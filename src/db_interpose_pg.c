@@ -1008,7 +1008,56 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     if (insert_sql) free(insert_sql);
                     PQclear(res);
 
-                    // PostgreSQL-only mode: don't execute on SQLite
+                    // Dual-write play_queue tables to SQLite (Plex reads these from SQLite)
+                    int is_play_queue = strstr(sql, "play_queue") != NULL;
+                    if (is_play_queue && strncasecmp(sql, "INSERT", 6) == 0 && this_insert_id > 0) {
+                        // For INSERT: inject explicit ID from PostgreSQL
+                        char *exp_sql = expanded_sql ? expanded_sql : sqlite3_expanded_sql(pStmt);
+                        if (exp_sql) {
+                            const char *cols_start = strchr(exp_sql, '(');
+                            const char *values_kw = strstr(exp_sql, "VALUES");
+                            if (!values_kw) values_kw = strstr(exp_sql, "values");
+
+                            if (cols_start && values_kw) {
+                                const char *cols_end = values_kw - 1;
+                                while (cols_end > cols_start && (*cols_end == ' ' || *cols_end == ')')) cols_end--;
+                                cols_end++;
+
+                                const char *vals_paren = strchr(values_kw, '(');
+                                if (vals_paren) {
+                                    size_t cols_len = cols_end - cols_start - 1;
+                                    const char *vals_content = vals_paren + 1;
+                                    const char *table_start = strcasestr(exp_sql, "INTO ");
+                                    if (table_start) {
+                                        table_start += 5;
+                                        while (*table_start == ' ') table_start++;
+                                        const char *table_end = table_start;
+                                        while (*table_end && *table_end != ' ' && *table_end != '(') table_end++;
+                                        size_t table_len = table_end - table_start;
+
+                                        char *insert_with_id = malloc(strlen(exp_sql) + 100);
+                                        if (insert_with_id) {
+                                            snprintf(insert_with_id, strlen(exp_sql) + 100,
+                                                    "INSERT INTO %.*s (\"id\",%.*s) VALUES (%lld,%s",
+                                                    (int)table_len, table_start,
+                                                    (int)cols_len, cols_start + 1,
+                                                    this_insert_id, vals_content);
+                                            char *err_msg = NULL;
+                                            sqlite3_exec(sqlite3_db_handle(pStmt), insert_with_id, NULL, NULL, &err_msg);
+                                            if (err_msg) sqlite3_free(err_msg);
+                                            free(insert_with_id);
+                                        }
+                                    }
+                                }
+                            }
+                            if (exp_sql != expanded_sql) sqlite3_free(exp_sql);
+                        }
+                    } else if (is_play_queue) {
+                        // For UPDATE/DELETE: execute on SQLite too
+                        sqlite3_step(pStmt);
+                        sqlite3_reset(pStmt);
+                    }
+
                     if (expanded_sql) sqlite3_free(expanded_sql);
                     sql_translation_free(&trans);
                     return SQLITE_DONE;
