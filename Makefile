@@ -75,13 +75,13 @@ test: $(TARGET)
 ifeq ($(UNAME_S),Darwin)
 	@DYLD_INSERT_LIBRARIES=./$(TARGET) \
 		PLEX_PG_HOST=localhost \
-		PLEX_PG_DATABASE=plex_test \
+		PLEX_PG_DATABASE=plex \
 		PLEX_PG_USER=plex \
 		/bin/echo "Shim loaded successfully"
 else
 	@LD_PRELOAD=./$(TARGET) \
 		PLEX_PG_HOST=localhost \
-		PLEX_PG_DATABASE=plex_test \
+		PLEX_PG_DATABASE=plex \
 		PLEX_PG_USER=plex \
 		/bin/echo "Shim loaded successfully"
 endif
