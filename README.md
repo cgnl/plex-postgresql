@@ -4,6 +4,8 @@ Run Plex Media Server with PostgreSQL instead of SQLite.
 
 This project provides a shim library that intercepts Plex's SQLite calls and redirects them to PostgreSQL, allowing you to use a more scalable and robust database backend.
 
+> **⚠️ macOS only** - Currently requires macOS (uses `DYLD_INTERPOSE`). Linux support via `LD_PRELOAD` is planned for a future release.
+
 ## Features
 
 - **Transparent interception** - Uses macOS `DYLD_INTERPOSE` to intercept SQLite calls
@@ -13,7 +15,7 @@ This project provides a shim library that intercepts Plex's SQLite calls and red
 
 ## Requirements
 
-- macOS (uses DYLD_INTERPOSE)
+- **macOS** (Apple Silicon or Intel)
 - PostgreSQL 15+
 - Plex Media Server
 - Xcode Command Line Tools
