@@ -1,0 +1,148 @@
+## Plex PostgreSQL Shim - "bad lexical cast" Error
+
+### Context
+We hebben een DYLD interpose shim (`db_interpose_pg.dylib`) die Plex Media Server's SQLite calls onderschept en doorstuurt naar PostgreSQL. De shim werkt voor Movies libraries, maar **TV Shows libraries falen** met:
+
+```
+ERROR - Exception handled: bad lexical cast: source type value could not be interpreted as target
+```
+
+De error komt in Plex zelf (C++ boost library) - niet in onze code.
+
+### Wat werkt
+- Movies library: ✅
+- Video afspelen: ✅
+- PostgreSQL connectie: ✅
+- Alle SQL queries worden succesvol uitgevoerd
+
+### Wat niet werkt
+- TV Shows library overzicht: ❌ "Something went wrong"
+- Cloud TV Shows library overzicht: ❌ "Something went wrong"
+
+### Bevindingen
+
+1. **De error komt NA succesvolle PostgreSQL queries** - alle queries worden correct uitgevoerd:
+   - 63-kolom metadata query: ✅ succesvol (50 rows)
+   - Counter cache query: ✅ succesvol (2036 rows)
+   - Daarna: ❌ "bad lexical cast" error in Plex
+
+2. **NULL values in parent_id kolom**:
+   - TV Shows (metadata_type=2) hebben `parent_id = NULL`
+   - PostgreSQL retourneert correct `PQgetisnull() = 1` voor deze kolom
+   - Onze code retourneert correct `SQLITE_NULL` voor `sqlite3_column_type()`
+   - Debug output bevestigt: `row0_col2: oid=23 is_null=1 val=''`
+
+3. **Counter cache query** die net vóór de error loopt:
+   ```sql
+   SELECT parents.parent_id, count(*) 
+   FROM metadata_items AS parents 
+   JOIN metadata_items AS leaves ON leaves.parent_id = parents.id 
+   WHERE parents.metadata_type = 3 
+   GROUP BY parents.parent_id
+   ```
+   - Retourneert 2036 rows met parent_id (INT4, OID=23) en count (BIGINT, OID=20)
+   - Alle waarden zijn valide integers
+   - Debug output: `col0_oid=23 col1_oid=20, first row: col0='7079500' col1='100'`
+
+4. **Movies library werkt WEL** - het probleem is specifiek voor TV Shows
+   - TV Shows gebruiken metadata_type 2 (show), 3 (season), 4 (episode)
+   - Movies gebruiken metadata_type 1
+
+5. **Plex log patroon**:
+   ```
+   Request: GET /library/sections/6/all?type=2...
+   MetadataCounterCache: rebuilding full counter cache for totals
+   ERROR - Exception handled: bad lexical cast: source type value could not be interpreted as target
+   Completed: 500 GET /library/sections/6/all...
+   ```
+
+### Huidige test
+We hebben zojuist de counter cache query toegevoegd aan `SQLITE_ONLY_PATTERNS[]` om te testen of die query het probleem veroorzaakt:
+```c
+// TEST: Counter cache query causes bad lexical cast in Plex
+"parents.parent_id,count(*)",
+```
+
+### Relevante code structuur
+
+**Interpose mechanisme:**
+- `my_sqlite3_prepare_v2()` - onderschept SQL, vertaalt naar PostgreSQL syntax
+- `my_sqlite3_step()` - voert query uit op PostgreSQL, cached resultaten
+- `my_sqlite3_column_type()` - retourneert SQLITE_NULL/INTEGER/TEXT/FLOAT/BLOB
+- `my_sqlite3_column_int()` - retourneert int waarde (0 voor NULL)
+- `my_sqlite3_column_int64()` - retourneert int64 waarde
+- `my_sqlite3_column_text()` - retourneert text waarde
+
+**NULL handling:**
+```c
+static int my_sqlite3_column_type(sqlite3_stmt *pStmt, int idx) {
+    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
+        if (pg_stmt->current_row < pg_stmt->num_rows) {
+            if (PQgetisnull(pg_stmt->result, pg_stmt->current_row, idx)) {
+                return SQLITE_NULL;  // <-- Dit zou correct moeten zijn
+            }
+            // Map PostgreSQL OIDs to SQLite types
+            Oid oid = PQftype(pg_stmt->result, idx);
+            switch (oid) {
+                case 23:  // INT4
+                case 20:  // INT8
+                case 21:  // INT2
+                    return SQLITE_INTEGER;
+                // ...
+            }
+        }
+    }
+    return sqlite3_column_type(pStmt, idx);
+}
+```
+
+**Type mapping:**
+- OID 23 (INT4) -> SQLITE_INTEGER
+- OID 20 (INT8/BIGINT) -> SQLITE_INTEGER  
+- OID 1043 (VARCHAR) -> SQLITE_TEXT
+- NULL -> SQLITE_NULL
+
+### Mogelijke oorzaken (hypotheses)
+
+1. **Counter cache query retourneert verkeerd type** - COUNT(*) is BIGINT (OID 20) maar wordt misschien verkeerd geïnterpreteerd
+
+2. **Ergens wordt een lege string als integer gelezen** - hoewel we checken op NULL, misschien mist er ergens een check
+
+3. **Plex verwacht specifiek gedrag voor NULL dat we niet correct implementeren** - misschien moet sqlite3_column_int() iets anders retourneren voor NULL?
+
+4. **Er is een query die we niet loggen** - misschien een query via een andere code path
+
+### Bestanden
+- Hoofdcode: `/Users/sander/plex-postgresql/src/db_interpose_pg.c`
+- SQL translator: `/Users/sander/plex-postgresql/src/sql_translator.c`
+- Debug log: `/tmp/plex_redirect_pg.log`
+- Plex log: `~/Library/Logs/Plex Media Server/Plex Media Server.log`
+
+### Commando's om te testen
+
+```bash
+# Rebuild dylib
+cd /Users/sander/plex-postgresql && make clean && make
+
+# Restart Plex met shim
+launchctl stop com.plex.mediaserver.shim
+sleep 2
+launchctl start com.plex.mediaserver.shim
+
+# Check logs
+tail -f /tmp/plex_redirect_pg.log
+tail -f ~/Library/Logs/Plex\ Media\ Server/Plex\ Media\ Server.log | grep -E "error|Exception|bad lexical"
+
+# Test PostgreSQL direct
+PGPASSWORD= /opt/homebrew/opt/postgresql@15/bin/psql -h localhost -U plex -d plex_test
+```
+
+### LaunchAgent configuratie
+`~/Library/LaunchAgents/com.plex.mediaserver.shim.plist` met:
+- DYLD_INSERT_LIBRARIES=/Users/sander/plex-postgresql/db_interpose_pg.dylib
+- PLEX_PG_HOST=localhost
+- PLEX_PG_PORT=5432
+- PLEX_PG_DATABASE=plex_test
+- PLEX_PG_USER=plex
+- PLEX_PG_SCHEMA=plex

@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: plex-postgres
+    environment:
+      POSTGRES_USER: plex
+      POSTGRES_PASSWORD: plex
+      POSTGRES_DB: plex
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Do NOT pre-create schema - let Plex create it dynamically
+      # The shim forwards all DDL to both SQLite and PostgreSQL
+      # - ./schema:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plex"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - plex-network
+
+  plex:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: plex-postgresql
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Amsterdam
+      - VERSION=docker
+      # PostgreSQL configuration
+      - PLEX_PG_HOST=postgres
+      - PLEX_PG_PORT=5432
+      - PLEX_PG_DATABASE=plex
+      - PLEX_PG_USER=plex
+      - PLEX_PG_PASSWORD=plex
+      - PLEX_PG_SCHEMA=plex
+    volumes:
+      - plex_config:/config
+      # Uncomment and edit to mount your media
+      # - /path/to/media:/media:ro
+    ports:
+      - "32401:32400"
+      - "32401:32400/udp"
+      - "32470:32469"
+      - "32470:32469/udp"
+      # Skip 1900/udp - conflicts with local Plex
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - plex-network
+
+volumes:
+  postgres_data:
+  plex_config:
+
+networks:
+  plex-network:
+    driver: bridge

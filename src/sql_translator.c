@@ -444,6 +444,152 @@ static char* translate_datetime(const char *sql) {
     return result;
 }
 
+// Translate last_insert_rowid() -> lastval()
+// SQLite: SELECT last_insert_rowid()
+// PostgreSQL: SELECT lastval() (returns last value from any sequence in current session)
+static char* translate_last_insert_rowid(const char *sql) {
+    char *result = str_replace_nocase(sql, "last_insert_rowid()", "lastval()");
+    return result;
+}
+
+// Translate json_each() -> json_array_elements()
+// SQLite: SELECT value FROM json_each('[1,2,3]')
+// PostgreSQL: SELECT value::text FROM json_array_elements('[1,2,3]'::json)
+static char* translate_json_each(const char *sql) {
+    if (!sql) return NULL;
+
+    char *result = malloc(MAX_SQL_LEN);
+    if (!result) return NULL;
+
+    char *out = result;
+    const char *p = sql;
+
+    while (*p) {
+        // Look for json_each( - case insensitive
+        if (strncasecmp(p, "json_each(", 10) == 0) {
+            const char *args_start = p + 10;
+
+            // Extract the JSON argument manually to handle string literals properly
+            // We need to find the closing ) taking into account quotes and nested parens
+            const char *scan = args_start;
+            int depth = 0;
+            int in_string = 0;
+            char string_char = 0;
+
+            while (*scan) {
+                if (in_string) {
+                    if (*scan == string_char && (scan == args_start || *(scan-1) != '\\')) {
+                        in_string = 0;
+                    }
+                } else {
+                    if (*scan == '\'' || *scan == '"') {
+                        in_string = 1;
+                        string_char = *scan;
+                    } else if (*scan == '(') {
+                        depth++;
+                    } else if (*scan == ')') {
+                        if (depth == 0) break;
+                        depth--;
+                    }
+                }
+                scan++;
+            }
+
+            // Copy the argument
+            size_t arg_len = scan - args_start;
+            char *arg = malloc(arg_len + 1);
+            if (arg) {
+                memcpy(arg, args_start, arg_len);
+                arg[arg_len] = '\0';
+
+                // Trim whitespace
+                char *arg_start = arg;
+                char *arg_end = arg + arg_len - 1;
+                while (*arg_start && isspace(*arg_start)) arg_start++;
+                while (arg_end > arg_start && isspace(*arg_end)) {
+                    *arg_end = '\0';
+                    arg_end--;
+                }
+
+                // Convert to json_array_elements with proper casting
+                out += sprintf(out, "json_array_elements(%s::json)", arg_start);
+
+                free(arg);
+            }
+
+            // Move past the closing )
+            p = scan;
+            if (*p == ')') p++;
+        } else {
+            *out++ = *p++;
+        }
+    }
+
+    *out = '\0';
+
+    // Now fix references to the value column - need to cast to appropriate type
+    // Pattern: "value FROM json_array_elements" -> "(value::text)::integer FROM json_array_elements"
+    // Cast to text first, then to integer to handle numeric comparisons
+    char *temp = str_replace(result, " value FROM json_array_elements", " (value::text)::integer FROM json_array_elements");
+    if (temp) {
+        free(result);
+        result = temp;
+    }
+
+    return result;
+}
+
+// Fix GROUP BY strict mode - add missing columns that appear in SELECT
+// PostgreSQL requires all non-aggregate columns in SELECT to be in GROUP BY
+static char* fix_group_by_strict(const char *sql) {
+    if (!sql) return NULL;
+
+    // Only process if it has GROUP BY
+    if (!strcasestr(sql, "group by")) {
+        return strdup(sql);
+    }
+
+    // Special case: metadata_item_clusterings query with missing column
+    // SELECT metadata_item_id,metadata_item_cluster_id ... GROUP BY metadata_item_id
+    // Need to add metadata_item_cluster_id to GROUP BY
+    if (strcasestr(sql, "metadata_item_clusterings") &&
+        strcasestr(sql, "metadata_item_cluster_id") &&
+        strcasestr(sql, "group by") &&
+        strcasestr(sql, "metadata_item_id")) {
+
+        // Find the GROUP BY clause
+        char *group_pos = strcasestr(sql, "group by");
+        if (group_pos) {
+            // Check if metadata_item_cluster_id is NOT already in GROUP BY
+            char *having_pos = strcasestr(group_pos, "having");
+            char *end_pos = having_pos ? having_pos : (group_pos + strlen(group_pos));
+
+            // Create a substring of just the GROUP BY clause
+            size_t group_clause_len = end_pos - group_pos;
+            char *group_clause = malloc(group_clause_len + 1);
+            if (group_clause) {
+                memcpy(group_clause, group_pos, group_clause_len);
+                group_clause[group_clause_len] = '\0';
+
+                // Check if metadata_item_cluster_id is already in GROUP BY
+                if (!strcasestr(group_clause, "metadata_item_cluster_id")) {
+                    // Need to add it
+                    // Find "GROUP BY metadata_item_clusterings.metadata_item_id"
+                    // and add ",metadata_item_clusterings.metadata_item_cluster_id"
+                    char *result = str_replace_nocase(sql,
+                        "group by metadata_item_clusterings.metadata_item_id",
+                        "group by metadata_item_clusterings.metadata_item_id,metadata_item_clusterings.metadata_item_cluster_id");
+                    free(group_clause);
+                    return result ? result : strdup(sql);
+                }
+                free(group_clause);
+            }
+        }
+    }
+
+    return strdup(sql);
+}
+
 // Add alias to subqueries in FROM clause
 // PostgreSQL requires: FROM (SELECT ...) AS alias
 // SQLite allows: FROM (SELECT ...)
@@ -1010,6 +1156,18 @@ char* sql_translate_functions(const char *sql) {
     if (!temp) return NULL;
     current = temp;
 
+    // 5a. last_insert_rowid() -> lastval()
+    temp = translate_last_insert_rowid(current);
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    // 5b. json_each() -> json_array_elements()
+    temp = translate_json_each(current);
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
     // 6. IFNULL -> COALESCE
     temp = str_replace_nocase(current, "IFNULL(", "COALESCE(");
     free(current);
@@ -1057,6 +1215,12 @@ char* sql_translate_functions(const char *sql) {
 
     // 15. Fix forward reference in self-joins (SQLite allows, PostgreSQL doesn't)
     temp = fix_forward_reference_joins(current);
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    // 15b. Fix GROUP BY strict mode - add missing columns
+    temp = fix_group_by_strict(current);
     free(current);
     if (!temp) return NULL;
     current = temp;

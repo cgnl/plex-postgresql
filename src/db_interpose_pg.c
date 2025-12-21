@@ -97,6 +97,7 @@ typedef struct pg_stmt {
     int num_rows;
     int num_cols;
     int is_pg;
+    int is_cached;  // 1 if this is from TLS (cached stmt), uses expanded_sql
 
     char *param_values[MAX_PARAMS];
     int param_lengths[MAX_PARAMS];
@@ -120,6 +121,7 @@ static pg_connection_t *connections[MAX_CONNECTIONS];
 static int connection_count = 0;
 
 // Statement tracking - maps sqlite3_stmt* to pg_stmt_t*
+// Used for statements prepared through our shim
 #define MAX_STATEMENTS 1024
 static struct {
     sqlite3_stmt *sqlite_stmt;
@@ -127,6 +129,152 @@ static struct {
 } stmt_map[MAX_STATEMENTS];
 static int stmt_count = 0;
 static pthread_mutex_t stmt_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Thread-local storage for cached statement results
+// This is needed because cached statements (prepared before our shim) can be
+// executed concurrently by multiple threads, each needing its own result set
+#define MAX_CACHED_STMTS_PER_THREAD 64
+typedef struct {
+    sqlite3_stmt *sqlite_stmt;
+    pg_stmt_t *pg_stmt;
+} cached_stmt_entry_t;
+
+typedef struct {
+    cached_stmt_entry_t entries[MAX_CACHED_STMTS_PER_THREAD];
+    int count;
+} thread_cached_stmts_t;
+
+static pthread_key_t cached_stmts_key;
+static pthread_once_t cached_stmts_key_once = PTHREAD_ONCE_INIT;
+
+static void free_thread_cached_stmts(void *ptr) {
+    thread_cached_stmts_t *tcs = (thread_cached_stmts_t *)ptr;
+    if (tcs) {
+        for (int i = 0; i < tcs->count; i++) {
+            pg_stmt_t *pg_stmt = tcs->entries[i].pg_stmt;
+            if (pg_stmt) {
+                if (pg_stmt->sql) free(pg_stmt->sql);
+                if (pg_stmt->pg_sql) free(pg_stmt->pg_sql);
+                if (pg_stmt->result) PQclear(pg_stmt->result);
+                free(pg_stmt);
+            }
+        }
+        free(tcs);
+    }
+}
+
+static void create_cached_stmts_key(void) {
+    pthread_key_create(&cached_stmts_key, free_thread_cached_stmts);
+}
+
+static thread_cached_stmts_t* get_thread_cached_stmts(void) {
+    pthread_once(&cached_stmts_key_once, create_cached_stmts_key);
+    thread_cached_stmts_t *tcs = pthread_getspecific(cached_stmts_key);
+    if (!tcs) {
+        tcs = calloc(1, sizeof(thread_cached_stmts_t));
+        if (tcs) {
+            pthread_setspecific(cached_stmts_key, tcs);
+        }
+    }
+    return tcs;
+}
+
+// Find a cached statement result for this thread
+static pg_stmt_t* find_cached_pg_stmt(sqlite3_stmt *sqlite_stmt) {
+    thread_cached_stmts_t *tcs = get_thread_cached_stmts();
+    if (!tcs) return NULL;
+    for (int i = 0; i < tcs->count; i++) {
+        if (tcs->entries[i].sqlite_stmt == sqlite_stmt) {
+            return tcs->entries[i].pg_stmt;
+        }
+    }
+    return NULL;
+}
+
+// Register a cached statement result for this thread
+static void register_cached_pg_stmt(sqlite3_stmt *sqlite_stmt, pg_stmt_t *pg_stmt) {
+    thread_cached_stmts_t *tcs = get_thread_cached_stmts();
+    if (!tcs) return;
+
+    // Check if already registered (shouldn't happen, but be safe)
+    for (int i = 0; i < tcs->count; i++) {
+        if (tcs->entries[i].sqlite_stmt == sqlite_stmt) {
+            // Replace existing
+            pg_stmt_t *old = tcs->entries[i].pg_stmt;
+            if (old && old != pg_stmt) {
+                if (old->sql) free(old->sql);
+                if (old->pg_sql) free(old->pg_sql);
+                if (old->result) PQclear(old->result);
+                free(old);
+            }
+            tcs->entries[i].pg_stmt = pg_stmt;
+            return;
+        }
+    }
+
+    // Add new entry
+    if (tcs->count < MAX_CACHED_STMTS_PER_THREAD) {
+        tcs->entries[tcs->count].sqlite_stmt = sqlite_stmt;
+        tcs->entries[tcs->count].pg_stmt = pg_stmt;
+        tcs->count++;
+    } else {
+        // Evict oldest entry (simple FIFO)
+        pg_stmt_t *old = tcs->entries[0].pg_stmt;
+        if (old) {
+            if (old->sql) free(old->sql);
+            if (old->pg_sql) free(old->pg_sql);
+            if (old->result) PQclear(old->result);
+            free(old);
+        }
+        memmove(&tcs->entries[0], &tcs->entries[1],
+                (MAX_CACHED_STMTS_PER_THREAD - 1) * sizeof(cached_stmt_entry_t));
+        tcs->entries[MAX_CACHED_STMTS_PER_THREAD - 1].sqlite_stmt = sqlite_stmt;
+        tcs->entries[MAX_CACHED_STMTS_PER_THREAD - 1].pg_stmt = pg_stmt;
+    }
+}
+
+// Clear cached statement result for this thread
+static void clear_cached_pg_stmt(sqlite3_stmt *sqlite_stmt) {
+    thread_cached_stmts_t *tcs = get_thread_cached_stmts();
+    if (!tcs) return;
+
+    for (int i = 0; i < tcs->count; i++) {
+        if (tcs->entries[i].sqlite_stmt == sqlite_stmt) {
+            pg_stmt_t *pg_stmt = tcs->entries[i].pg_stmt;
+            if (pg_stmt) {
+                // Just clear the result, keep the pg_stmt for reuse
+                if (pg_stmt->result) {
+                    PQclear(pg_stmt->result);
+                    pg_stmt->result = NULL;
+                }
+                pg_stmt->current_row = 0;
+                pg_stmt->num_rows = 0;
+            }
+            return;
+        }
+    }
+}
+
+// Remove cached statement from thread-local storage (called on finalize)
+static void unregister_cached_pg_stmt(sqlite3_stmt *sqlite_stmt) {
+    thread_cached_stmts_t *tcs = get_thread_cached_stmts();
+    if (!tcs) return;
+
+    for (int i = 0; i < tcs->count; i++) {
+        if (tcs->entries[i].sqlite_stmt == sqlite_stmt) {
+            pg_stmt_t *pg_stmt = tcs->entries[i].pg_stmt;
+            if (pg_stmt) {
+                if (pg_stmt->sql) free(pg_stmt->sql);
+                if (pg_stmt->pg_sql) free(pg_stmt->pg_sql);
+                if (pg_stmt->result) PQclear(pg_stmt->result);
+                free(pg_stmt);
+            }
+            // Remove by moving last entry here
+            tcs->entries[i] = tcs->entries[--tcs->count];
+            return;
+        }
+    }
+}
 
 // Global metadata_id tracking - shared across all connections
 static sqlite3_int64 global_generator_metadata_id = 0;
@@ -224,6 +372,10 @@ static const char *SQLITE_SKIP_PATTERNS[] = {
     "ROLLBACK",          // Avoid "no transaction in progress" warnings
     "SAVEPOINT",
     "RELEASE SAVEPOINT",
+    "sqlite_schema",     // SQLite internal schema table
+    "sqlite_master",     // SQLite internal master table (alias for sqlite_schema)
+    "typeof(",           // SQLite typeof() function (used in schema migrations)
+    "last_insert_rowid()", // SQLite-specific function for last inserted row ID
     NULL
 };
 
@@ -243,6 +395,49 @@ static int should_skip_sql(const char *sql) {
             return 1;
         }
     }
+    return 0;
+}
+
+// Log SQL translation fallback for analysis
+static void log_sql_fallback(const char *original_sql, const char *translated_sql, const char *error_msg, const char *context) {
+    // Log to main log
+    log_message("=== SQL FALLBACK TO SQLITE ===");
+    log_message("Context: %s", context);
+    log_message("Original SQL: %.500s", original_sql);
+    if (translated_sql) {
+        log_message("Translated SQL: %.500s", translated_sql);
+    }
+    log_message("PostgreSQL Error: %s", error_msg);
+    log_message("=== END FALLBACK ===");
+
+    // Also log to separate fallback analysis file
+    FILE *fallback_log = fopen("/tmp/plex_pg_fallbacks.log", "a");
+    if (fallback_log) {
+        time_t now = time(NULL);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+        fprintf(fallback_log, "\n[%s] %s\n", timestamp, context);
+        fprintf(fallback_log, "ORIGINAL: %s\n", original_sql);
+        if (translated_sql) {
+            fprintf(fallback_log, "TRANSLATED: %s\n", translated_sql);
+        }
+        fprintf(fallback_log, "ERROR: %s\n", error_msg);
+        fprintf(fallback_log, "---\n");
+        fclose(fallback_log);
+    }
+}
+
+// Check if a PostgreSQL error is a known translation limitation
+static int is_known_translation_limitation(const char *error_msg) {
+    if (!error_msg) return 0;
+
+    // Known translation limitations (but we want to log these for improvement)
+    if (strstr(error_msg, "operator does not exist: integer = json")) return 1;
+    if (strstr(error_msg, "must appear in the GROUP BY clause")) return 1;
+    if (strstr(error_msg, "syntax error")) return 1;
+    if (strstr(error_msg, "no unique or exclusion constraint matching the ON CONFLICT")) return 1;
+
     return 0;
 }
 
@@ -424,6 +619,7 @@ static void register_stmt(sqlite3_stmt *sqlite_stmt, pg_stmt_t *pg_stmt) {
     pthread_mutex_unlock(&stmt_mutex);
 }
 
+// Find pg_stmt in global stmt_map ONLY (for statements prepared through our shim)
 static pg_stmt_t* find_pg_stmt(sqlite3_stmt *sqlite_stmt) {
     pthread_mutex_lock(&stmt_mutex);
     for (int i = 0; i < stmt_count; i++) {
@@ -435,6 +631,16 @@ static pg_stmt_t* find_pg_stmt(sqlite3_stmt *sqlite_stmt) {
     }
     pthread_mutex_unlock(&stmt_mutex);
     return NULL;
+}
+
+// Find pg_stmt in BOTH stmt_map and TLS (for column functions that need to read data)
+static pg_stmt_t* find_any_pg_stmt(sqlite3_stmt *sqlite_stmt) {
+    // First check stmt_map
+    pg_stmt_t *result = find_pg_stmt(sqlite_stmt);
+    if (result) return result;
+
+    // Fallback: check thread-local storage (for cached statements)
+    return find_cached_pg_stmt(sqlite_stmt);
 }
 
 static void unregister_stmt(sqlite3_stmt *sqlite_stmt) {
@@ -604,8 +810,8 @@ static int my_sqlite3_exec(sqlite3 *db, const char *sql,
                           int (*callback)(void*, int, char**, char**),
                           void *arg, char **errmsg) {
     // Debug: log all exec calls
-    if (is_write_operation(sql)) {
-        log_message("EXEC WRITE: %.300s", sql);
+    if (!should_skip_sql(sql)) {
+        log_message("EXEC: %.300s", sql);
     }
     // Log all play_queue related queries
     if (strstr(sql, "play_queue")) {
@@ -923,6 +1129,17 @@ static int my_sqlite3_bind_null(sqlite3_stmt *pStmt, int idx) {
 static int my_sqlite3_step(sqlite3_stmt *pStmt) {
     pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
 
+    // Debug: log all step calls
+    const char *step_sql = sqlite3_sql(pStmt);
+    if (step_sql && !strstr(step_sql, "PRAGMA") && !strstr(step_sql, "fts3_tokenizer")) {
+        sqlite3 *db_dbg = sqlite3_db_handle(pStmt);
+        pg_connection_t *pg_dbg = find_pg_connection(db_dbg);
+        log_message("STEP called: pg_stmt=%s, pg_conn=%s, sql=%.100s",
+                    pg_stmt ? "yes" : "no",
+                    (pg_dbg && pg_dbg->is_pg_active) ? "active" : "none",
+                    step_sql);
+    }
+
     // For skipped statements (is_pg == 3), just return SQLITE_DONE
     if (pg_stmt && pg_stmt->is_pg == 3) {
         return SQLITE_DONE;
@@ -936,7 +1153,7 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
         pg_connection_t *pg_conn = find_pg_connection(db);
 
         // Fallback: if db doesn't match, try to find any active library connection
-        if (!pg_conn && sql_check && is_write_operation(sql_check)) {
+        if (!pg_conn && sql_check) {
             pg_conn = find_any_pg_connection_for_library();
         }
 
@@ -945,7 +1162,7 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
             char *expanded_sql = sqlite3_expanded_sql(pStmt);
             const char *sql = expanded_sql ? expanded_sql : sqlite3_sql(pStmt);
 
-            if (sql && is_write_operation(sql)) {
+            if (sql && is_write_operation(sql) && !should_skip_sql(sql)) {
 
                 // Translate and execute on PostgreSQL
                 sql_translation_t trans = sql_translate(sql);
@@ -975,8 +1192,16 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     sqlite3_int64 this_insert_id = 0;  // Track ID from THIS specific insert
 
                     if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
-                        log_message("STEP CACHED WRITE PG error: %s\nSQL: %s",
-                                    PQerrorMessage(pg_conn->conn), exec_sql);
+                        const char *pg_error = PQerrorMessage(pg_conn->conn);
+
+                        // Log all fallbacks for analysis and improvement
+                        if (is_known_translation_limitation(pg_error)) {
+                            log_sql_fallback(sql, exec_sql, pg_error, "CACHED WRITE");
+                        } else {
+                            // Unexpected error - log with more detail
+                            log_message("STEP CACHED WRITE PG error: %s\nSQL: %s", pg_error, exec_sql);
+                            log_sql_fallback(sql, exec_sql, pg_error, "CACHED WRITE (UNEXPECTED)");
+                        }
                         pg_conn->last_changes = 0;
                     } else {
                         const char *cmd_tuples = PQcmdTuples(res);
@@ -1008,61 +1233,84 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     if (insert_sql) free(insert_sql);
                     PQclear(res);
 
-                    // Dual-write play_queue tables to SQLite (Plex reads these from SQLite)
-                    int is_play_queue = strstr(sql, "play_queue") != NULL;
-                    if (is_play_queue && strncasecmp(sql, "INSERT", 6) == 0 && this_insert_id > 0) {
-                        // For INSERT: inject explicit ID from PostgreSQL
-                        char *exp_sql = expanded_sql ? expanded_sql : sqlite3_expanded_sql(pStmt);
-                        if (exp_sql) {
-                            const char *cols_start = strchr(exp_sql, '(');
-                            const char *values_kw = strstr(exp_sql, "VALUES");
-                            if (!values_kw) values_kw = strstr(exp_sql, "values");
-
-                            if (cols_start && values_kw) {
-                                const char *cols_end = values_kw - 1;
-                                while (cols_end > cols_start && (*cols_end == ' ' || *cols_end == ')')) cols_end--;
-                                cols_end++;
-
-                                const char *vals_paren = strchr(values_kw, '(');
-                                if (vals_paren) {
-                                    size_t cols_len = cols_end - cols_start - 1;
-                                    const char *vals_content = vals_paren + 1;
-                                    const char *table_start = strcasestr(exp_sql, "INTO ");
-                                    if (table_start) {
-                                        table_start += 5;
-                                        while (*table_start == ' ') table_start++;
-                                        const char *table_end = table_start;
-                                        while (*table_end && *table_end != ' ' && *table_end != '(') table_end++;
-                                        size_t table_len = table_end - table_start;
-
-                                        char *insert_with_id = malloc(strlen(exp_sql) + 100);
-                                        if (insert_with_id) {
-                                            snprintf(insert_with_id, strlen(exp_sql) + 100,
-                                                    "INSERT INTO %.*s (\"id\",%.*s) VALUES (%lld,%s",
-                                                    (int)table_len, table_start,
-                                                    (int)cols_len, cols_start + 1,
-                                                    this_insert_id, vals_content);
-                                            char *err_msg = NULL;
-                                            sqlite3_exec(sqlite3_db_handle(pStmt), insert_with_id, NULL, NULL, &err_msg);
-                                            if (err_msg) sqlite3_free(err_msg);
-                                            free(insert_with_id);
-                                        }
-                                    }
-                                }
-                            }
-                            if (exp_sql != expanded_sql) sqlite3_free(exp_sql);
-                        }
-                    } else if (is_play_queue) {
-                        // For UPDATE/DELETE: execute on SQLite too
-                        sqlite3_step(pStmt);
-                        sqlite3_reset(pStmt);
-                    }
-
+                    // PostgreSQL-only mode
                     if (expanded_sql) sqlite3_free(expanded_sql);
                     sql_translation_free(&trans);
                     return SQLITE_DONE;
                 }  // close: if (trans.success && trans.sql)
             }  // close: if (sql && is_write_operation(sql))
+
+            // Handle cached READ statements - execute on SQLite but fetch PostgreSQL data for columns
+            // This approach: let SQLite update its internal state, but use PostgreSQL data for column values
+            if (sql && is_read_operation(sql) && !should_skip_sql(sql)) {
+                // Check if we already have a result for this statement in this thread
+                pg_stmt_t *cached_pg_stmt = find_cached_pg_stmt(pStmt);
+
+                // First, let SQLite step to update its internal state
+                int sqlite_result = sqlite3_step(pStmt);
+
+                // Handle PostgreSQL data fetching
+                if (sqlite_result == SQLITE_ROW || sqlite_result == SQLITE_DONE) {
+                    if (cached_pg_stmt && cached_pg_stmt->result) {
+                        // We already have PostgreSQL data - just advance current_row
+                        if (sqlite_result == SQLITE_ROW) {
+                            cached_pg_stmt->current_row++;
+                        }
+                        // log_message("STEP CACHED READ: advancing row to %d for: %.100s", cached_pg_stmt->current_row, sql);
+                    } else {
+                        // First step or no result yet - need to fetch from PostgreSQL
+                        sql_translation_t trans = sql_translate(sql);
+                        if (trans.success && trans.sql) {
+                            pg_stmt_t *new_pg_stmt = cached_pg_stmt;
+                            if (!new_pg_stmt) {
+                                new_pg_stmt = calloc(1, sizeof(pg_stmt_t));
+                                if (new_pg_stmt) {
+                                    new_pg_stmt->conn = pg_conn;
+                                    new_pg_stmt->sql = strdup(sql);
+                                    new_pg_stmt->pg_sql = strdup(trans.sql);
+                                    new_pg_stmt->is_pg = 2;  // read
+                                    new_pg_stmt->is_cached = 1;  // mark as cached statement
+                                    new_pg_stmt->param_count = 0;
+                                    register_cached_pg_stmt(pStmt, new_pg_stmt);
+                                }
+                            }
+
+                            if (new_pg_stmt) {
+                                // Execute on PostgreSQL to get current data
+                                new_pg_stmt->result = PQexec(pg_conn->conn, trans.sql);
+                                ExecStatusType status = PQresultStatus(new_pg_stmt->result);
+
+                                if (status == PGRES_TUPLES_OK) {
+                                    new_pg_stmt->num_rows = PQntuples(new_pg_stmt->result);
+                                    new_pg_stmt->num_cols = PQnfields(new_pg_stmt->result);
+                                    new_pg_stmt->current_row = 0;
+
+                                    log_message("STEP CACHED READ: sqlite=%d, pg_rows=%d for: %.200s",
+                                                sqlite_result, new_pg_stmt->num_rows, trans.sql);
+                                } else {
+                                    const char *pg_error = PQerrorMessage(pg_conn->conn);
+
+                                    // Log all fallbacks for analysis and improvement
+                                    if (is_known_translation_limitation(pg_error)) {
+                                        log_sql_fallback(sql, trans.sql, pg_error, "CACHED READ");
+                                    } else {
+                                        // Unexpected error - log with more detail
+                                        log_message("STEP CACHED READ PG error: %s", pg_error);
+                                        log_sql_fallback(sql, trans.sql, pg_error, "CACHED READ (UNEXPECTED)");
+                                    }
+                                    PQclear(new_pg_stmt->result);
+                                    new_pg_stmt->result = NULL;
+                                }
+                            }
+                        }
+                        sql_translation_free(&trans);
+                    }
+                }
+
+                if (expanded_sql) sqlite3_free(expanded_sql);
+                // Return SQLite's result to maintain internal state consistency
+                return sqlite_result;
+            }
 
             if (expanded_sql) sqlite3_free(expanded_sql);
         }
@@ -1118,8 +1366,16 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     }
                     
                 } else if (status != PGRES_COMMAND_OK) {
-                    log_message("STEP PG read error: %s\nSQL: %s",
-                                PQerrorMessage(pg_stmt->conn->conn), pg_stmt->pg_sql);
+                    const char *pg_error = PQerrorMessage(pg_stmt->conn->conn);
+
+                    // Log all fallbacks for analysis and improvement
+                    if (is_known_translation_limitation(pg_error)) {
+                        log_sql_fallback(pg_stmt->sql, pg_stmt->pg_sql, pg_error, "PREPARED READ");
+                    } else {
+                        // Unexpected error - log with more detail
+                        log_message("STEP PG read error: %s\nSQL: %s", pg_error, pg_stmt->pg_sql);
+                        log_sql_fallback(pg_stmt->sql, pg_stmt->pg_sql, pg_error, "PREPARED READ (UNEXPECTED)");
+                    }
                     PQclear(pg_stmt->result);
                     pg_stmt->result = NULL;
                 }
@@ -1197,11 +1453,23 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
     }
 
     // Execute on SQLite for non-redirected DBs only
-    return sqlite3_step(pStmt);
+    // Debug: log if we're falling through to SQLite for a redirected database
+    sqlite3 *db_check = sqlite3_db_handle(pStmt);
+    pg_connection_t *pg_check = find_pg_connection(db_check);
+    const char *sql_dbg = sqlite3_sql(pStmt);
+    if (pg_check && pg_check->is_pg_active) {
+        log_message("WARNING: Falling through to SQLite for redirected DB: %.300s", sql_dbg ? sql_dbg : "(unknown)");
+    }
+    int rc = sqlite3_step(pStmt);
+    // Log result for debugging
+    if (sql_dbg && !strstr(sql_dbg, "PRAGMA")) {
+        log_message("STEP result: %d (sql=%.100s)", rc, sql_dbg);
+    }
+    return rc;
 }
 
 static int my_sqlite3_reset(sqlite3_stmt *pStmt) {
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
 
     if (pg_stmt) {
         // Clear parameter values for reuse
@@ -1218,6 +1486,10 @@ static int my_sqlite3_reset(sqlite3_stmt *pStmt) {
             PQclear(pg_stmt->result);
             pg_stmt->result = NULL;
         }
+
+        // Reset row position for next execution
+        pg_stmt->current_row = 0;
+        pg_stmt->num_rows = 0;
     }
 
     return sqlite3_reset(pStmt);
@@ -1226,6 +1498,9 @@ static int my_sqlite3_reset(sqlite3_stmt *pStmt) {
 static int my_sqlite3_finalize(sqlite3_stmt *pStmt) {
     // Clean up our tracking before SQLite finalizes
     unregister_stmt(pStmt);
+
+    // Also clean up thread-local storage for cached statements
+    unregister_cached_pg_stmt(pStmt);
 
     return sqlite3_finalize(pStmt);
 }
@@ -1253,7 +1528,7 @@ static int my_sqlite3_clear_bindings(sqlite3_stmt *pStmt) {
 
 static int my_sqlite3_column_count(sqlite3_stmt *pStmt) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         return pg_stmt->num_cols;
     }
@@ -1263,7 +1538,7 @@ static int my_sqlite3_column_count(sqlite3_stmt *pStmt) {
 
 static int my_sqlite3_column_type(sqlite3_stmt *pStmt, int idx) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         // Bounds check
         if (idx < 0 || idx >= pg_stmt->num_cols) {
@@ -1321,7 +1596,7 @@ static sqlite3_int64 pg_value_to_int64(const char *val) {
 
 static int my_sqlite3_column_int(sqlite3_stmt *pStmt, int idx) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         // Bounds check
         if (idx < 0 || idx >= pg_stmt->num_cols) {
@@ -1347,7 +1622,7 @@ static int my_sqlite3_column_int(sqlite3_stmt *pStmt, int idx) {
 
 static sqlite3_int64 my_sqlite3_column_int64(sqlite3_stmt *pStmt, int idx) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         // Bounds check
         if (idx < 0 || idx >= pg_stmt->num_cols) {
@@ -1379,7 +1654,7 @@ static double pg_value_to_double(const char *val) {
 
 static double my_sqlite3_column_double(sqlite3_stmt *pStmt, int idx) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         // Bounds check
         if (idx < 0 || idx >= pg_stmt->num_cols) {
@@ -1402,7 +1677,7 @@ static double my_sqlite3_column_double(sqlite3_stmt *pStmt, int idx) {
 
 static const unsigned char* my_sqlite3_column_text(sqlite3_stmt *pStmt, int idx) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         // Bounds check
         if (idx < 0 || idx >= pg_stmt->num_cols) {
@@ -1427,7 +1702,7 @@ static const unsigned char* my_sqlite3_column_text(sqlite3_stmt *pStmt, int idx)
 
 static const void* my_sqlite3_column_blob(sqlite3_stmt *pStmt, int idx) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         // Bounds check
         if (idx < 0 || idx >= pg_stmt->num_cols) {
@@ -1450,7 +1725,7 @@ static const void* my_sqlite3_column_blob(sqlite3_stmt *pStmt, int idx) {
 
 static int my_sqlite3_column_bytes(sqlite3_stmt *pStmt, int idx) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         // Bounds check
         if (idx < 0 || idx >= pg_stmt->num_cols) {
@@ -1473,7 +1748,7 @@ static int my_sqlite3_column_bytes(sqlite3_stmt *pStmt, int idx) {
 
 static const char* my_sqlite3_column_name(sqlite3_stmt *pStmt, int idx) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         // Bounds check
         if (idx < 0 || idx >= pg_stmt->num_cols) {
@@ -1487,7 +1762,7 @@ static const char* my_sqlite3_column_name(sqlite3_stmt *pStmt, int idx) {
 
 static int my_sqlite3_data_count(sqlite3_stmt *pStmt) {
 #if PG_READ_ENABLED
-    pg_stmt_t *pg_stmt = find_pg_stmt(pStmt);
+    pg_stmt_t *pg_stmt = find_any_pg_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
         // If we have a valid row, return the column count
         if (pg_stmt->current_row < pg_stmt->num_rows) {
@@ -1540,9 +1815,60 @@ static sqlite3_int64 my_sqlite3_last_insert_rowid(sqlite3 *db) {
 
 // Intercept sqlite3_get_table for debugging
 static int my_sqlite3_get_table(sqlite3 *db, const char *sql, char ***pazResult, int *pnRow, int *pnColumn, char **pzErrMsg) {
-    if (strstr(sql, "play_queue") || strstr(sql, "generator")) {
-        log_message("GET_TABLE (play_queue/generator): %.500s", sql);
+    pg_connection_t *pg_conn = find_pg_connection(db);
+
+    if (pg_conn && pg_conn->is_pg_active && pg_conn->conn && is_read_operation(sql)) {
+        log_message("GET_TABLE PG: %.500s", sql);
+
+        // Translate and execute on PostgreSQL
+        sql_translation_t trans = sql_translate(sql);
+        if (trans.success && trans.sql) {
+            PGresult *res = PQexec(pg_conn->conn, trans.sql);
+            ExecStatusType status = PQresultStatus(res);
+
+            if (status == PGRES_TUPLES_OK) {
+                int nrows = PQntuples(res);
+                int ncols = PQnfields(res);
+
+                // Allocate result array: (nrows+1) * ncols + 1 for column names
+                // Format: [col1_name, col2_name, ..., row1_col1, row1_col2, ..., row2_col1, ...]
+                int total = (nrows + 1) * ncols + 1;
+                char **result = malloc(total * sizeof(char*));
+                if (result) {
+                    // Column names first
+                    for (int c = 0; c < ncols; c++) {
+                        result[c] = strdup(PQfname(res, c));
+                    }
+                    // Then data rows
+                    for (int r = 0; r < nrows; r++) {
+                        for (int c = 0; c < ncols; c++) {
+                            if (PQgetisnull(res, r, c)) {
+                                result[(r + 1) * ncols + c] = NULL;
+                            } else {
+                                result[(r + 1) * ncols + c] = strdup(PQgetvalue(res, r, c));
+                            }
+                        }
+                    }
+                    result[total - 1] = NULL;
+
+                    *pazResult = result;
+                    *pnRow = nrows;
+                    *pnColumn = ncols;
+                    if (pzErrMsg) *pzErrMsg = NULL;
+
+                    log_message("GET_TABLE PG: %d rows, %d cols", nrows, ncols);
+                    PQclear(res);
+                    sql_translation_free(&trans);
+                    return SQLITE_OK;
+                }
+            } else {
+                log_message("GET_TABLE PG error: %s", PQerrorMessage(pg_conn->conn));
+            }
+            PQclear(res);
+        }
+        sql_translation_free(&trans);
     }
+
     return sqlite3_get_table(db, sql, pazResult, pnRow, pnColumn, pzErrMsg);
 }
 
