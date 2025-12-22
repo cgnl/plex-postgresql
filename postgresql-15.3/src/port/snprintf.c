@@ -357,7 +357,7 @@ static void trailing_pad(int padlen, PrintfTarget *target);
 #ifndef HAVE_STRCHRNUL
 
 static inline const char *
-strchrnul(const char *s, int c)
+pg_strchrnul(const char *s, int c)
 {
 	while (*s != '\0' && *s != c)
 		s++;
@@ -421,7 +421,7 @@ dopr(PrintfTarget *target, const char *format, va_list args)
 		if (*format != '%')
 		{
 			/* Scan to next '%' or end of string */
-			const char *next_pct = strchrnul(format + 1, '%');
+			const char *next_pct = pg_strchrnul(format + 1, '%');
 
 			/* Dump literal data we just scanned over */
 			dostr(format, next_pct - format, target);

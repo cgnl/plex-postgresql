@@ -12,7 +12,6 @@
 #include "pg_logging.h"
 #include "pg_client.h"
 #include "pg_statement.h"
-#include "fishhook.h"
 #include "sql_translator.h"
 
 // ============================================================================
@@ -29,90 +28,57 @@
     };
 
 // ============================================================================
-// Helpers & Original Function Pointers
+// Robust Symbol Resolution
 // ============================================================================
 
-static int (*orig_sqlite3_open)(const char*, sqlite3**) = NULL;
-static int (*orig_sqlite3_open_v2)(const char*, sqlite3**, int, const char*) = NULL;
-static int (*orig_sqlite3_close)(sqlite3*) = NULL;
-static int (*orig_sqlite3_close_v2)(sqlite3*) = NULL;
-static int (*orig_sqlite3_prepare)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
-static int (*orig_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
-static int (*orig_sqlite3_prepare_v3)(sqlite3*, const char*, int, unsigned int, sqlite3_stmt**, const char**) = NULL;
-static int (*orig_sqlite3_step)(sqlite3_stmt*) = NULL;
-static int (*orig_sqlite3_reset)(sqlite3_stmt*) = NULL;
-static int (*orig_sqlite3_finalize)(sqlite3_stmt*) = NULL;
-static int (*orig_sqlite3_exec)(sqlite3*, const char*, int(*)(void*,int,char**,char**), void*, char**) = NULL;
-static sqlite3_int64 (*orig_sqlite3_last_insert_rowid)(sqlite3*) = NULL;
-static int (*orig_sqlite3_changes)(sqlite3*) = NULL;
-static const char* (*orig_sqlite3_errmsg)(sqlite3*) = NULL;
-static int (*orig_sqlite3_errcode)(sqlite3*) = NULL;
-static int (*orig_sqlite3_column_count)(sqlite3_stmt*) = NULL;
-static const char* (*orig_sqlite3_column_name)(sqlite3_stmt*, int) = NULL;
-static int (*orig_sqlite3_column_type)(sqlite3_stmt*, int) = NULL;
-static int (*orig_sqlite3_column_int)(sqlite3_stmt*, int) = NULL;
-static sqlite3_int64 (*orig_sqlite3_column_int64)(sqlite3_stmt*, int) = NULL;
-static const unsigned char* (*orig_sqlite3_column_text)(sqlite3_stmt*, int) = NULL;
-static const void* (*orig_sqlite3_column_blob)(sqlite3_stmt*, int) = NULL;
-static double (*orig_sqlite3_column_double)(sqlite3_stmt*, int) = NULL;
-static int (*orig_sqlite3_column_bytes)(sqlite3_stmt*, int) = NULL;
-static int (*orig_sqlite3_bind_int)(sqlite3_stmt*, int, int) = NULL;
-static int (*orig_sqlite3_bind_int64)(sqlite3_stmt*, int, sqlite3_int64) = NULL;
-static int (*orig_sqlite3_bind_text)(sqlite3_stmt*, int, const char*, int, void(*)(void*)) = NULL;
-static int (*orig_sqlite3_bind_double)(sqlite3_stmt*, int, double) = NULL;
-static int (*orig_sqlite3_bind_blob)(sqlite3_stmt*, int, const void*, int, void(*)(void*)) = NULL;
-static int (*orig_sqlite3_bind_null)(sqlite3_stmt*, int) = NULL;
-static int (*orig_sqlite3_bind_parameter_count)(sqlite3_stmt*) = NULL;
-static int (*orig_sqlite3_stmt_readonly)(sqlite3_stmt*) = NULL;
-static const char* (*orig_sqlite3_column_decltype)(sqlite3_stmt*, int) = NULL;
-static int (*orig_sqlite3_clear_bindings)(sqlite3_stmt*) = NULL;
-static int (*orig_sqlite3_wal_checkpoint)(sqlite3*, const char*) = NULL;
-static int (*orig_sqlite3_wal_checkpoint_v2)(sqlite3*, const char*, int, int*, int*) = NULL;
-static int (*orig_sqlite3_table_column_metadata)(sqlite3*, const char*, const char*, const char*, const char**, const char**, int*, int*, int*) = NULL;
+static void* resolve_sqlite_symbol(const char *symbol) {
+    // 1. Prioritize Plex bundled library for ABI compatibility
+    const char *bundled_path = "/Applications/Plex Media Server.app/Contents/Frameworks/libsqlite3.dylib";
+    void *bundled = dlopen(bundled_path, RTLD_LAZY | RTLD_NOLOAD);
+    if (bundled) {
+        void *s = dlsym(bundled, symbol);
+        if (s) {
+            Dl_info info;
+            if (dladdr(s, &info) && !strstr(info.dli_fname, "db_interpose_pg.dylib")) {
+                dlclose(bundled);
+                return s;
+            }
+        }
+        dlclose(bundled);
+    }
 
-static void resolve_all_symbols() {
-    struct rebinding rebs[] = {
-        {"sqlite3_open", NULL, (void**)&orig_sqlite3_open},
-        {"sqlite3_open_v2", NULL, (void**)&orig_sqlite3_open_v2},
-        {"sqlite3_close", NULL, (void**)&orig_sqlite3_close},
-        {"sqlite3_close_v2", NULL, (void**)&orig_sqlite3_close_v2},
-        {"sqlite3_prepare", NULL, (void**)&orig_sqlite3_prepare},
-        {"sqlite3_prepare_v2", NULL, (void**)&orig_sqlite3_prepare_v2},
-        {"sqlite3_prepare_v3", NULL, (void**)&orig_sqlite3_prepare_v3},
-        {"sqlite3_step", NULL, (void**)&orig_sqlite3_step},
-        {"sqlite3_reset", NULL, (void**)&orig_sqlite3_reset},
-        {"sqlite3_finalize", NULL, (void**)&orig_sqlite3_finalize},
-        {"sqlite3_exec", NULL, (void**)&orig_sqlite3_exec},
-        {"sqlite3_last_insert_rowid", NULL, (void**)&orig_sqlite3_last_insert_rowid},
-        {"sqlite3_changes", NULL, (void**)&orig_sqlite3_changes},
-        {"sqlite3_errmsg", NULL, (void**)&orig_sqlite3_errmsg},
-        {"sqlite3_errcode", NULL, (void**)&orig_sqlite3_errcode},
-        {"sqlite3_column_count", NULL, (void**)&orig_sqlite3_column_count},
-        {"sqlite3_column_name", NULL, (void**)&orig_sqlite3_column_name},
-        {"sqlite3_column_type", NULL, (void**)&orig_sqlite3_column_type},
-        {"sqlite3_column_int", NULL, (void**)&orig_sqlite3_column_int},
-        {"sqlite3_column_int64", NULL, (void**)&orig_sqlite3_column_int64},
-        {"sqlite3_column_text", NULL, (void**)&orig_sqlite3_column_text},
-        {"sqlite3_column_blob", NULL, (void**)&orig_sqlite3_column_blob},
-        {"sqlite3_column_double", NULL, (void**)&orig_sqlite3_column_double},
-        {"sqlite3_column_bytes", NULL, (void**)&orig_sqlite3_column_bytes},
-        {"sqlite3_bind_int", NULL, (void**)&orig_sqlite3_bind_int},
-        {"sqlite3_bind_int64", NULL, (void**)&orig_sqlite3_bind_int64},
-        {"sqlite3_bind_text", NULL, (void**)&orig_sqlite3_bind_text},
-        {"sqlite3_bind_double", NULL, (void**)&orig_sqlite3_bind_double},
-        {"sqlite3_bind_blob", NULL, (void**)&orig_sqlite3_bind_blob},
-        {"sqlite3_bind_null", NULL, (void**)&orig_sqlite3_bind_null},
-        {"sqlite3_bind_parameter_count", NULL, (void**)&orig_sqlite3_bind_parameter_count},
-        {"sqlite3_stmt_readonly", NULL, (void**)&orig_sqlite3_stmt_readonly},
-        {"sqlite3_column_decltype", NULL, (void**)&orig_sqlite3_column_decltype},
-        {"sqlite3_clear_bindings", NULL, (void**)&orig_sqlite3_clear_bindings},
-        {"sqlite3_wal_checkpoint", NULL, (void**)&orig_sqlite3_wal_checkpoint},
-        {"sqlite3_wal_checkpoint_v2", NULL, (void**)&orig_sqlite3_wal_checkpoint_v2},
-        {"sqlite3_table_column_metadata", NULL, (void**)&orig_sqlite3_table_column_metadata}
-    };
-    // Fishhook finds the original implementations in the lazy/non-lazy jump tables
-    rebind_symbols(rebs, sizeof(rebs)/sizeof(struct rebinding));
-    LOG_INFO("Resolved all symbols via fishhook");
+    // 2. Fallback to RTLD_NEXT
+    void *sym = dlsym(RTLD_NEXT, symbol);
+    if (sym) {
+        Dl_info info;
+        if (dladdr(sym, &info) && !strstr(info.dli_fname, "db_interpose_pg.dylib")) {
+            return sym;
+        }
+    }
+    
+    // 3. Last resort: Search all images but skip ourselves
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *img_name = _dyld_get_image_name(i);
+        if (strstr(img_name, "db_interpose_pg.dylib")) continue;
+        
+        void *h = dlopen(img_name, RTLD_LAZY | RTLD_NOLOAD);
+        if (h) {
+            void *s = dlsym(h, symbol);
+            if (s) {
+                Dl_info info;
+                if (dladdr(s, &info) && !strstr(info.dli_fname, "db_interpose_pg.dylib")) {
+                    LOG_INFO("Found %s in %s at %p", symbol, info.dli_fname, s);
+                    dlclose(h);
+                    return s;
+                }
+            }
+            dlclose(h);
+        }
+    }
+    
+    LOG_ERROR("CRITICAL: Failed to resolve symbol %s", symbol);
+    return NULL;
 }
 
 // ============================================================================
@@ -123,8 +89,11 @@ static int my_sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, c
     int should_redir = should_redirect(filename);
     if (should_redir) LOG_INFO("Redirecting DB: %s", filename);
     
-    if (!orig_sqlite3_open_v2) return SQLITE_ERROR;
-    int rc = orig_sqlite3_open_v2(filename, ppDb, flags, zVfs);
+    static int (*orig)(const char*, sqlite3**, int, const char*) = NULL;
+    if (!orig) orig = (int(*)(const char*, sqlite3**, int, const char*)) resolve_sqlite_symbol("sqlite3_open_v2");
+    
+    if (!orig) return SQLITE_ERROR;
+    int rc = orig(filename, ppDb, flags, zVfs);
     
     if (rc == SQLITE_OK && should_redir) {
         sqlite3 *db = *ppDb;
@@ -154,12 +123,13 @@ static int my_sqlite3_close(sqlite3 *db) {
         pg_unregister_connection(db);
         pg_close(conn);
     }
-    if (!orig_sqlite3_close) return SQLITE_OK;
-    return orig_sqlite3_close(db);
+    static int (*orig)(sqlite3*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3*)) resolve_sqlite_symbol("sqlite3_close");
+    return orig ? orig(db) : SQLITE_OK;
 }
 
 static int my_sqlite3_close_v2(sqlite3 *db) {
-    return my_sqlite3_close(db); // close_v2 is similar enough for us
+    return my_sqlite3_close(db);
 }
 
 static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte, sqlite3_stmt **ppStmt, const char **pzTail) {
@@ -185,8 +155,9 @@ static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte, sqlit
         LOG_INFO("PREPARE -> SKIP to SQLite");
     }
     
-    if (!orig_sqlite3_prepare_v2) return SQLITE_ERROR;
-    return orig_sqlite3_prepare_v2(db, zSql, nByte, ppStmt, pzTail);
+    static int (*orig)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
+    if (!orig) orig = (int(*)(sqlite3*, const char*, int, sqlite3_stmt**, const char**)) resolve_sqlite_symbol("sqlite3_prepare_v2");
+    return orig ? orig(db, zSql, nByte, ppStmt, pzTail) : SQLITE_ERROR;
 }
 
 static int my_sqlite3_prepare(sqlite3 *db, const char *zSql, int nByte, sqlite3_stmt **ppStmt, const char **pzTail) {
@@ -203,20 +174,23 @@ static int my_sqlite3_prepare16_v2(sqlite3 *db, const void *zSql, int nByte, sql
 
 static int my_sqlite3_step(sqlite3_stmt *pStmt) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_step((pg_stmt_t*)pStmt);
-    if (!orig_sqlite3_step) return SQLITE_ERROR;
-    return orig_sqlite3_step(pStmt);
+    static int (*orig)(sqlite3_stmt*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*)) resolve_sqlite_symbol("sqlite3_step");
+    return orig ? orig(pStmt) : SQLITE_ERROR;
 }
 
 static int my_sqlite3_reset(sqlite3_stmt *pStmt) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_reset((pg_stmt_t*)pStmt);
-    if (!orig_sqlite3_reset) return SQLITE_OK;
-    return orig_sqlite3_reset(pStmt);
+    static int (*orig)(sqlite3_stmt*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*)) resolve_sqlite_symbol("sqlite3_reset");
+    return orig ? orig(pStmt) : SQLITE_OK;
 }
 
 static int my_sqlite3_finalize(sqlite3_stmt *pStmt) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_finalize((pg_stmt_t*)pStmt);
-    if (!orig_sqlite3_finalize) return SQLITE_OK;
-    return orig_sqlite3_finalize(pStmt);
+    static int (*orig)(sqlite3_stmt*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*)) resolve_sqlite_symbol("sqlite3_finalize");
+    return orig ? orig(pStmt) : SQLITE_OK;
 }
 
 static int my_sqlite3_exec(sqlite3 *db, const char *sql, int (*callback)(void*,int,char**,char**), void *arg, char **errmsg) {
@@ -230,146 +204,195 @@ static int my_sqlite3_exec(sqlite3 *db, const char *sql, int (*callback)(void*,i
          pg_finalize(stmt);
          return SQLITE_OK;
     }
-    if (!orig_sqlite3_exec) return SQLITE_ERROR;
-    return orig_sqlite3_exec(db, sql, callback, arg, errmsg);
+    static int (*orig)(sqlite3*, const char*, int(*)(void*,int,char**,char**), void*, char**) = NULL;
+    if (!orig) orig = (int(*)(sqlite3*, const char*, int(*)(void*,int,char**,char**), void*, char**)) resolve_sqlite_symbol("sqlite3_exec");
+    return orig ? orig(db, sql, callback, arg, errmsg) : SQLITE_ERROR;
 }
 
 static sqlite3_int64 my_sqlite3_last_insert_rowid(sqlite3 *db) {
     pg_connection_t *conn = find_pg_connection(db);
     if (conn && conn->is_pg_active) return conn->last_insert_rowid;
-    if (!orig_sqlite3_last_insert_rowid) return 0;
-    return orig_sqlite3_last_insert_rowid(db);
+    static sqlite3_int64 (*orig)(sqlite3*) = NULL;
+    if (!orig) orig = (sqlite3_int64(*)(sqlite3*)) resolve_sqlite_symbol("sqlite3_last_insert_rowid");
+    return orig ? orig(db) : 0;
 }
 
 static int my_sqlite3_changes(sqlite3 *db) {
     pg_connection_t *conn = find_pg_connection(db);
     if (conn && conn->is_pg_active) return conn->last_changes;
-    if (!orig_sqlite3_changes) return 0;
-    return orig_sqlite3_changes(db);
+    static int (*orig)(sqlite3*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3*)) resolve_sqlite_symbol("sqlite3_changes");
+    return orig ? orig(db) : 0;
 }
 
 static const char *my_sqlite3_errmsg(sqlite3 *db) {
     pg_connection_t *conn = find_pg_connection(db);
     if (conn && conn->is_pg_active) return conn->last_error;
-    if (orig_sqlite3_errmsg) return orig_sqlite3_errmsg(db);
+    static const char* (*orig)(sqlite3*) = NULL;
+    if (!orig) orig = (const char*(*)(sqlite3*)) resolve_sqlite_symbol("sqlite3_errmsg");
+    if (orig) return orig(db);
     return "Shim Error: original errmsg not found";
 }
 
 static int my_sqlite3_errcode(sqlite3 *db) {
     pg_connection_t *conn = find_pg_connection(db);
     if (conn && conn->is_pg_active) return conn->last_error_code;
-    return orig_sqlite3_errcode ? orig_sqlite3_errcode(db) : SQLITE_ERROR;
+    static int (*orig)(sqlite3*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3*)) resolve_sqlite_symbol("sqlite3_errcode");
+    return orig ? orig(db) : SQLITE_ERROR;
 }
 
 static int my_sqlite3_bind_parameter_count(sqlite3_stmt *pStmt) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return ((pg_stmt_t*)pStmt)->param_count;
-    return orig_sqlite3_bind_parameter_count ? orig_sqlite3_bind_parameter_count(pStmt) : 0;
+    static int (*orig)(sqlite3_stmt*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*)) resolve_sqlite_symbol("sqlite3_bind_parameter_count");
+    return orig ? orig(pStmt) : 0;
 }
 
 static int my_sqlite3_stmt_readonly(sqlite3_stmt *pStmt) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return 0; // Assume RW for safety
-    return orig_sqlite3_stmt_readonly ? orig_sqlite3_stmt_readonly(pStmt) : 0;
+    static int (*orig)(sqlite3_stmt*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*)) resolve_sqlite_symbol("sqlite3_stmt_readonly");
+    return orig ? orig(pStmt) : 0;
 }
 
 static const char* my_sqlite3_column_decltype(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return "text";
-    return orig_sqlite3_column_decltype ? orig_sqlite3_column_decltype(pStmt, idx) : NULL;
+    static const char* (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (const char*(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_column_decltype");
+    return orig ? orig(pStmt, idx) : NULL;
 }
 
 // Column Accessors
 static int my_sqlite3_column_count(sqlite3_stmt *pStmt) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_column_count((pg_stmt_t*)pStmt);
-    return orig_sqlite3_column_count ? orig_sqlite3_column_count(pStmt) : 0;
+    static int (*orig)(sqlite3_stmt*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*)) resolve_sqlite_symbol("sqlite3_column_count");
+    return orig ? orig(pStmt) : 0;
 }
 
 static const char* my_sqlite3_column_name(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_column_name((pg_stmt_t*)pStmt, idx);
-    return orig_sqlite3_column_name ? orig_sqlite3_column_name(pStmt, idx) : NULL;
+    static const char* (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (const char*(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_column_name");
+    return orig ? orig(pStmt, idx) : NULL;
 }
 
 static int my_sqlite3_column_type(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_column_type((pg_stmt_t*)pStmt, idx);
-    return orig_sqlite3_column_type ? orig_sqlite3_column_type(pStmt, idx) : SQLITE_NULL;
+    static int (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_column_type");
+    return orig ? orig(pStmt, idx) : SQLITE_NULL;
 }
 
 static int my_sqlite3_column_int(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_column_int((pg_stmt_t*)pStmt, idx);
-    return orig_sqlite3_column_int ? orig_sqlite3_column_int(pStmt, idx) : 0;
+    static int (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_column_int");
+    return orig ? orig(pStmt, idx) : 0;
 }
 
 static sqlite3_int64 my_sqlite3_column_int64(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_column_int64((pg_stmt_t*)pStmt, idx);
-    return orig_sqlite3_column_int64 ? orig_sqlite3_column_int64(pStmt, idx) : 0;
+    static sqlite3_int64 (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (sqlite3_int64(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_column_int64");
+    return orig ? orig(pStmt, idx) : 0;
 }
 
 static const unsigned char* my_sqlite3_column_text(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_column_text((pg_stmt_t*)pStmt, idx);
-    return orig_sqlite3_column_text ? orig_sqlite3_column_text(pStmt, idx) : NULL;
+    static const unsigned char* (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (const unsigned char*(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_column_text");
+    return orig ? orig(pStmt, idx) : NULL;
 }
 
 static const void* my_sqlite3_column_blob(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_column_blob((pg_stmt_t*)pStmt, idx);
-    return orig_sqlite3_column_blob ? orig_sqlite3_column_blob(pStmt, idx) : NULL;
+    static const void* (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (const void*(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_column_blob");
+    return orig ? orig(pStmt, idx) : NULL;
 }
 
 static double my_sqlite3_column_double(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_column_double((pg_stmt_t*)pStmt, idx);
-    return orig_sqlite3_column_double ? orig_sqlite3_column_double(pStmt, idx) : 0.0;
+    static double (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (double(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_column_double");
+    return orig ? orig(pStmt, idx) : 0.0;
 }
 
 static int my_sqlite3_column_bytes(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_column_bytes((pg_stmt_t*)pStmt, idx);
-    return orig_sqlite3_column_bytes ? orig_sqlite3_column_bytes(pStmt, idx) : 0;
+    static int (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_column_bytes");
+    return orig ? orig(pStmt, idx) : 0;
 }
 
+// Bindings
 static int my_sqlite3_bind_int(sqlite3_stmt *pStmt, int idx, int val) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_bind_int((pg_stmt_t*)pStmt, idx, val);
-    return orig_sqlite3_bind_int ? orig_sqlite3_bind_int(pStmt, idx, val) : SQLITE_ERROR;
+    static int (*orig)(sqlite3_stmt*, int, int) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*, int, int)) resolve_sqlite_symbol("sqlite3_bind_int");
+    return orig ? orig(pStmt, idx, val) : SQLITE_ERROR;
 }
 
 static int my_sqlite3_bind_int64(sqlite3_stmt *pStmt, int idx, sqlite3_int64 val) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_bind_int64((pg_stmt_t*)pStmt, idx, val);
-    return orig_sqlite3_bind_int64 ? orig_sqlite3_bind_int64(pStmt, idx, val) : SQLITE_ERROR;
+    static int (*orig)(sqlite3_stmt*, int, sqlite3_int64) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*, int, sqlite3_int64)) resolve_sqlite_symbol("sqlite3_bind_int64");
+    return orig ? orig(pStmt, idx, val) : SQLITE_ERROR;
 }
 
 static int my_sqlite3_bind_text(sqlite3_stmt *pStmt, int idx, const char *val, int len, void(*destructor)(void*)) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_bind_text((pg_stmt_t*)pStmt, idx, val, len, destructor);
-    return orig_sqlite3_bind_text ? orig_sqlite3_bind_text(pStmt, idx, val, len, destructor) : SQLITE_ERROR;
+    static int (*orig)(sqlite3_stmt*, int, const char*, int, void(*)(void*)) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*, int, const char*, int, void(*)(void*))) resolve_sqlite_symbol("sqlite3_bind_text");
+    return orig ? orig(pStmt, idx, val, len, destructor) : SQLITE_ERROR;
 }
 
 static int my_sqlite3_bind_double(sqlite3_stmt *pStmt, int idx, double val) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_bind_double((pg_stmt_t*)pStmt, idx, val);
-    return orig_sqlite3_bind_double ? orig_sqlite3_bind_double(pStmt, idx, val) : SQLITE_ERROR;
+    static int (*orig)(sqlite3_stmt*, int, double) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*, int, double)) resolve_sqlite_symbol("sqlite3_bind_double");
+    return orig ? orig(pStmt, idx, val) : SQLITE_ERROR;
 }
 
 static int my_sqlite3_bind_blob(sqlite3_stmt *pStmt, int idx, const void *val, int len, void(*destructor)(void*)) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_bind_blob((pg_stmt_t*)pStmt, idx, val, len, destructor);
-    return orig_sqlite3_bind_blob ? orig_sqlite3_bind_blob(pStmt, idx, val, len, destructor) : SQLITE_ERROR;
+    static int (*orig)(sqlite3_stmt*, int, const void*, int, void(*)(void*)) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*, int, const void*, int, void(*)(void*))) resolve_sqlite_symbol("sqlite3_bind_blob");
+    return orig ? orig(pStmt, idx, val, len, destructor) : SQLITE_ERROR;
 }
 
 static int my_sqlite3_bind_null(sqlite3_stmt *pStmt, int idx) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return pg_bind_null((pg_stmt_t*)pStmt, idx);
-    return orig_sqlite3_bind_null ? orig_sqlite3_bind_null(pStmt, idx) : SQLITE_ERROR;
+    static int (*orig)(sqlite3_stmt*, int) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*, int)) resolve_sqlite_symbol("sqlite3_bind_null");
+    return orig ? orig(pStmt, idx) : SQLITE_ERROR;
 }
 
 static int my_sqlite3_clear_bindings(sqlite3_stmt *pStmt) {
     if (is_pg_stmt((pg_stmt_t*)pStmt)) return SQLITE_OK;
-    return orig_sqlite3_clear_bindings ? orig_sqlite3_clear_bindings(pStmt) : SQLITE_OK;
+    static int (*orig)(sqlite3_stmt*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3_stmt*)) resolve_sqlite_symbol("sqlite3_clear_bindings");
+    return orig ? orig(pStmt) : SQLITE_OK;
 }
 
 static int my_sqlite3_wal_checkpoint(sqlite3 *db, const char *zDb) {
-    if (!orig_sqlite3_wal_checkpoint) return SQLITE_OK;
-    return orig_sqlite3_wal_checkpoint(db, zDb);
+    static int (*orig)(sqlite3*, const char*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3*, const char*)) resolve_sqlite_symbol("sqlite3_wal_checkpoint");
+    return orig ? orig(db, zDb) : SQLITE_OK;
 }
 
 static int my_sqlite3_wal_checkpoint_v2(sqlite3 *db, const char *zDb, int eMode, int *pnLog, int *pnCkpt) {
-    if (!orig_sqlite3_wal_checkpoint_v2) return SQLITE_OK;
-    return orig_sqlite3_wal_checkpoint_v2(db, zDb, eMode, pnLog, pnCkpt);
+    static int (*orig)(sqlite3*, const char*, int, int*, int*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3*, const char*, int, int*, int*)) resolve_sqlite_symbol("sqlite3_wal_checkpoint_v2");
+    return orig ? orig(db, zDb, eMode, pnLog, pnCkpt) : SQLITE_OK;
 }
 
 static int my_sqlite3_table_column_metadata(sqlite3 *db, const char *zDbName, const char *zTableName, const char *zColumnName, const char **pzDataType, const char **pzCollSeq, int *pNotNull, int *pPrimaryKey, int *pAutoinc) {
-    if (!orig_sqlite3_table_column_metadata) return SQLITE_ERROR;
-    return orig_sqlite3_table_column_metadata(db, zDbName, zTableName, zColumnName, pzDataType, pzCollSeq, pNotNull, pPrimaryKey, pAutoinc);
+    static int (*orig)(sqlite3*, const char*, const char*, const char*, const char**, const char**, int*, int*, int*) = NULL;
+    if (!orig) orig = (int(*)(sqlite3*, const char*, const char*, const char*, const char**, const char**, int*, int*, int*)) resolve_sqlite_symbol("sqlite3_table_column_metadata");
+    return orig ? orig(db, zDbName, zTableName, zColumnName, pzDataType, pzCollSeq, pNotNull, pPrimaryKey, pAutoinc) : SQLITE_ERROR;
 }
 
 // ============================================================================
@@ -420,6 +443,5 @@ static void shim_init(void) {
     fprintf(stderr, "!!!!! SHIM INIT RUNNING !!!!!\n");
     init_logging();
     load_config();
-    resolve_all_symbols(); // Must be called after init_logging
     LOG_INFO("Shim initialized.");
 }
