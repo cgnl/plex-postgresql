@@ -21,6 +21,9 @@ This project provides a shim library that intercepts Plex's SQLite calls and red
 ### SQL Translation Enhancements
 - ✅ **JSON functions**: `json_each()` → `json_array_elements()` with proper type casting
 - ✅ **GROUP BY strict mode**: Automatically adds missing non-aggregate columns
+- ✅ **GROUP BY NULL removal**: SQLite allows `GROUP BY NULL`, PostgreSQL doesn't
+- ✅ **HAVING alias resolution**: Resolves column aliases in HAVING clauses
+- ✅ **Empty IN clause handling**: `IN ()` and `IN (  )` → `IN (NULL)`
 - ✅ **50+ function translations**: iif, typeof, strftime, unixepoch, datetime, and more
 - ✅ **Smart caching**: Thread-local result caching for improved performance
 
@@ -308,12 +311,14 @@ plex-postgresql/
 ├── src/
 │   ├── db_interpose_pg.c        # macOS shim (1920 lines)
 │   ├── db_interpose_pg_linux.c  # Linux shim
-│   └── sql_translator.c         # SQL translation engine (2001 lines)
+│   └── sql_translator.c         # SQL translation engine (2087 lines)
 ├── include/
 │   ├── db_interpose.h
 │   └── sql_translator.h
 ├── scripts/
-│   └── analyze_fallbacks.sh     # Fallback analysis tool
+│   ├── analyze_fallbacks.sh     # Fallback analysis tool
+│   ├── start_plex_pg.sh         # Start Plex with PostgreSQL shim
+│   └── update_toc.sh            # Update table of contents in source files
 ├── docs/
 │   ├── MODULES.md               # Code structure & navigation guide
 │   └── FALLBACK_IMPROVEMENT.md  # SQL translator improvement guide
