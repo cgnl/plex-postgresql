@@ -34,6 +34,8 @@ typedef struct pg_connection {
     int last_changes;           // Track rows affected by last write
     sqlite3_int64 last_insert_rowid;  // Track last inserted row ID
     sqlite3_int64 last_generator_metadata_id;  // Track metadata_item_id from last generator URI
+    char last_error[1024];      // Track last PostgreSQL error message
+    int last_error_code;        // Track last SQLite-style error code
 } pg_connection_t;
 
 // Statement structure

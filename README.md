@@ -76,7 +76,7 @@ psql -U plex -d plex -c "CREATE SCHEMA plex;"
 ### 3. Build the Shim
 
 ```bash
-git clone https://github.com/yourusername/plex-postgresql.git
+git clone https://github.com/cgnl/plex-postgresql.git
 cd plex-postgresql
 make clean && make
 ```
@@ -146,7 +146,7 @@ sudo -u postgres psql -d plex -c "CREATE SCHEMA plex;"
 ### 3. Build the Shim
 
 ```bash
-git clone https://github.com/yourusername/plex-postgresql.git
+git clone https://github.com/cgnl/plex-postgresql.git
 cd plex-postgresql
 make linux
 ```
@@ -172,7 +172,7 @@ export PLEX_PG_SCHEMA=plex
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/plex-postgresql.git
+git clone https://github.com/cgnl/plex-postgresql.git
 cd plex-postgresql
 
 # Edit docker-compose.yml to set your media paths
@@ -309,22 +309,25 @@ psql -h localhost -U plex -d plex -c \
 ```
 plex-postgresql/
 ├── src/
-│   ├── db_interpose_pg.c        # macOS shim (1920 lines)
-│   ├── db_interpose_pg_linux.c  # Linux shim
-│   └── sql_translator.c         # SQL translation engine (2087 lines)
+│   ├── pg_types.h              # Core type definitions (structs)
+│   ├── pg_config.h/c           # Configuration loading
+│   ├── pg_logging.h/c          # Logging infrastructure
+│   ├── pg_client.h/c           # PostgreSQL connection management
+│   ├── pg_statement.h/c        # Statement lifecycle (prepare/bind/step)
+│   ├── db_interpose_pg.c       # macOS DYLD interpose entry point
+│   ├── db_interpose_pg_linux.c # Linux LD_PRELOAD shim
+│   ├── sql_translator.c        # SQL translation engine (2200+ lines)
+│   └── fishhook.c              # Facebook's fishhook library
 ├── include/
-│   ├── db_interpose.h
-│   └── sql_translator.h
+│   └── sql_translator.h        # SQL translator public interface
 ├── scripts/
-│   ├── analyze_fallbacks.sh     # Fallback analysis tool
-│   ├── start_plex_pg.sh         # Start Plex with PostgreSQL shim
-│   └── update_toc.sh            # Update table of contents in source files
-├── docs/
-│   ├── MODULES.md               # Code structure & navigation guide
-│   └── FALLBACK_IMPROVEMENT.md  # SQL translator improvement guide
+│   ├── analyze_fallbacks.sh    # Fallback analysis tool
+│   └── start_plex_pg.sh        # Start Plex with PostgreSQL shim
 ├── Dockerfile
 ├── docker-compose.yml
 ├── Makefile
+├── MODULES.md                  # Code structure & navigation guide
+├── FALLBACK_IMPROVEMENT.md     # SQL translator improvement guide
 └── README.md
 ```
 
@@ -401,11 +404,16 @@ See [FALLBACK_IMPROVEMENT.md](FALLBACK_IMPROVEMENT.md) for detailed guide.
 
 ### Code Navigation
 
-All major source files have Table of Contents at the top:
-- `src/db_interpose_pg.c` - Line ~18-90
-- `src/sql_translator.c` - Line ~6-64
+The codebase is organized into focused modules:
+- `pg_types.h` - All type definitions
+- `pg_config.c` - Configuration loading
+- `pg_logging.c` - Logging infrastructure
+- `pg_client.c` - PostgreSQL connection
+- `pg_statement.c` - Statement lifecycle
+- `db_interpose_pg.c` - DYLD interpose entry
+- `sql_translator.c` - SQL translation engine
 
-Use [MODULES.md](MODULES.md) for complete navigation guide.
+Use [MODULES.md](MODULES.md) for complete navigation guide with function references.
 
 ## 🎯 Roadmap
 
@@ -522,8 +530,8 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/plex-postgresql/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/plex-postgresql/discussions)
+- **Issues**: [GitHub Issues](https://github.com/cgnl/plex-postgresql/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/cgnl/plex-postgresql/discussions)
 - **Documentation**: [MODULES.md](MODULES.md) | [FALLBACK_IMPROVEMENT.md](FALLBACK_IMPROVEMENT.md)
 
 ---
