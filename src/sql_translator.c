@@ -1370,8 +1370,17 @@ char* sql_translate_types(const char *sql) {
 
     // varchar(255) -> VARCHAR(255) (same, but normalize case)
     // TEXT is the same
-    // BLOB -> BYTEA
-    temp = str_replace_nocase(current, " BLOB", " BYTEA");
+    // BLOB -> BYTEA (only in DDL context, not table names like "blobs")
+    // Match specific patterns to avoid replacing table names
+    temp = str_replace_nocase(current, " BLOB)", " BYTEA)");  // end of column def
+    free(current);
+    current = temp;
+
+    temp = str_replace_nocase(current, " BLOB,", " BYTEA,");  // followed by comma
+    free(current);
+    current = temp;
+
+    temp = str_replace_nocase(current, " BLOB ", " BYTEA ");  // followed by space (DEFAULT etc)
     free(current);
     current = temp;
 
