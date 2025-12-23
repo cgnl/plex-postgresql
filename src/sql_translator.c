@@ -150,10 +150,16 @@ char* sql_translate_functions(const char *sql) {
     if (!temp) { LOG_ERROR("fix_integer_text_mismatch returned NULL"); return NULL; }
     current = temp;
 
-    // 15b. Fix GROUP BY strict mode
+    // 15b. Fix GROUP BY strict mode (legacy single-case handler)
     temp = fix_group_by_strict(current);
     free(current);
     if (!temp) { LOG_ERROR("fix_group_by_strict returned NULL"); return NULL; }
+    current = temp;
+
+    // 15b2. Fix GROUP BY strict mode (complete rewriter)
+    temp = fix_group_by_strict_complete(current);
+    free(current);
+    if (!temp) { LOG_ERROR("fix_group_by_strict_complete returned NULL"); return NULL; }
     current = temp;
 
     // 15c. Strip "collate icu_root"
@@ -272,9 +278,17 @@ sql_translation_t sql_translate(const char *sqlite_sql) {
         return result;
     }
 
-    // Step 5: Translate DDL quotes
-    char *step5 = translate_ddl_quotes(step4);
+    // Step 4a: Translate INSERT OR REPLACE to ON CONFLICT DO UPDATE
+    char *step4a = translate_insert_or_replace(step4);
     free(step4);
+    if (!step4a) {
+        strcpy(result.error, "INSERT OR REPLACE translation failed");
+        return result;
+    }
+
+    // Step 5: Translate DDL quotes
+    char *step5 = translate_ddl_quotes(step4a);
+    free(step4a);
     if (!step5) {
         strcpy(result.error, "DDL quote translation failed");
         return result;

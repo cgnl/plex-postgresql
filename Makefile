@@ -31,8 +31,8 @@ endif
 
 # SQL Translator modules
 SQL_TR_OBJS = src/sql_translator.o src/sql_tr_helpers.o src/sql_tr_placeholders.o \
-              src/sql_tr_functions.o src/sql_tr_query.o src/sql_tr_types.o \
-              src/sql_tr_quotes.o src/sql_tr_keywords.o
+              src/sql_tr_functions.o src/sql_tr_query.o src/sql_tr_groupby.o src/sql_tr_types.o \
+              src/sql_tr_quotes.o src/sql_tr_keywords.o src/sql_tr_upsert.o
 
 # PG modules
 PG_MODULES = src/pg_config.o src/pg_logging.o src/pg_client.o src/pg_statement.o
@@ -76,6 +76,9 @@ src/sql_tr_functions.o: src/sql_tr_functions.c src/sql_translator_internal.h
 src/sql_tr_query.o: src/sql_tr_query.c src/sql_translator_internal.h
 	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
 
+src/sql_tr_groupby.o: src/sql_tr_groupby.c src/sql_translator_internal.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
 src/sql_tr_types.o: src/sql_tr_types.c include/sql_translator.h src/sql_translator_internal.h
 	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
 
@@ -83,6 +86,9 @@ src/sql_tr_quotes.o: src/sql_tr_quotes.c src/sql_translator_internal.h
 	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
 
 src/sql_tr_keywords.o: src/sql_tr_keywords.c include/sql_translator.h src/sql_translator_internal.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
+src/sql_tr_upsert.o: src/sql_tr_upsert.c src/sql_translator_internal.h
 	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
 
 src/pg_config.o: src/pg_config.c src/pg_config.h src/pg_types.h

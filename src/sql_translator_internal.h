@@ -44,6 +44,7 @@ char* simplify_typeof_fixup(const char *sql);
 // ============================================================================
 
 char* fix_group_by_strict(const char *sql);
+char* fix_group_by_strict_complete(const char *sql);  // Complete GROUP BY rewriter
 char* add_subquery_alias(const char *sql);
 char* translate_case_booleans(const char *sql);
 char* translate_max_to_greatest(const char *sql);
@@ -74,5 +75,11 @@ char* fix_on_conflict_quotes(const char *sql);
 // ============================================================================
 
 char* fix_operator_spacing(const char *sql);
+
+// ============================================================================
+// UPSERT Translations (sql_tr_upsert.c)
+// ============================================================================
+
+char* translate_insert_or_replace(const char *sql);
 
 #endif // SQL_TRANSLATOR_INTERNAL_H

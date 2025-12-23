@@ -121,20 +121,22 @@ char* sql_translate_keywords(const char *sql) {
     free(current);
     current = temp;
 
-    // REPLACE INTO -> INSERT INTO
-    temp = str_replace_nocase(current, "REPLACE INTO", "INSERT INTO");
-    free(current);
-    current = temp;
+    // NOTE: INSERT OR REPLACE is handled by translate_insert_or_replace() in sql_tr_upsert.c
+    // We DO NOT translate it here to avoid conflicts with REPLACE INTO translation below.
 
-    // INSERT OR IGNORE -> INSERT
+    // INSERT OR IGNORE -> INSERT (with ON CONFLICT DO NOTHING added later)
     temp = str_replace_nocase(current, "INSERT OR IGNORE INTO", "INSERT INTO");
     free(current);
     current = temp;
 
-    // INSERT OR REPLACE -> INSERT
-    temp = str_replace_nocase(current, "INSERT OR REPLACE INTO", "INSERT INTO");
-    free(current);
-    current = temp;
+    // REPLACE INTO -> INSERT INTO (standalone REPLACE, not part of INSERT OR REPLACE)
+    // This handles SQLite's REPLACE INTO syntax which is equivalent to INSERT OR REPLACE
+    // But we only do this AFTER checking for INSERT OR REPLACE above
+    if (!strcasestr(current, "INSERT OR")) {
+        temp = str_replace_nocase(current, "REPLACE INTO", "INSERT INTO");
+        free(current);
+        current = temp;
+    }
 
     // GLOB -> LIKE
     temp = str_replace_nocase(current, " GLOB ", " LIKE ");
