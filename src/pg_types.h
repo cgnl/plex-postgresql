@@ -84,6 +84,7 @@ typedef struct pg_stmt {
     int is_pg;                       // 0=skip, 1=write, 2=read, 3=no-op
     int is_cached;                   // 1 if from TLS (cached stmt)
     int needs_requery;               // 1 if reset() was called
+    int write_executed;              // 1 if write has been executed (prevents duplicate execution)
 
     char *param_values[MAX_PARAMS];
     int param_lengths[MAX_PARAMS];

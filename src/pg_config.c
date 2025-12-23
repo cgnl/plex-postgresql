@@ -35,6 +35,8 @@ static const char *SQLITE_SKIP_PATTERNS[] = {
     "ANALYZE sqlite_",
     "ATTACH DATABASE",
     "DETACH DATABASE",
+    "BEGIN",
+    "COMMIT",
     "ROLLBACK",
     "SAVEPOINT",
     "RELEASE SAVEPOINT",

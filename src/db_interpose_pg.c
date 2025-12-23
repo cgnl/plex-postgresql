@@ -593,6 +593,14 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
 
             // Handle cached WRITE
             if (sql && is_write_operation(sql) && !should_skip_sql(sql)) {
+                // CRITICAL FIX: Check if this cached write was already executed
+                pg_stmt_t *cached = pg_find_cached_stmt(pStmt);
+                if (cached && cached->write_executed) {
+                    // Already executed, prevent duplicate execution
+                    if (expanded_sql) sqlite3_free(expanded_sql);
+                    return SQLITE_DONE;
+                }
+
                 // For cached statements, also use thread-local connection
                 pg_connection_t *cached_exec_conn = pg_conn;
                 if (is_library_db_path(pg_conn->db_path)) {
@@ -638,6 +646,19 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                         }
                     } else {
                         log_sql_fallback(sql, exec_sql, PQerrorMessage(pg_conn->conn), "CACHED WRITE");
+                    }
+
+                    // CRITICAL FIX: Create cached stmt entry and mark as executed
+                    if (!cached) {
+                        cached = pg_stmt_create(cached_exec_conn, sql, pStmt);
+                        if (cached) {
+                            cached->is_pg = 1;  // WRITE
+                            cached->is_cached = 1;
+                            cached->write_executed = 1;  // Mark as executed
+                            pg_register_cached_stmt(pStmt, cached);
+                        }
+                    } else {
+                        cached->write_executed = 1;  // Mark as executed
                     }
 
                     if (insert_sql) free(insert_sql);
@@ -827,6 +848,14 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 return (pg_stmt->current_row < pg_stmt->num_rows) ? SQLITE_ROW : SQLITE_DONE;
             }
         } else if (pg_stmt->is_pg == 1) {  // WRITE
+            // CRITICAL FIX: Prevent duplicate execution of the same write
+            // If Plex calls step() multiple times without reset(), only execute once
+            if (pg_stmt->write_executed) {
+                // Already executed this write, just return DONE
+                // This prevents the statistics_media INSERT storm bug
+                return SQLITE_DONE;
+            }
+
             // Log INSERT on play_queue_generators for debugging
             if (strstr(pg_stmt->pg_sql, "play_queue_generators")) {
                 LOG_INFO("INSERT play_queue_generators on thread %p conn %p",
@@ -855,6 +884,9 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
             } else {
                 LOG_ERROR("STEP PG write error: %s", PQerrorMessage(exec_conn->conn));
             }
+
+            // Mark as executed to prevent re-execution on subsequent step() calls
+            pg_stmt->write_executed = 1;
             PQclear(res);
         }
     }
@@ -880,13 +912,13 @@ static int my_sqlite3_reset(sqlite3_stmt *pStmt) {
                 pg_stmt->param_values[i] = NULL;
             }
         }
-        pg_stmt_clear_result(pg_stmt);
+        pg_stmt_clear_result(pg_stmt);  // This also resets write_executed
     }
 
     // Also clear cached statements - these use a separate registry
     pg_stmt_t *cached = pg_find_cached_stmt(pStmt);
     if (cached) {
-        pg_stmt_clear_result(cached);
+        pg_stmt_clear_result(cached);  // This also resets write_executed
     }
 
     return sqlite3_reset(pStmt);
