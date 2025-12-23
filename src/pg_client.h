@@ -26,6 +26,9 @@ pg_connection_t* pg_find_any_library_connection(void);
 // Thread-local connection (one PG connection per thread for library.db)
 pg_connection_t* pg_get_thread_connection(const char *db_path);
 
+// Close pool connection for a database handle (called on sqlite3_close)
+void pg_close_pool_for_db(sqlite3 *db);
+
 // Global state
 sqlite3_int64 pg_get_global_metadata_id(void);
 void pg_set_global_metadata_id(sqlite3_int64 id);

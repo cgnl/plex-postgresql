@@ -38,6 +38,16 @@ static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int pool_initialized = 0;
 static char library_db_path[512] = {0};
 
+// Connection idle timeout (seconds) - close connections idle longer than this
+#define POOL_IDLE_TIMEOUT 60
+
+// Track mapping from sqlite3* handles to pool slots for cleanup on close
+static struct {
+    sqlite3 *db;
+    int pool_slot;
+} db_to_pool[MAX_CONNECTIONS];
+static int db_to_pool_count = 0;
+
 // Global metadata ID for play_queue_generators workaround
 static sqlite3_int64 global_last_metadata_id = 0;
 static pthread_mutex_t metadata_id_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -82,6 +92,8 @@ void pg_client_cleanup(void) {
     for (int i = 0; i < POOL_SIZE; i++) {
         if (library_pool[i].conn) {
             if (library_pool[i].conn->conn) {
+                LOG_INFO("Cleanup: closing pool connection %d (thread %p)",
+                        i, (void*)library_pool[i].owner_thread);
                 PQfinish(library_pool[i].conn->conn);
             }
             pthread_mutex_destroy(&library_pool[i].conn->mutex);
@@ -90,6 +102,7 @@ void pg_client_cleanup(void) {
         }
     }
     pool_initialized = 0;
+    db_to_pool_count = 0;
     pthread_mutex_unlock(&pool_mutex);
 
     client_initialized = 0;
@@ -143,6 +156,28 @@ pg_connection_t* pg_find_connection(sqlite3 *db) {
             if (is_library_db(handle_conn->db_path)) {
                 pg_connection_t *pool_conn = pool_get_connection(handle_conn->db_path);
                 if (pool_conn && pool_conn->is_pg_active) {
+                    // Track this db->pool mapping for cleanup on close
+                    pthread_mutex_lock(&pool_mutex);
+                    int found = 0;
+                    for (int j = 0; j < db_to_pool_count; j++) {
+                        if (db_to_pool[j].db == db) {
+                            found = 1;
+                            break;
+                        }
+                    }
+                    if (!found && db_to_pool_count < MAX_CONNECTIONS) {
+                        // Find which pool slot we're using
+                        for (int j = 0; j < POOL_SIZE; j++) {
+                            if (library_pool[j].conn == pool_conn) {
+                                db_to_pool[db_to_pool_count].db = db;
+                                db_to_pool[db_to_pool_count].pool_slot = j;
+                                db_to_pool_count++;
+                                LOG_DEBUG("Tracked db %p -> pool slot %d", (void*)db, j);
+                                break;
+                            }
+                        }
+                    }
+                    pthread_mutex_unlock(&pool_mutex);
                     return pool_conn;
                 }
             }
@@ -188,6 +223,38 @@ pg_connection_t* pg_find_any_library_connection(void) {
 
 static int is_library_db(const char *path) {
     return path && strstr(path, "com.plexapp.plugins.library.db") != NULL;
+}
+
+// Reap idle connections from pool (close connections idle > POOL_IDLE_TIMEOUT)
+static void pool_reap_idle_connections(void) {
+    time_t now = time(NULL);
+    int reaped = 0;
+
+    // Must be called with pool_mutex held
+    for (int i = 0; i < POOL_SIZE; i++) {
+        if (library_pool[i].conn &&
+            library_pool[i].owner_thread != 0 &&
+            (now - library_pool[i].last_used) > POOL_IDLE_TIMEOUT) {
+
+            LOG_INFO("Pool reaper: closing idle connection %d (idle %ld seconds, thread %p)",
+                    i, now - library_pool[i].last_used,
+                    (void*)library_pool[i].owner_thread);
+
+            if (library_pool[i].conn->conn) {
+                PQfinish(library_pool[i].conn->conn);
+            }
+            pthread_mutex_destroy(&library_pool[i].conn->mutex);
+            free(library_pool[i].conn);
+            library_pool[i].conn = NULL;
+            library_pool[i].owner_thread = 0;
+            library_pool[i].last_used = 0;
+            reaped++;
+        }
+    }
+
+    if (reaped > 0) {
+        LOG_INFO("Pool reaper: closed %d idle connections", reaped);
+    }
 }
 
 static pg_connection_t* create_pool_connection(const char *db_path) {
@@ -240,6 +307,13 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
     // Save the db_path for later use
     if (!library_db_path[0] && db_path) {
         strncpy(library_db_path, db_path, sizeof(library_db_path) - 1);
+    }
+
+    // Periodically reap idle connections (every ~10th call to reduce overhead)
+    static int reap_counter = 0;
+    if (++reap_counter >= 10) {
+        pool_reap_idle_connections();
+        reap_counter = 0;
     }
 
     // 1. First, find a connection already owned by this thread
@@ -337,6 +411,43 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
 // Public function for getting thread connection (now uses pool)
 pg_connection_t* pg_get_thread_connection(const char *db_path) {
     return pool_get_connection(db_path);
+}
+
+// Close pool connection for a specific database handle
+// Called when sqlite3_close() is invoked
+void pg_close_pool_for_db(sqlite3 *db) {
+    if (!db) return;
+
+    pthread_mutex_lock(&pool_mutex);
+
+    // Find and remove db-to-pool mapping
+    int pool_slot = -1;
+    for (int i = 0; i < db_to_pool_count; i++) {
+        if (db_to_pool[i].db == db) {
+            pool_slot = db_to_pool[i].pool_slot;
+
+            // Remove this mapping by shifting remaining entries
+            for (int j = i; j < db_to_pool_count - 1; j++) {
+                db_to_pool[j] = db_to_pool[j + 1];
+            }
+            db_to_pool_count--;
+            break;
+        }
+    }
+
+    // If we found a pool slot, mark it as free (reset owner_thread)
+    // Don't close the connection immediately - let the reaper handle it
+    // This allows other threads to reuse the connection if needed
+    if (pool_slot >= 0 && pool_slot < POOL_SIZE) {
+        if (library_pool[pool_slot].conn) {
+            LOG_INFO("Pool: releasing slot %d for db %p (thread %p)",
+                    pool_slot, (void*)db, (void*)library_pool[pool_slot].owner_thread);
+            library_pool[pool_slot].owner_thread = 0;  // Mark as free for reuse
+            library_pool[pool_slot].last_used = time(NULL);  // Update timestamp for reaper
+        }
+    }
+
+    pthread_mutex_unlock(&pool_mutex);
 }
 
 // ============================================================================

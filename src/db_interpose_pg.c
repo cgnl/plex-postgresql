@@ -182,6 +182,12 @@ static int my_sqlite3_close(sqlite3 *db) {
     pg_connection_t *pg_conn = pg_find_connection(db);
     if (pg_conn) {
         LOG_INFO("CLOSE: PostgreSQL connection for %s", pg_conn->db_path);
+
+        // If this is a library.db, release pool connection
+        if (strstr(pg_conn->db_path, "com.plexapp.plugins.library.db")) {
+            pg_close_pool_for_db(db);
+        }
+
         pg_unregister_connection(pg_conn);
         pg_close(pg_conn);
     }
@@ -191,6 +197,11 @@ static int my_sqlite3_close(sqlite3 *db) {
 static int my_sqlite3_close_v2(sqlite3 *db) {
     pg_connection_t *pg_conn = pg_find_connection(db);
     if (pg_conn) {
+        // If this is a library.db, release pool connection
+        if (strstr(pg_conn->db_path, "com.plexapp.plugins.library.db")) {
+            pg_close_pool_for_db(db);
+        }
+
         pg_unregister_connection(pg_conn);
         pg_close(pg_conn);
     }
