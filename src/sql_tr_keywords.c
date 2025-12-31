@@ -5,12 +5,14 @@
 
 #include "sql_translator.h"
 #include "sql_translator_internal.h"
+#include <stdint.h>
 
 // ============================================================================
 // Check if string starts with a SQL keyword
 // ============================================================================
 
 // Pre-computed keyword lengths to avoid strlen() in loop
+// Grouped by first character for O(1) first-char lookup
 static const struct { const char *word; size_t len; } keywords[] = {
     {"from", 4}, {"where", 5}, {"join", 4}, {"inner", 5}, {"outer", 5},
     {"left", 4}, {"right", 5}, {"cross", 5}, {"on", 2}, {"and", 3},
@@ -21,8 +23,24 @@ static const struct { const char *word; size_t len; } keywords[] = {
     {NULL, 0}
 };
 
+// Bitmap of valid keyword first chars: a,b,c,d,e,f,g,h,i,j,l,n,o,r,s,u,v,w
+// Bit position = char - 'a'
+static const uint32_t keyword_first_chars =
+    (1 << ('a'-'a')) | (1 << ('b'-'a')) | (1 << ('c'-'a')) | (1 << ('d'-'a')) |
+    (1 << ('e'-'a')) | (1 << ('f'-'a')) | (1 << ('g'-'a')) | (1 << ('h'-'a')) |
+    (1 << ('i'-'a')) | (1 << ('j'-'a')) | (1 << ('l'-'a')) | (1 << ('n'-'a')) |
+    (1 << ('o'-'a')) | (1 << ('r'-'a')) | (1 << ('s'-'a')) | (1 << ('u'-'a')) |
+    (1 << ('v'-'a')) | (1 << ('w'-'a'));
+
 static int starts_with_keyword(const char *p) {
+    // Fast path: check if first char could start a keyword
+    char c = *p | 0x20;  // tolower without branch
+    if (c < 'a' || c > 'z') return 0;
+    if (!(keyword_first_chars & (1 << (c - 'a')))) return 0;
+
+    // Only check keywords starting with this character
     for (int i = 0; keywords[i].word; i++) {
+        if ((keywords[i].word[0] | 0x20) != c) continue;  // Skip non-matching first char
         if (strncasecmp(p, keywords[i].word, keywords[i].len) == 0) {
             char next = p[keywords[i].len];
             if (next == '\0' || next == ' ' || next == '\t' || next == '\n' ||
@@ -40,6 +58,28 @@ static int starts_with_keyword(const char *p) {
 
 char* fix_operator_spacing(const char *sql) {
     if (!sql) return NULL;
+
+    // Fast path: if no operator-minus patterns exist, just return a copy
+    // This avoids processing huge queries that don't need fixing
+    int needs_fix = 0;
+    for (const char *scan = sql; *scan; scan++) {
+        if ((*scan == '=' || *scan == '>' || *scan == '<' || *scan == '!') &&
+            scan[1] == '-' && isdigit(scan[2])) {
+            needs_fix = 1;
+            break;
+        }
+        // Also check two-char operators: !=, <>, >=, <=
+        if ((scan[0] == '!' && scan[1] == '=' && scan[2] == '-' && isdigit(scan[3])) ||
+            (scan[0] == '<' && scan[1] == '>' && scan[2] == '-' && isdigit(scan[3])) ||
+            (scan[0] == '>' && scan[1] == '=' && scan[2] == '-' && isdigit(scan[3])) ||
+            (scan[0] == '<' && scan[1] == '=' && scan[2] == '-' && isdigit(scan[3]))) {
+            needs_fix = 1;
+            break;
+        }
+    }
+    if (!needs_fix) {
+        return strdup(sql);
+    }
 
     char *result = malloc(strlen(sql) * 2 + 1);
     if (!result) return NULL;
