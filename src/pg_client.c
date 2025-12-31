@@ -12,6 +12,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <sys/select.h>
 
 // ============================================================================
 // Connection Pool Configuration
@@ -399,6 +400,23 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
     pthread_mutex_unlock(&pool_mutex);
 
     // =========================================================================
+    // PHASE 0: Cleanup stale READY connections (idle > 30s)
+    // Release slots that haven't been used - the owning thread is likely gone
+    // Phase 2 will reset these connections when claimed
+    // =========================================================================
+    for (int i = 0; i < POOL_SIZE; i++) {
+        pool_slot_state_t state = atomic_load(&library_pool[i].state);
+        if (state == SLOT_READY && (now - library_pool[i].last_used) > 30) {
+            // Mark as FREE so Phase 2 can claim and reset it
+            pool_slot_state_t expected = SLOT_READY;
+            if (atomic_compare_exchange_strong(&library_pool[i].state, &expected, SLOT_FREE)) {
+                LOG_INFO("Pool: released stale slot %d (idle %lds)",
+                        i, (long)(now - library_pool[i].last_used));
+            }
+        }
+    }
+
+    // =========================================================================
     // PHASE 1: Find thread's existing READY connection (lock-free)
     // =========================================================================
     for (int i = 0; i < POOL_SIZE; i++) {
@@ -409,9 +427,29 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
 
             pg_connection_t *conn = library_pool[i].conn;
             if (conn && conn->conn && PQstatus(conn->conn) == CONNECTION_OK) {
-                // Connection looks healthy - use it directly
-                // Note: We don't drain stale results here as it can crash on corrupted connections
-                // If there are stale results, the next query will fail and trigger reconnect
+                // Check if socket has pending data (orphaned results from timed-out queries)
+                int sock = PQsocket(conn->conn);
+                if (sock >= 0) {
+                    fd_set read_fds;
+                    struct timeval tv = {0, 0};  // Zero timeout = non-blocking check
+                    FD_ZERO(&read_fds);
+                    FD_SET(sock, &read_fds);
+                    int ready = select(sock + 1, &read_fds, NULL, NULL, &tv);
+                    if (ready > 0) {
+                        // Data waiting = orphaned results, reset connection
+                        LOG_INFO("Pool: slot %d has pending data, resetting", i);
+                        PQreset(conn->conn);
+                        if (PQstatus(conn->conn) == CONNECTION_OK) {
+                            pg_conn_config_t *cfg = pg_config_get();
+                            char schema_cmd[256];
+                            snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
+                            PGresult *res = PQexec(conn->conn, schema_cmd);
+                            PQclear(res);
+                            res = PQexec(conn->conn, "SET statement_timeout = '10s'");
+                            PQclear(res);
+                        }
+                    }
+                }
                 library_pool[i].last_used = now;
                 return conn;
             }
