@@ -1,0 +1,4 @@
+run
+bt
+thread backtrace all
+quit

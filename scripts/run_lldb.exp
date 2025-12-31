@@ -1,0 +1,22 @@
+#!/usr/bin/expect -f
+
+set timeout 60
+
+spawn env DYLD_INSERT_LIBRARIES=/Users/sander/plex-postgresql/db_interpose_pg.dylib PLEX_NO_SHADOW_SCAN=1 PLEX_PG_HOST=localhost PLEX_PG_PORT=5432 PLEX_PG_DATABASE=plex PLEX_PG_USER=plex PLEX_PG_PASSWORD=plex PLEX_PG_SCHEMA=plex ENV_PG_LOG_LEVEL=INFO lldb "/Applications/Plex Media Server.app/Contents/MacOS/Plex Media Server"
+
+expect "(lldb)" { send "run\r" }
+
+expect {
+    "Process * stopped" {
+        send "bt\r"
+        expect "(lldb)" { send "register read\r" }
+        expect "(lldb)" { send "thread backtrace all\r" }
+        expect "(lldb)" { send "quit\r" }
+    }
+    timeout {
+        send "quit\r"
+        exit 1
+    }
+}
+
+expect eof

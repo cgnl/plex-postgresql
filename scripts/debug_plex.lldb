@@ -1,0 +1,28 @@
+# LLDB script to debug Plex Media Server with PostgreSQL shim
+
+# Set environment variables for shim
+env DYLD_INSERT_LIBRARIES=/Users/sander/plex-postgresql/db_interpose_pg.dylib
+env PLEX_PG_HOST=localhost
+env PLEX_PG_PORT=5432
+env PLEX_PG_DATABASE=plex
+env PLEX_PG_USER=plex
+env PLEX_PG_PASSWORD=plex
+env PLEX_PG_SCHEMA=plex
+
+# Catch C++ exceptions
+breakpoint set -E C++
+
+# Set breakpoint on drop_icu_root_indexes function
+breakpoint set -n drop_icu_root_indexes
+
+# Set breakpoint on my_sqlite3_prepare_v3
+breakpoint set -n my_sqlite3_prepare_v3
+
+# Set breakpoint on my_sqlite3_exec
+breakpoint set -n my_sqlite3_exec
+
+# Run the program
+run
+
+# Continue after hitting first breakpoint
+continue
