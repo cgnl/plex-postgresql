@@ -69,7 +69,7 @@ void pg_logging_init(void) {
     static volatile int first_log_done = 0;
     if (!first_log_done) {
         first_log_done = 1;
-        log_message(PG_LOG_INFO, "Logging initialized. Level: %d", current_log_level);
+        pg_log_message_internal(PG_LOG_INFO, "Logging initialized. Level: %d", current_log_level);
     }
 }
 
@@ -85,7 +85,7 @@ void pg_logging_cleanup(void) {
 // Core Logging (minimized mutex hold time)
 // ============================================================================
 
-void log_message(int level, const char *fmt, ...) {
+void pg_log_message_internal(int level, const char *fmt, ...) {
     if (!logging_initialized) pg_logging_init();
     if (level > current_log_level) return;
     if (!log_file) return;
@@ -139,14 +139,14 @@ void log_message(int level, const char *fmt, ...) {
 void log_sql_fallback(const char *original_sql, const char *translated_sql,
                       const char *error_msg, const char *context) {
     // Log to main log
-    log_message(PG_LOG_INFO, "=== SQL FALLBACK TO SQLITE ===");
-    log_message(PG_LOG_INFO, "Context: %s", context);
-    log_message(PG_LOG_INFO, "Original SQL: %.500s", original_sql);
+    pg_log_message_internal(PG_LOG_INFO, "=== SQL FALLBACK TO SQLITE ===");
+    pg_log_message_internal(PG_LOG_INFO, "Context: %s", context ? context : "(null)");
+    pg_log_message_internal(PG_LOG_INFO, "Original SQL: %.500s", original_sql ? original_sql : "(null)");
     if (translated_sql) {
-        log_message(PG_LOG_INFO, "Translated SQL: %.500s", translated_sql);
+        pg_log_message_internal(PG_LOG_INFO, "Translated SQL: %.500s", translated_sql);
     }
-    log_message(PG_LOG_INFO, "PostgreSQL Error: %s", error_msg);
-    log_message(PG_LOG_INFO, "=== END FALLBACK ===");
+    pg_log_message_internal(PG_LOG_INFO, "PostgreSQL Error: %s", error_msg ? error_msg : "(null)");
+    pg_log_message_internal(PG_LOG_INFO, "=== END FALLBACK ===");
 
     // Also log to separate fallback analysis file
     FILE *fallback_log = fopen(FALLBACK_LOG_FILE, "a");
@@ -155,12 +155,12 @@ void log_sql_fallback(const char *original_sql, const char *translated_sql,
         char timestamp[64];
         strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
 
-        fprintf(fallback_log, "\n[%s] %s\n", timestamp, context);
-        fprintf(fallback_log, "ORIGINAL: %s\n", original_sql);
+        fprintf(fallback_log, "\n[%s] %s\n", timestamp, context ? context : "(null)");
+        fprintf(fallback_log, "ORIGINAL: %s\n", original_sql ? original_sql : "(null)");
         if (translated_sql) {
             fprintf(fallback_log, "TRANSLATED: %s\n", translated_sql);
         }
-        fprintf(fallback_log, "ERROR: %s\n", error_msg);
+        fprintf(fallback_log, "ERROR: %s\n", error_msg ? error_msg : "(null)");
         fprintf(fallback_log, "---\n");
         fclose(fallback_log);
     }

@@ -17,9 +17,13 @@
 #include "pg_logging.h"
 
 // Standard translation: call function, swap result
+// CRITICAL FIX: Free current before returning NULL to prevent memory leak
 #define TRANSLATE(func) do { \
     temp = func(current); \
-    if (!temp) { return NULL; } \
+    if (!temp) { \
+        free(current); \
+        return NULL; \
+    } \
     free(current); \
     current = temp; \
 } while(0)
@@ -115,6 +119,9 @@ char* sql_translate_functions(const char *sql) {
 
     // 15b2. Fix GROUP BY strict mode (complete rewriter)
     TRANSLATE(fix_group_by_strict_complete);
+
+    // 15b3. Fix clusters subquery AFTER group by rewriter (it incorrectly adds outer columns)
+    TRANSLATE(fix_group_by_strict);
 
     // 15c. Strip "collate icu_root"
     TRANSLATE(strip_icu_collation);

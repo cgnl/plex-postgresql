@@ -16,7 +16,7 @@
 // ============================================================================
 
 #define MAX_CONNECTIONS 512
-#define MAX_PARAMS 64
+#define MAX_PARAMS 256
 #define MAX_STATEMENTS 1024
 #define MAX_CACHED_STMTS_PER_THREAD 64
 #define PG_VALUE_MAGIC 0x50475641  // "PGVA" - identifies our fake sqlite3_value
@@ -37,6 +37,24 @@
 
 // PostgreSQL-only mode flag
 #define PG_READ_ENABLED 1
+
+// Connection pool size
+#define POOL_SIZE 30
+
+// ============================================================================
+// Connection Pool State Machine (thread-safe with atomic CAS)
+// ============================================================================
+
+typedef enum {
+    SLOT_FREE = 0,        // Available for any thread
+    SLOT_RESERVED,        // Thread claimed, creating connection
+    SLOT_READY,           // Connection active and usable
+    SLOT_RECONNECTING,    // Thread is reconnecting
+    SLOT_ERROR            // Connection failed
+} pool_slot_state_t;
+
+// Forward declaration for pool_slot_t (full definition in pg_client.c)
+struct pg_connection;
 
 // ============================================================================
 // Configuration Structure
@@ -75,6 +93,7 @@ typedef struct pg_connection {
 
 typedef struct pg_stmt {
     pthread_mutex_t mutex;           // Protect against concurrent access from multiple threads
+    atomic_int ref_count;            // CRITICAL FIX: Reference count to prevent double-free
     pg_connection_t *conn;
     sqlite3_stmt *shadow_stmt;       // Real SQLite statement handle (for mapping)
     char *sql;                       // Original SQL

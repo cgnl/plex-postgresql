@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <strings.h>
 #include <ctype.h>
+#include <dlfcn.h>
 #include <sqlite3.h>
 #include <libpq-fe.h>
 
@@ -22,6 +23,16 @@
 #include "pg_client.h"
 #include "pg_statement.h"
 #include "sql_translator.h"
+
+// ============================================================================
+// Recursion prevention for interposed functions
+// ============================================================================
+
+// With DYLD_FORCE_FLAT_NAMESPACE=1, we CANNOT use dlsym/dlopen to get the
+// original SQLite functions - all calls will go through our interpose!
+// Instead, we use a thread-local flag to detect and prevent recursion.
+
+static __thread int in_interpose_call = 0;
 
 // ============================================================================
 // Globals (minimal - most state is in modules)
@@ -251,6 +262,12 @@ static int my_sqlite3_close_v2(sqlite3 *db) {
 static int my_sqlite3_exec(sqlite3 *db, const char *sql,
                           int (*callback)(void*, int, char**, char**),
                           void *arg, char **errmsg) {
+    // CRITICAL FIX: NULL check to prevent crash in strcasestr
+    if (!sql) {
+        LOG_ERROR("exec called with NULL SQL");
+        return sqlite3_exec(db, sql, callback, arg, errmsg);
+    }
+
     pg_connection_t *pg_conn = pg_find_connection(db);
 
     if (pg_conn && pg_conn->conn && pg_conn->is_pg_active) {
@@ -273,6 +290,8 @@ static int my_sqlite3_exec(sqlite3 *db, const char *sql,
                     }
                 }
 
+                // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
+                pthread_mutex_lock(&pg_conn->mutex);
                 PGresult *res = PQexec(pg_conn->conn, exec_sql);
                 ExecStatusType status = PQresultStatus(res);
 
@@ -291,11 +310,13 @@ static int my_sqlite3_exec(sqlite3 *db, const char *sql,
                         }
                     }
                 } else {
-                    LOG_ERROR("PostgreSQL exec error: %s", PQerrorMessage(pg_conn->conn));
+                    const char *err = (pg_conn && pg_conn->conn) ? PQerrorMessage(pg_conn->conn) : "NULL connection";
+                    LOG_ERROR("PostgreSQL exec error: %s", err);
                 }
 
                 if (insert_sql) free(insert_sql);
                 PQclear(res);
+                pthread_mutex_unlock(&pg_conn->mutex);
             }
             sql_translation_free(&trans);
         }
@@ -331,7 +352,7 @@ static int my_sqlite3_exec(sqlite3 *db, const char *sql,
 // Helper to create a simplified SQL for SQLite when query uses FTS
 // Removes FTS joins and MATCH clauses since SQLite shadow DB doesn't have FTS tables
 static char* simplify_fts_for_sqlite(const char *sql) {
-    if (!strcasestr(sql, "fts4_")) return NULL;
+    if (!sql || !strcasestr(sql, "fts4_")) return NULL;
 
     char *result = malloc(strlen(sql) * 2 + 100);
     if (!result) return NULL;
@@ -400,8 +421,14 @@ static char* simplify_fts_for_sqlite(const char *sql) {
 
 static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
                                   sqlite3_stmt **ppStmt, const char **pzTail) {
+    // CRITICAL FIX: NULL check to prevent crash in strcasestr
+    if (!zSql) {
+        LOG_ERROR("prepare_v2 called with NULL SQL");
+        return sqlite3_prepare_v2(db, zSql, nByte, ppStmt, pzTail);
+    }
+
     // Debug: log INSERT INTO metadata_items
-    if (zSql && strncasecmp(zSql, "INSERT", 6) == 0 && strcasestr(zSql, "metadata_items")) {
+    if (strncasecmp(zSql, "INSERT", 6) == 0 && strcasestr(zSql, "metadata_items")) {
         LOG_INFO("PREPARE_V2 INSERT metadata_items: %.300s", zSql);
         if (strcasestr(zSql, "icu_root")) {
             LOG_INFO("PREPARE_V2 has icu_root - will clean!");
@@ -654,12 +681,14 @@ static int my_sqlite3_bind_int(sqlite3_stmt *pStmt, int idx, int val) {
 
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt && idx > 0 && idx <= MAX_PARAMS) {
+        pthread_mutex_lock(&pg_stmt->mutex);  // CRITICAL FIX: Protect bind operations
         int pg_idx = pg_map_param_index(pg_stmt, pStmt, idx);
         if (pg_idx >= 0 && pg_idx < MAX_PARAMS) {
             // Use pre-allocated buffer instead of strdup
             snprintf(pg_stmt->param_buffers[pg_idx], 32, "%d", val);
             pg_stmt->param_values[pg_idx] = pg_stmt->param_buffers[pg_idx];
         }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
 
     return rc;
@@ -670,12 +699,14 @@ static int my_sqlite3_bind_int64(sqlite3_stmt *pStmt, int idx, sqlite3_int64 val
 
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt && idx > 0 && idx <= MAX_PARAMS) {
+        pthread_mutex_lock(&pg_stmt->mutex);  // CRITICAL FIX: Protect bind operations
         int pg_idx = pg_map_param_index(pg_stmt, pStmt, idx);
         if (pg_idx >= 0 && pg_idx < MAX_PARAMS) {
             // Use pre-allocated buffer instead of strdup
             snprintf(pg_stmt->param_buffers[pg_idx], 32, "%lld", val);
             pg_stmt->param_values[pg_idx] = pg_stmt->param_buffers[pg_idx];
         }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
 
     return rc;
@@ -686,12 +717,14 @@ static int my_sqlite3_bind_double(sqlite3_stmt *pStmt, int idx, double val) {
 
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt && idx > 0 && idx <= MAX_PARAMS) {
+        pthread_mutex_lock(&pg_stmt->mutex);  // CRITICAL FIX: Protect bind operations
         int pg_idx = pg_map_param_index(pg_stmt, pStmt, idx);
         if (pg_idx >= 0 && pg_idx < MAX_PARAMS) {
             // Use pre-allocated buffer instead of strdup
             snprintf(pg_stmt->param_buffers[pg_idx], 32, "%.17g", val);
             pg_stmt->param_values[pg_idx] = pg_stmt->param_buffers[pg_idx];
         }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
 
     return rc;
@@ -709,6 +742,7 @@ static int my_sqlite3_bind_text(sqlite3_stmt *pStmt, int idx, const char *val,
 
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt && idx > 0 && idx <= MAX_PARAMS && val) {
+        pthread_mutex_lock(&pg_stmt->mutex);  // CRITICAL FIX: Protect bind operations
         int pg_idx = pg_map_param_index(pg_stmt, pStmt, idx);
 
         if (pg_idx >= 0 && pg_idx < MAX_PARAMS) {
@@ -727,6 +761,7 @@ static int my_sqlite3_bind_text(sqlite3_stmt *pStmt, int idx, const char *val,
                 }
             }
         }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
 
     return rc;
@@ -738,6 +773,7 @@ static int my_sqlite3_bind_blob(sqlite3_stmt *pStmt, int idx, const void *val,
 
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt && idx > 0 && idx <= MAX_PARAMS && val && nBytes > 0) {
+        pthread_mutex_lock(&pg_stmt->mutex);  // CRITICAL FIX: Protect bind operations
         int pg_idx = pg_map_param_index(pg_stmt, pStmt, idx);
         if (pg_idx >= 0 && pg_idx < MAX_PARAMS) {
             if (pg_stmt->param_values[pg_idx] && !is_preallocated_buffer(pg_stmt, pg_idx)) {
@@ -751,6 +787,7 @@ static int my_sqlite3_bind_blob(sqlite3_stmt *pStmt, int idx, const void *val,
             pg_stmt->param_lengths[pg_idx] = nBytes;
             pg_stmt->param_formats[pg_idx] = 1;  // binary
         }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
 
     return rc;
@@ -763,6 +800,7 @@ static int my_sqlite3_bind_blob64(sqlite3_stmt *pStmt, int idx, const void *val,
 
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt && idx > 0 && idx <= MAX_PARAMS && val && nBytes > 0) {
+        pthread_mutex_lock(&pg_stmt->mutex);  // CRITICAL FIX: Protect bind operations
         int pg_idx = pg_map_param_index(pg_stmt, pStmt, idx);
         if (pg_idx >= 0 && pg_idx < MAX_PARAMS) {
             if (pg_stmt->param_values[pg_idx] && !is_preallocated_buffer(pg_stmt, pg_idx)) {
@@ -776,6 +814,7 @@ static int my_sqlite3_bind_blob64(sqlite3_stmt *pStmt, int idx, const void *val,
             pg_stmt->param_lengths[pg_idx] = (int)nBytes;
             pg_stmt->param_formats[pg_idx] = 1;  // binary
         }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
 
     return rc;
@@ -789,6 +828,7 @@ static int my_sqlite3_bind_text64(sqlite3_stmt *pStmt, int idx, const char *val,
 
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt && idx > 0 && idx <= MAX_PARAMS && val) {
+        pthread_mutex_lock(&pg_stmt->mutex);  // CRITICAL FIX: Protect bind operations
         int pg_idx = pg_map_param_index(pg_stmt, pStmt, idx);
         if (pg_idx >= 0 && pg_idx < MAX_PARAMS) {
             if (pg_stmt->param_values[pg_idx] && !is_preallocated_buffer(pg_stmt, pg_idx)) {
@@ -805,6 +845,7 @@ static int my_sqlite3_bind_text64(sqlite3_stmt *pStmt, int idx, const char *val,
                 }
             }
         }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
 
     return rc;
@@ -816,6 +857,7 @@ static int my_sqlite3_bind_value(sqlite3_stmt *pStmt, int idx, const sqlite3_val
 
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt && idx > 0 && idx <= MAX_PARAMS && pValue) {
+        pthread_mutex_lock(&pg_stmt->mutex);  // CRITICAL FIX: Protect bind operations
         int pg_idx = pg_map_param_index(pg_stmt, pStmt, idx);
         if (pg_idx >= 0 && pg_idx < MAX_PARAMS) {
             // Get value type and extract appropriately
@@ -864,6 +906,7 @@ static int my_sqlite3_bind_value(sqlite3_stmt *pStmt, int idx, const sqlite3_val
                     break;
             }
         }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
 
     return rc;
@@ -874,6 +917,7 @@ static int my_sqlite3_bind_null(sqlite3_stmt *pStmt, int idx) {
 
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt && idx > 0 && idx <= MAX_PARAMS) {
+        pthread_mutex_lock(&pg_stmt->mutex);  // CRITICAL FIX: Protect bind operations
         int pg_idx = pg_map_param_index(pg_stmt, pStmt, idx);
         if (pg_idx >= 0 && pg_idx < MAX_PARAMS) {
             if (pg_stmt->param_values[pg_idx] && !is_preallocated_buffer(pg_stmt, pg_idx)) {
@@ -881,6 +925,7 @@ static int my_sqlite3_bind_null(sqlite3_stmt *pStmt, int idx) {
                 pg_stmt->param_values[pg_idx] = NULL;
             }
         }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
 
     return rc;
@@ -911,10 +956,10 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
             // Handle cached WRITE
             if (sql && is_write_operation(sql) && !should_skip_sql(sql)) {
                 // Debug: log cached INSERT for metadata_items
-                if (strcasestr(sql, "INSERT") && strcasestr(sql, "metadata_items")) {
+                if (sql && strcasestr(sql, "INSERT") && strcasestr(sql, "metadata_items")) {
                     LOG_ERROR("CACHED INSERT metadata_items:");
                     LOG_ERROR("  expanded_sql=%s", expanded_sql ? "YES" : "NO");
-                    LOG_ERROR("  sql (first 300): %.300s", sql);
+                    LOG_ERROR("  sql (first 300): %.300s", sql ? sql : "(null)");
                 }
                 // CRITICAL FIX: Check if this cached write was already executed
                 pg_stmt_t *cached = pg_find_cached_stmt(pStmt);
@@ -954,6 +999,8 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                                 (void*)pthread_self(), (void*)cached_exec_conn);
                     }
 
+                    // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
+                    pthread_mutex_lock(&cached_exec_conn->mutex);
                     PGresult *res = PQexec(cached_exec_conn->conn, exec_sql);
                     ExecStatusType status = PQresultStatus(res);
 
@@ -968,8 +1015,13 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                             }
                         }
                     } else {
-                        log_sql_fallback(sql, exec_sql, PQerrorMessage(pg_conn->conn), "CACHED WRITE");
+                        const char *err = (pg_conn && pg_conn->conn) ? PQerrorMessage(pg_conn->conn) : "NULL connection";
+                        log_sql_fallback(sql, exec_sql, err, "CACHED WRITE");
                     }
+
+                    if (insert_sql) free(insert_sql);
+                    PQclear(res);
+                    pthread_mutex_unlock(&cached_exec_conn->mutex);
 
                     // CRITICAL FIX: Create cached stmt entry and mark as executed
                     if (!cached) {
@@ -983,9 +1035,6 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     } else {
                         cached->write_executed = 1;  // Mark as executed
                     }
-
-                    if (insert_sql) free(insert_sql);
-                    PQclear(res);
                 }
                 sql_translation_free(&trans);
                 if (expanded_sql) sqlite3_free(expanded_sql);
@@ -1013,8 +1062,16 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     if (cached && cached->result) {
                         // Already have results, advance to next row
                         cached->current_row++;
+                        if (cached->current_row >= cached->num_rows) {
+                            // CRITICAL FIX: Free PGresult immediately when done
+                            // Prevents memory accumulation when Plex doesn't call reset()
+                            PQclear(cached->result);
+                            cached->result = NULL;
+                            if (expanded_sql) sqlite3_free(expanded_sql);
+                            return SQLITE_DONE;
+                        }
                         if (expanded_sql) sqlite3_free(expanded_sql);
-                        return (cached->current_row < cached->num_rows) ? SQLITE_ROW : SQLITE_DONE;
+                        return SQLITE_ROW;
                     }
 
                     // No result yet - execute PostgreSQL query
@@ -1041,11 +1098,14 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                             }
                         }
                         if (new_stmt) {
+                            // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
+                            pthread_mutex_lock(&cached_read_conn->mutex);
                             new_stmt->result = PQexec(cached_read_conn->conn, trans.sql);
                             if (PQresultStatus(new_stmt->result) == PGRES_TUPLES_OK) {
                                 new_stmt->num_rows = PQntuples(new_stmt->result);
                                 new_stmt->num_cols = PQnfields(new_stmt->result);
                                 new_stmt->current_row = 0;
+                                pthread_mutex_unlock(&cached_read_conn->mutex);
                                 // Log result count for play_queue_generators
                                 if (strstr(sql, "play_queue_generators")) {
                                     LOG_INFO("CACHED SELECT play_queue_generators returned %d rows", new_stmt->num_rows);
@@ -1058,7 +1118,9 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                                 if (expanded_sql) sqlite3_free(expanded_sql);
                                 return (new_stmt->num_rows > 0) ? SQLITE_ROW : SQLITE_DONE;
                             } else {
-                                log_sql_fallback(sql, trans.sql, PQerrorMessage(cached_read_conn->conn), "CACHED READ");
+                                const char *err = (cached_read_conn && cached_read_conn->conn) ? PQerrorMessage(cached_read_conn->conn) : "NULL connection";
+                                pthread_mutex_unlock(&cached_read_conn->mutex);
+                                log_sql_fallback(sql, trans.sql, err, "CACHED READ");
                                 PQclear(new_stmt->result);
                                 new_stmt->result = NULL;
                             }
@@ -1098,38 +1160,53 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
         if (pg_stmt->is_pg == 2) {  // READ
             if (!pg_stmt->result) {
                 // Log SELECT on play_queue_generators for debugging
-                if (strstr(pg_stmt->pg_sql, "play_queue_generators")) {
+                if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "play_queue_generators")) {
                     LOG_INFO("SELECT play_queue_generators on thread %p conn %p: %s",
                             (void*)pthread_self(), (void*)exec_conn, pg_stmt->pg_sql);
                 }
                 // Log media_parts queries with parameters
-                if (strstr(pg_stmt->pg_sql, "media_parts") || strstr(pg_stmt->pg_sql, "media_items")) {
+                if (pg_stmt->pg_sql && (strstr(pg_stmt->pg_sql, "media_parts") || strstr(pg_stmt->pg_sql, "media_items"))) {
                     LOG_INFO("MEDIA QUERY (params=%d): %s", pg_stmt->param_count, pg_stmt->pg_sql);
                     for (int i = 0; i < pg_stmt->param_count && i < 5; i++) {
                         LOG_INFO("  PARAM[%d] = %s", i+1, paramValues[i] ? paramValues[i] : "NULL");
                     }
                     // Debug: check search_path
-                    if (strstr(pg_stmt->pg_sql, "directories")) {
+                    if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "directories")) {
+                        // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
+                        pthread_mutex_lock(&exec_conn->mutex);
                         PGresult *sp = PQexec(exec_conn->conn, "SHOW search_path");
                         if (PQresultStatus(sp) == PGRES_TUPLES_OK && PQntuples(sp) > 0) {
                             LOG_INFO("  search_path = %s", PQgetvalue(sp, 0, 0));
                         }
                         PQclear(sp);
+                        pthread_mutex_unlock(&exec_conn->mutex);
                     }
                 }
 
                 // Log translated query for debugging
-                if (strstr(pg_stmt->pg_sql, "distinct")) {
+                if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "distinct")) {
                     LOG_INFO("[DISTINCT QUERY] %.200s...", pg_stmt->pg_sql);
                 }
 
+                // Validate connection before use to prevent crash
+                if (!exec_conn || !exec_conn->conn || PQstatus(exec_conn->conn) != CONNECTION_OK) {
+                    LOG_ERROR("STEP SELECT: Invalid connection");
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return SQLITE_ERROR;
+                }
+
+                // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
+                // libpq is not thread-safe when sharing PGconn between threads
+                pthread_mutex_lock(&exec_conn->mutex);
                 pg_stmt->result = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
                     pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
+                pthread_mutex_unlock(&exec_conn->mutex);
 
                 // Check for query errors
                 ExecStatusType status = PQresultStatus(pg_stmt->result);
                 if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
-                    LOG_ERROR("PostgreSQL query failed: %s", PQerrorMessage(exec_conn->conn));
+                    const char *err = (exec_conn && exec_conn->conn) ? PQerrorMessage(exec_conn->conn) : "NULL connection";
+                    LOG_ERROR("PostgreSQL query failed: %s", err);
                     LOG_ERROR("Failed query: %.500s", pg_stmt->pg_sql);
                 }
 
@@ -1139,14 +1216,15 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     pg_stmt->current_row = 0;
 
                     // Log result count for play_queue_generators
-                    if (strstr(pg_stmt->pg_sql, "play_queue_generators")) {
+                    if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "play_queue_generators")) {
                         LOG_INFO("SELECT play_queue_generators returned %d rows", PQntuples(pg_stmt->result));
                     }
                     // Verbose query logging disabled for performance
                     // Enable DEBUG level logging to see query details
                 } else {
+                    const char *err = (exec_conn && exec_conn->conn) ? PQerrorMessage(exec_conn->conn) : "NULL connection";
                     log_sql_fallback(pg_stmt->sql, pg_stmt->pg_sql,
-                                     PQerrorMessage(exec_conn->conn), "PREPARED READ");
+                                     err, "PREPARED READ");
                     PQclear(pg_stmt->result);
                     pg_stmt->result = NULL;
                 }
@@ -1155,9 +1233,16 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
             }
 
             if (pg_stmt->result) {
-                int result = (pg_stmt->current_row < pg_stmt->num_rows) ? SQLITE_ROW : SQLITE_DONE;
+                if (pg_stmt->current_row >= pg_stmt->num_rows) {
+                    // CRITICAL FIX: Free PGresult immediately when done
+                    // Prevents memory accumulation when Plex doesn't call reset()
+                    PQclear(pg_stmt->result);
+                    pg_stmt->result = NULL;
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return SQLITE_DONE;
+                }
                 pthread_mutex_unlock(&pg_stmt->mutex);
-                return result;
+                return SQLITE_ROW;
             }
         } else if (pg_stmt->is_pg == 1) {  // WRITE
             // CRITICAL FIX: Prevent duplicate execution of the same write
@@ -1170,7 +1255,7 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
             }
 
             // Log INSERT on play_queue_generators for debugging
-            if (strstr(pg_stmt->pg_sql, "play_queue_generators")) {
+            if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "play_queue_generators")) {
                 LOG_INFO("INSERT play_queue_generators on thread %p conn %p",
                         (void*)pthread_self(), (void*)exec_conn);
             }
@@ -1198,6 +1283,33 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 LOG_ERROR("  SQL: %.300s", pg_stmt->pg_sql ? pg_stmt->pg_sql : "NULL");
             }
 
+            // VALIDATION: Skip statistics_media INSERTs with empty count AND duration
+            // This prevents the 310M empty rows bug
+            if (pg_stmt->pg_sql && strcasestr(pg_stmt->pg_sql, "statistics_media")) {
+                // Check if count (param 6) and duration (param 7) are both 0 or NULL
+                const char *count_val = (pg_stmt->param_count > 6) ? paramValues[6] : NULL;
+                const char *duration_val = (pg_stmt->param_count > 7) ? paramValues[7] : NULL;
+                int count_empty = !count_val || strcmp(count_val, "0") == 0;
+                int duration_empty = !duration_val || strcmp(duration_val, "0") == 0;
+                if (count_empty && duration_empty) {
+                    LOG_INFO("SKIP statistics_media INSERT: count=%s duration=%s (empty)",
+                            count_val ? count_val : "NULL", duration_val ? duration_val : "NULL");
+                    pg_stmt->write_executed = 1;
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return SQLITE_DONE;
+                }
+            }
+
+            // Validate connection before use to prevent crash
+            if (!exec_conn || !exec_conn->conn || PQstatus(exec_conn->conn) != CONNECTION_OK) {
+                LOG_ERROR("STEP: Invalid connection, reconnecting...");
+                pg_stmt->write_executed = 1;
+                pthread_mutex_unlock(&pg_stmt->mutex);
+                return SQLITE_ERROR;
+            }
+
+            // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
+            pthread_mutex_lock(&exec_conn->mutex);
             PGresult *res = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
                 pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
 
@@ -1209,7 +1321,7 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 if (status == PGRES_TUPLES_OK && PQntuples(res) > 0) {
                     const char *id_str = PQgetvalue(res, 0, 0);
                     if (id_str && *id_str) {
-                        if (strstr(pg_stmt->pg_sql, "play_queue_generators")) {
+                        if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "play_queue_generators")) {
                             LOG_INFO("STEP play_queue_generators: RETURNING id = %s on thread %p conn %p",
                                     id_str, (void*)pthread_self(), (void*)exec_conn);
                         }
@@ -1218,12 +1330,14 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     }
                 }
             } else {
-                LOG_ERROR("STEP PG write error: %s", PQerrorMessage(exec_conn->conn));
+                const char *err = (exec_conn && exec_conn->conn) ? PQerrorMessage(exec_conn->conn) : "NULL connection";
+                LOG_ERROR("STEP PG write error: %s", err);
             }
 
             // Mark as executed to prevent re-execution on subsequent step() calls
             pg_stmt->write_executed = 1;
             PQclear(res);
+            pthread_mutex_unlock(&exec_conn->mutex);
         }
 
         pthread_mutex_unlock(&pg_stmt->mutex);
@@ -1265,10 +1379,16 @@ static int my_sqlite3_reset(sqlite3_stmt *pStmt) {
 static int my_sqlite3_finalize(sqlite3_stmt *pStmt) {
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
     if (pg_stmt) {
+        // Statement is in global registry
+        // CRITICAL FIX: Use weak clear for TLS (in case same stmt is also cached there)
+        // This prevents double-free: global registry owns the reference
+        pg_clear_cached_stmt_weak(pStmt);
         pg_unregister_stmt(pStmt);
-        pg_stmt_free(pg_stmt);
+        pg_stmt_unref(pg_stmt);
+    } else {
+        // Statement might only be in TLS cache - use normal clear which unrefs
+        pg_clear_cached_stmt(pStmt);
     }
-    pg_clear_cached_stmt(pStmt);
     return sqlite3_finalize(pStmt);
 }
 
@@ -1291,73 +1411,75 @@ static int my_sqlite3_clear_bindings(sqlite3_stmt *pStmt) {
 
 static int my_sqlite3_column_count(sqlite3_stmt *pStmt) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
-        return pg_stmt->num_cols;
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return sqlite3_column_count(pStmt);
+        }
+        int count = pg_stmt->num_cols;
+        pthread_mutex_unlock(&pg_stmt->mutex);
+        return count;
     }
     return sqlite3_column_count(pStmt);
 }
 
 static int my_sqlite3_column_type(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return SQLITE_NULL;
+        }
         if (idx < 0 || idx >= pg_stmt->num_cols) {
             LOG_ERROR("COL_TYPE_BOUNDS: idx=%d out of bounds (num_cols=%d) sql=%.100s",
                      idx, pg_stmt->num_cols, pg_stmt->pg_sql ? pg_stmt->pg_sql : "?");
+            pthread_mutex_unlock(&pg_stmt->mutex);
             return SQLITE_NULL;
         }
         int row = pg_stmt->current_row;
         if (row < 0 || row >= pg_stmt->num_rows) {
             LOG_ERROR("COL_TYPE_ROW_BOUNDS: row=%d out of bounds (num_rows=%d)", row, pg_stmt->num_rows);
+            pthread_mutex_unlock(&pg_stmt->mutex);
             return SQLITE_NULL;
         }
-        if (PQgetisnull(pg_stmt->result, row, idx)) return SQLITE_NULL;
-        return pg_oid_to_sqlite_type(PQftype(pg_stmt->result, idx));
+        int is_null = PQgetisnull(pg_stmt->result, row, idx);
+        int result = is_null ? SQLITE_NULL : pg_oid_to_sqlite_type(PQftype(pg_stmt->result, idx));
+        pthread_mutex_unlock(&pg_stmt->mutex);
+        return result;
     }
     return sqlite3_column_type(pStmt, idx);
 }
 
 static int my_sqlite3_column_int(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0;
+        }
         if (idx < 0 || idx >= pg_stmt->num_cols) {
             LOG_ERROR("COL_INT_BOUNDS: idx=%d out of bounds (num_cols=%d)", idx, pg_stmt->num_cols);
+            pthread_mutex_unlock(&pg_stmt->mutex);
             return 0;
         }
         int row = pg_stmt->current_row;
         if (row < 0 || row >= pg_stmt->num_rows) {
             LOG_ERROR("COL_INT_ROW_BOUNDS: row=%d out of bounds (num_rows=%d)", row, pg_stmt->num_rows);
+            pthread_mutex_unlock(&pg_stmt->mutex);
             return 0;
         }
 
-        const char *col_name = PQfname(pg_stmt->result, idx);
         int result_val = 0;
-
         if (!PQgetisnull(pg_stmt->result, row, idx)) {
             const char *val = PQgetvalue(pg_stmt->result, row, idx);
             if (val[0] == 't' && val[1] == '\0') result_val = 1;
             else if (val[0] == 'f' && val[1] == '\0') result_val = 0;
             else result_val = atoi(val);
         }
-
-        // Log ALL type-related column reads for Movies/TV Shows queries
-        if (col_name && (strstr(col_name, "type") || strstr(col_name, "metadata"))) {
-            LOG_INFO("COL_INT: row=%d idx=%d name='%s' val=%d sql=%.100s",
-                     row, idx, col_name, result_val, pg_stmt->pg_sql ? pg_stmt->pg_sql : "?");
-
-            // Extra detail if metadata_type specifically
-            if (strstr(col_name, "metadata_type")) {
-                LOG_ERROR("METADATA_TYPE_READ: row=%d idx=%d name='%s' val=%d (expected 1 or 18 for movies)",
-                         row, idx, col_name, result_val);
-                // Dump first 10 columns to see what's around it
-                LOG_ERROR("  Column context (first 10 cols):");
-                for (int i = 0; i < 10 && i < pg_stmt->num_cols; i++) {
-                    const char *cn = PQfname(pg_stmt->result, i);
-                    const char *cv = PQgetisnull(pg_stmt->result, row, i) ? "NULL" : PQgetvalue(pg_stmt->result, row, i);
-                    LOG_ERROR("    [%d] %s = %s", i, cn ? cn : "?", cv);
-                }
-            }
-        }
-
+        pthread_mutex_unlock(&pg_stmt->mutex);
         return result_val;
     }
     return sqlite3_column_int(pStmt, idx);
@@ -1365,38 +1487,32 @@ static int my_sqlite3_column_int(sqlite3_stmt *pStmt, int idx) {
 
 static sqlite3_int64 my_sqlite3_column_int64(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0;
+        }
         if (idx < 0 || idx >= pg_stmt->num_cols) {
             LOG_ERROR("COL_INT64_BOUNDS: idx=%d out of bounds (num_cols=%d)", idx, pg_stmt->num_cols);
+            pthread_mutex_unlock(&pg_stmt->mutex);
             return 0;
         }
         int row = pg_stmt->current_row;
         if (row < 0 || row >= pg_stmt->num_rows) {
             LOG_ERROR("COL_INT64_ROW_BOUNDS: row=%d out of bounds (num_rows=%d)", row, pg_stmt->num_rows);
+            pthread_mutex_unlock(&pg_stmt->mutex);
             return 0;
         }
 
-        const char *col_name = PQfname(pg_stmt->result, idx);
         sqlite3_int64 result_val = 0;
-
         if (!PQgetisnull(pg_stmt->result, row, idx)) {
             const char *val = PQgetvalue(pg_stmt->result, row, idx);
             if (val[0] == 't' && val[1] == '\0') result_val = 1;
             else if (val[0] == 'f' && val[1] == '\0') result_val = 0;
             else result_val = atoll(val);
         }
-
-        // Log ALL type-related column reads
-        if (col_name && (strstr(col_name, "type") || strstr(col_name, "metadata"))) {
-            LOG_INFO("COL_INT64: row=%d idx=%d name='%s' val=%lld sql=%.100s",
-                     row, idx, col_name, result_val, pg_stmt->pg_sql ? pg_stmt->pg_sql : "?");
-
-            if (strstr(col_name, "metadata_type")) {
-                LOG_ERROR("METADATA_TYPE_INT64_READ: row=%d idx=%d name='%s' val=%lld",
-                         row, idx, col_name, result_val);
-            }
-        }
-
+        pthread_mutex_unlock(&pg_stmt->mutex);
         return result_val;
     }
     return sqlite3_column_int64(pStmt, idx);
@@ -1404,25 +1520,43 @@ static sqlite3_int64 my_sqlite3_column_int64(sqlite3_stmt *pStmt, int idx) {
 
 static double my_sqlite3_column_double(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
-        if (idx < 0 || idx >= pg_stmt->num_cols) return 0.0;
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0.0;
+        }
+        if (idx < 0 || idx >= pg_stmt->num_cols) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0.0;
+        }
         int row = pg_stmt->current_row;
-        if (row < 0 || row >= pg_stmt->num_rows) return 0.0;
+        if (row < 0 || row >= pg_stmt->num_rows) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0.0;
+        }
+        double result_val = 0.0;
         if (!PQgetisnull(pg_stmt->result, row, idx)) {
             const char *val = PQgetvalue(pg_stmt->result, row, idx);
-            if (val[0] == 't' && val[1] == '\0') return 1.0;
-            if (val[0] == 'f' && val[1] == '\0') return 0.0;
-            return atof(val);
+            if (val[0] == 't' && val[1] == '\0') result_val = 1.0;
+            else if (val[0] == 'f' && val[1] == '\0') result_val = 0.0;
+            else result_val = atof(val);
         }
-        return 0.0;
+        pthread_mutex_unlock(&pg_stmt->mutex);
+        return result_val;
     }
     return sqlite3_column_double(pStmt, idx);
 }
 
 static const unsigned char* my_sqlite3_column_text(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
+    if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+        // CRITICAL FIX: Check result AFTER lock to prevent use-after-free
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return NULL;
+        }
 
         if (idx < 0 || idx >= pg_stmt->num_cols || idx >= MAX_PARAMS) {
             LOG_ERROR("COL_TEXT_BOUNDS: idx=%d out of bounds (num_cols=%d) sql=%.100s",
@@ -1570,8 +1704,12 @@ static const void* pg_decode_bytea(pg_stmt_t *pg_stmt, int row, int col, int *ou
 
 static const void* my_sqlite3_column_blob(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
+    if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return NULL;
+        }
 
         if (idx < 0 || idx >= pg_stmt->num_cols || idx >= MAX_PARAMS) {
             pthread_mutex_unlock(&pg_stmt->mutex);
@@ -1644,8 +1782,12 @@ static const void* my_sqlite3_column_blob(sqlite3_stmt *pStmt, int idx) {
 
 static int my_sqlite3_column_bytes(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
+    if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0;
+        }
 
         if (idx < 0 || idx >= pg_stmt->num_cols) {
             pthread_mutex_unlock(&pg_stmt->mutex);
@@ -1678,10 +1820,18 @@ static int my_sqlite3_column_bytes(sqlite3_stmt *pStmt, int idx) {
 
 static const char* my_sqlite3_column_name(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
-        if (idx >= 0 && idx < pg_stmt->num_cols) {
-            return PQfname(pg_stmt->result, idx);
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return sqlite3_column_name(pStmt, idx);
         }
+        if (idx >= 0 && idx < pg_stmt->num_cols) {
+            const char *name = PQfname(pg_stmt->result, idx);
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return name;
+        }
+        pthread_mutex_unlock(&pg_stmt->mutex);
     }
     return sqlite3_column_name(pStmt, idx);
 }
@@ -1691,12 +1841,20 @@ static const char* my_sqlite3_column_name(sqlite3_stmt *pStmt, int idx) {
 // The sqlite3_value_* functions will decode this to return proper PostgreSQL data.
 static sqlite3_value* my_sqlite3_column_value(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return sqlite3_column_value(pStmt, idx);
+        }
         if (idx < 0 || idx >= pg_stmt->num_cols) {
             LOG_ERROR("COLUMN_VALUE_BOUNDS: idx=%d out of bounds (num_cols=%d) sql=%.100s",
                      idx, pg_stmt->num_cols, pg_stmt->pg_sql ? pg_stmt->pg_sql : "?");
+            pthread_mutex_unlock(&pg_stmt->mutex);
             return NULL;
         }
+        int row = pg_stmt->current_row;
+        pthread_mutex_unlock(&pg_stmt->mutex);
 
         // Return a fake value from our pool (thread-safe)
         pthread_mutex_lock(&fake_value_mutex);
@@ -1705,7 +1863,7 @@ static sqlite3_value* my_sqlite3_column_value(sqlite3_stmt *pStmt, int idx) {
         fake->magic = PG_FAKE_VALUE_MAGIC;
         fake->pg_stmt = pg_stmt;
         fake->col_idx = idx;
-        fake->row_idx = pg_stmt->current_row;
+        fake->row_idx = row;
         pthread_mutex_unlock(&fake_value_mutex);
 
         return (sqlite3_value*)fake;
@@ -1715,6 +1873,7 @@ static sqlite3_value* my_sqlite3_column_value(sqlite3_stmt *pStmt, int idx) {
 
 // Intercept sqlite3_value_type to handle our fake values
 static int my_sqlite3_value_type(sqlite3_value *pVal) {
+    if (!pVal) return SQLITE_NULL;  // CRITICAL FIX: NULL check to prevent crash
     pg_fake_value_t *fake = pg_check_fake_value(pVal);
     if (fake && fake->pg_stmt) {
         pg_stmt_t *pg_stmt = (pg_stmt_t*)fake->pg_stmt;
@@ -1742,6 +1901,7 @@ static int my_sqlite3_value_type(sqlite3_value *pVal) {
 
 // Intercept sqlite3_value_text to handle our fake values
 static const unsigned char* my_sqlite3_value_text(sqlite3_value *pVal) {
+    if (!pVal) return NULL;  // CRITICAL FIX: NULL check
     pg_fake_value_t *fake = pg_check_fake_value(pVal);
     if (fake && fake->pg_stmt) {
         pg_stmt_t *pg_stmt = (pg_stmt_t*)fake->pg_stmt;
@@ -1758,6 +1918,7 @@ static const unsigned char* my_sqlite3_value_text(sqlite3_value *pVal) {
 
 // Intercept sqlite3_value_int to handle our fake values
 static int my_sqlite3_value_int(sqlite3_value *pVal) {
+    if (!pVal) return 0;  // CRITICAL FIX: NULL check
     pg_fake_value_t *fake = pg_check_fake_value(pVal);
     if (fake && fake->pg_stmt) {
         pg_stmt_t *pg_stmt = (pg_stmt_t*)fake->pg_stmt;
@@ -1775,6 +1936,7 @@ static int my_sqlite3_value_int(sqlite3_value *pVal) {
 
 // Intercept sqlite3_value_int64 to handle our fake values
 static sqlite3_int64 my_sqlite3_value_int64(sqlite3_value *pVal) {
+    if (!pVal) return 0;  // CRITICAL FIX: NULL check
     pg_fake_value_t *fake = pg_check_fake_value(pVal);
     if (fake && fake->pg_stmt) {
         pg_stmt_t *pg_stmt = (pg_stmt_t*)fake->pg_stmt;
@@ -1792,6 +1954,7 @@ static sqlite3_int64 my_sqlite3_value_int64(sqlite3_value *pVal) {
 
 // Intercept sqlite3_value_double to handle our fake values
 static double my_sqlite3_value_double(sqlite3_value *pVal) {
+    if (!pVal) return 0.0;  // CRITICAL FIX: NULL check
     pg_fake_value_t *fake = pg_check_fake_value(pVal);
     if (fake && fake->pg_stmt) {
         pg_stmt_t *pg_stmt = (pg_stmt_t*)fake->pg_stmt;
@@ -1809,6 +1972,7 @@ static double my_sqlite3_value_double(sqlite3_value *pVal) {
 
 // Intercept sqlite3_value_bytes to handle our fake values
 static int my_sqlite3_value_bytes(sqlite3_value *pVal) {
+    if (!pVal) return 0;  // CRITICAL FIX: NULL check
     pg_fake_value_t *fake = pg_check_fake_value(pVal);
     if (fake && fake->pg_stmt) {
         pg_stmt_t *pg_stmt = (pg_stmt_t*)fake->pg_stmt;
@@ -1825,6 +1989,7 @@ static int my_sqlite3_value_bytes(sqlite3_value *pVal) {
 
 // Intercept sqlite3_value_blob to handle our fake values
 static const void* my_sqlite3_value_blob(sqlite3_value *pVal) {
+    if (!pVal) return NULL;  // CRITICAL FIX: NULL check
     pg_fake_value_t *fake = pg_check_fake_value(pVal);
     if (fake && fake->pg_stmt) {
         pg_stmt_t *pg_stmt = (pg_stmt_t*)fake->pg_stmt;
@@ -1841,8 +2006,15 @@ static const void* my_sqlite3_value_blob(sqlite3_value *pVal) {
 
 static int my_sqlite3_data_count(sqlite3_stmt *pStmt) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->result) {
-        return (pg_stmt->current_row < pg_stmt->num_rows) ? pg_stmt->num_cols : 0;
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        pthread_mutex_lock(&pg_stmt->mutex);
+        if (!pg_stmt->result) {
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return sqlite3_data_count(pStmt);
+        }
+        int count = (pg_stmt->current_row < pg_stmt->num_rows) ? pg_stmt->num_cols : 0;
+        pthread_mutex_unlock(&pg_stmt->mutex);
+        return count;
     }
     return sqlite3_data_count(pStmt);
 }
@@ -1852,52 +2024,95 @@ static int my_sqlite3_data_count(sqlite3_stmt *pStmt) {
 // ============================================================================
 
 static int my_sqlite3_changes(sqlite3 *db) {
-    pg_connection_t *pg_conn = pg_find_connection(db);
-    if (pg_conn && pg_conn->is_pg_active) {
-        return pg_conn->last_changes;
+    // Prevent recursion: if we're already in an interpose call, return 0
+    if (in_interpose_call) {
+        return 0;
     }
-    return sqlite3_changes(db);
+    in_interpose_call = 1;
+
+    pg_connection_t *pg_conn = pg_find_connection(db);
+    int result = 0;
+
+    if (pg_conn && pg_conn->is_pg_active) {
+        result = pg_conn->last_changes;
+    }
+    // For non-PostgreSQL databases, return 0 (safe default)
+    // We CANNOT call the original SQLite function with DYLD_FORCE_FLAT_NAMESPACE
+    // because it will cause infinite recursion
+
+    in_interpose_call = 0;
+    return result;
 }
 
 static sqlite3_int64 my_sqlite3_changes64(sqlite3 *db) {
-    pg_connection_t *pg_conn = pg_find_connection(db);
-    if (pg_conn && pg_conn->is_pg_active) {
-        return (sqlite3_int64)pg_conn->last_changes;
+    // Prevent recursion: if we're already in an interpose call, return 0
+    if (in_interpose_call) {
+        return 0;
     }
-    return sqlite3_changes64(db);
+    in_interpose_call = 1;
+
+    pg_connection_t *pg_conn = pg_find_connection(db);
+    sqlite3_int64 result = 0;
+
+    if (pg_conn && pg_conn->is_pg_active) {
+        result = (sqlite3_int64)pg_conn->last_changes;
+    }
+    // For non-PostgreSQL databases, return 0 (safe default)
+
+    in_interpose_call = 0;
+    return result;
 }
 
 static sqlite3_int64 my_sqlite3_last_insert_rowid(sqlite3 *db) {
+    // Prevent recursion: if we're already in an interpose call, return 0
+    if (in_interpose_call) {
+        return 0;
+    }
+    in_interpose_call = 1;
+
     pg_connection_t *pg_conn = pg_find_connection(db);
+    sqlite3_int64 result = 0;
 
     // Only use PostgreSQL lastval() if we found the EXACT connection for this db
     // Using a fallback connection would return wrong values from different tables
     if (pg_conn && pg_conn->is_pg_active && pg_conn->conn) {
+        // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
+        pthread_mutex_lock(&pg_conn->mutex);
         PGresult *res = PQexec(pg_conn->conn, "SELECT lastval()");
         if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
             sqlite3_int64 rowid = atoll(PQgetvalue(res, 0, 0) ?: "0");
             PQclear(res);
+            pthread_mutex_unlock(&pg_conn->mutex);
             if (rowid > 0) {
-                LOG_INFO("last_insert_rowid: lastval() = %lld on conn %p for db %p",
+                LOG_DEBUG("last_insert_rowid: lastval() = %lld on conn %p for db %p",
                         rowid, (void*)pg_conn, (void*)db);
-                return rowid;
+                result = rowid;
             }
         } else {
             PQclear(res);
+            pthread_mutex_unlock(&pg_conn->mutex);
         }
     }
+    // For non-PostgreSQL databases, return 0 (safe default)
 
-    // Fall back to SQLite - this handles non-redirected databases correctly
-    return sqlite3_last_insert_rowid(db);
+    in_interpose_call = 0;
+    return result;
 }
 
 static int my_sqlite3_get_table(sqlite3 *db, const char *sql, char ***pazResult,
                                  int *pnRow, int *pnColumn, char **pzErrMsg) {
+    // CRITICAL FIX: NULL check to prevent crash
+    if (!sql) {
+        return sqlite3_get_table(db, sql, pazResult, pnRow, pnColumn, pzErrMsg);
+    }
+
     pg_connection_t *pg_conn = pg_find_connection(db);
 
     if (pg_conn && pg_conn->is_pg_active && pg_conn->conn && is_read_operation(sql)) {
         sql_translation_t trans = sql_translate(sql);
         if (trans.success && trans.sql) {
+            // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
+            pthread_mutex_lock(&pg_conn->mutex);
             PGresult *res = PQexec(pg_conn->conn, trans.sql);
             if (PQresultStatus(res) == PGRES_TUPLES_OK) {
                 int nrows = PQntuples(res);
@@ -1919,11 +2134,13 @@ static int my_sqlite3_get_table(sqlite3 *db, const char *sql, char ***pazResult,
                     *pnColumn = ncols;
                     if (pzErrMsg) *pzErrMsg = NULL;
                     PQclear(res);
+                    pthread_mutex_unlock(&pg_conn->mutex);
                     sql_translation_free(&trans);
                     return SQLITE_OK;
                 }
             }
             PQclear(res);
+            pthread_mutex_unlock(&pg_conn->mutex);
         }
         sql_translation_free(&trans);
     }

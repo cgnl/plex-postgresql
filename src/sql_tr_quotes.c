@@ -403,7 +403,170 @@ char* fix_on_conflict_quotes(const char *sql) {
 char* fix_duplicate_assignments(const char *sql) {
     if (!sql) return NULL;
 
-    // For now, just return a copy
-    // This function can be implemented later if needed
-    return strdup(sql);
+    // Quick check - only applies to UPDATE statements
+    const char *s = sql;
+    while (*s && isspace(*s)) s++;
+    if (strncasecmp(s, "UPDATE", 6) != 0) {
+        return strdup(sql);
+    }
+
+    // Find the SET clause
+    const char *set_pos = strcasestr(sql, " SET ");
+    if (!set_pos) {
+        return strdup(sql);
+    }
+
+    // Find WHERE clause (end of SET clause)
+    const char *where_pos = strcasestr(set_pos, " WHERE ");
+    const char *set_end = where_pos ? where_pos : (sql + strlen(sql));
+
+    // Parse assignments in SET clause
+    #define MAX_ASSIGNMENTS 256
+    struct {
+        char column[128];
+        const char *value_start;
+        const char *value_end;
+        int keep;
+    } assignments[MAX_ASSIGNMENTS];
+    int assign_count = 0;
+
+    const char *p = set_pos + 5;  // Skip " SET "
+    while (p < set_end && assign_count < MAX_ASSIGNMENTS) {
+        // Skip whitespace
+        while (*p && isspace(*p) && p < set_end) p++;
+        if (p >= set_end) break;
+
+        // Extract column name (may be quoted)
+        const char *col_start = p;
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"' && p < set_end) p++;
+            if (*p == '"') p++;
+        } else {
+            while (*p && !isspace(*p) && *p != '=' && p < set_end) p++;
+        }
+
+        size_t col_len = p - col_start;
+        if (col_len >= sizeof(assignments[0].column)) col_len = sizeof(assignments[0].column) - 1;
+
+        // Normalize column name (remove quotes)
+        char column[128] = {0};
+        const char *src = col_start;
+        char *dst = column;
+        while (src < col_start + col_len && dst < column + sizeof(column) - 1) {
+            if (*src != '"') {
+                *dst++ = tolower(*src);
+            }
+            src++;
+        }
+        *dst = '\0';
+
+        // Skip whitespace and '='
+        while (*p && (isspace(*p) || *p == '=') && p < set_end) p++;
+
+        // Find value (ends at ',' or WHERE)
+        const char *value_start = p;
+        int paren_depth = 0;
+        int in_string = 0;
+        while (p < set_end) {
+            if (*p == '\'' && (p == sql || *(p-1) != '\\')) {
+                in_string = !in_string;
+            }
+            if (!in_string) {
+                if (*p == '(') paren_depth++;
+                if (*p == ')') paren_depth--;
+                if (*p == ',' && paren_depth == 0) break;
+            }
+            p++;
+        }
+        const char *value_end = p;
+
+        // Store assignment
+        strncpy(assignments[assign_count].column, column, sizeof(assignments[assign_count].column) - 1);
+        assignments[assign_count].value_start = value_start;
+        assignments[assign_count].value_end = value_end;
+        assignments[assign_count].keep = 1;
+        assign_count++;
+
+        // Skip comma
+        if (*p == ',') p++;
+    }
+
+    // Mark duplicates - keep only the LAST occurrence of each column
+    for (int i = 0; i < assign_count; i++) {
+        for (int j = i + 1; j < assign_count; j++) {
+            if (strcmp(assignments[i].column, assignments[j].column) == 0) {
+                assignments[i].keep = 0;  // Remove earlier occurrence
+                break;
+            }
+        }
+    }
+
+    // Count how many assignments we're keeping
+    int keep_count = 0;
+    for (int i = 0; i < assign_count; i++) {
+        if (assignments[i].keep) keep_count++;
+    }
+
+    // If no duplicates, return original
+    if (keep_count == assign_count) {
+        return strdup(sql);
+    }
+
+    // Rebuild SQL with deduplicated assignments
+    size_t result_len = strlen(sql) + 1;
+    char *result = malloc(result_len);
+    if (!result) return strdup(sql);
+
+    // Copy up to SET clause
+    size_t prefix_len = (set_pos + 5) - sql;
+    memcpy(result, sql, prefix_len);
+    char *out = result + prefix_len;
+
+    // Copy kept assignments
+    int first = 1;
+    for (int i = 0; i < assign_count; i++) {
+        if (!assignments[i].keep) continue;
+
+        if (!first) {
+            *out++ = ',';
+            *out++ = ' ';
+        }
+        first = 0;
+
+        // Find original column name with quotes from source
+        const char *orig_col_start = assignments[i].value_start;
+        while (orig_col_start > sql && *orig_col_start != '=' && *orig_col_start != ',') orig_col_start--;
+        if (*orig_col_start == '=' || *orig_col_start == ',') orig_col_start++;
+        while (*orig_col_start && isspace(*orig_col_start)) orig_col_start++;
+
+        const char *orig_col_end = orig_col_start;
+        if (*orig_col_end == '"') {
+            orig_col_end++;
+            while (*orig_col_end && *orig_col_end != '"') orig_col_end++;
+            if (*orig_col_end == '"') orig_col_end++;
+        } else {
+            while (*orig_col_end && !isspace(*orig_col_end) && *orig_col_end != '=') orig_col_end++;
+        }
+
+        // Copy column name
+        size_t col_len = orig_col_end - orig_col_start;
+        memcpy(out, orig_col_start, col_len);
+        out += col_len;
+
+        // Copy = and value
+        *out++ = '=';
+        size_t value_len = assignments[i].value_end - assignments[i].value_start;
+        memcpy(out, assignments[i].value_start, value_len);
+        out += value_len;
+    }
+
+    // Copy rest of SQL (WHERE clause, etc.)
+    if (where_pos) {
+        strcpy(out, where_pos);
+    } else {
+        *out = '\0';
+    }
+
+    return result;
 }

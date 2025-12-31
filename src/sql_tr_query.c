@@ -18,6 +18,24 @@ char* fix_group_by_strict(const char *sql) {
         return strdup(sql);
     }
 
+    // Special case: metadata_item_clusterings query with invalid outer table reference
+    // Bug: GROUP BY references clusters.library_section_id which is in outer query, not subquery
+    // Fix: Remove the outer table reference from GROUP BY
+    if (strcasestr(sql, "metadata_item_clusterings") &&
+        strcasestr(sql, "clusters.library_section_id") &&
+        strcasestr(sql, "group by")) {
+
+        // Remove ",clusters.library_section_id" from GROUP BY in subquery
+        char *result = str_replace_nocase(sql,
+            ",clusters.library_section_id HAVING",
+            " HAVING");
+        if (result && strcmp(result, sql) != 0) {
+            LOG_INFO("Fixed clusters subquery: removed outer table reference from GROUP BY");
+            return result;
+        }
+        if (result) free(result);
+    }
+
     // Special case: metadata_item_clusterings query with missing column
     if (strcasestr(sql, "metadata_item_clusterings") &&
         strcasestr(sql, "metadata_item_cluster_id") &&
@@ -144,6 +162,40 @@ char* translate_case_booleans(const char *sql) {
     current = temp;
 
     temp = str_replace_nocase(current, "then 1 else false end)", "then true else false end)");
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    // Fix integer literals in boolean context (SQLite allows 0/1, PostgreSQL requires boolean)
+    // (0 or ...) -> (FALSE or ...)
+    temp = str_replace_nocase(current, "(0 or ", "(FALSE or ");
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    temp = str_replace_nocase(current, "(1 or ", "(TRUE or ");
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    // ... and 0) -> ... and FALSE)
+    temp = str_replace_nocase(current, " and 0)", " and FALSE)");
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    temp = str_replace_nocase(current, " and 1)", " and TRUE)");
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    // ... or 0) -> ... or FALSE)
+    temp = str_replace_nocase(current, " or 0)", " or FALSE)");
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    temp = str_replace_nocase(current, " or 1)", " or TRUE)");
     free(current);
     if (!temp) return NULL;
     current = temp;

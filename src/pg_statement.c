@@ -60,7 +60,8 @@ static void free_thread_cached_stmts(void *ptr) {
         for (int i = 0; i < tcs->count; i++) {
             pg_stmt_t *pg_stmt = tcs->entries[i].pg_stmt;
             if (pg_stmt) {
-                pg_stmt_free(pg_stmt);
+                // CRITICAL FIX: Use unref to handle reference counting properly
+                pg_stmt_unref(pg_stmt);
             }
         }
         free(tcs);
@@ -115,7 +116,9 @@ void pg_statement_cleanup(void) {
     pthread_rwlock_wrlock(&stmt_map_rwlock);
     for (int i = 0; i < stmt_pool_next; i++) {
         if (stmt_pool[i].pg_stmt) {
-            pg_stmt_free(stmt_pool[i].pg_stmt);
+            // CRITICAL FIX: Use unref for consistent reference counting
+            pg_stmt_unref(stmt_pool[i].pg_stmt);
+            stmt_pool[i].pg_stmt = NULL;
         }
     }
     memset(stmt_hash, 0, sizeof(stmt_hash));
@@ -134,14 +137,26 @@ void pg_register_stmt(sqlite3_stmt *sqlite_stmt, pg_stmt_t *pg_stmt) {
 
     pthread_rwlock_wrlock(&stmt_map_rwlock);
 
-    // Get a free entry from the pool
-    if (stmt_pool_next >= MAX_STATEMENTS) {
-        pthread_rwlock_unlock(&stmt_map_rwlock);
-        LOG_ERROR("Statement pool full! MAX_STATEMENTS=%d", MAX_STATEMENTS);
-        return;
+    stmt_entry_t *entry = NULL;
+
+    // First, try to find a freed slot (sqlite_stmt == NULL)
+    for (int i = 0; i < stmt_pool_next; i++) {
+        if (stmt_pool[i].sqlite_stmt == NULL) {
+            entry = &stmt_pool[i];
+            break;
+        }
     }
 
-    stmt_entry_t *entry = &stmt_pool[stmt_pool_next++];
+    // If no freed slot, get a new one from the pool
+    if (!entry) {
+        if (stmt_pool_next >= MAX_STATEMENTS) {
+            pthread_rwlock_unlock(&stmt_map_rwlock);
+            LOG_ERROR("Statement pool full! MAX_STATEMENTS=%d", MAX_STATEMENTS);
+            return;
+        }
+        entry = &stmt_pool[stmt_pool_next++];
+    }
+
     entry->sqlite_stmt = sqlite_stmt;
     entry->pg_stmt = pg_stmt;
 
@@ -239,12 +254,18 @@ void pg_register_cached_stmt(sqlite3_stmt *sqlite_stmt, pg_stmt_t *pg_stmt) {
         if (tcs->entries[i].sqlite_stmt == sqlite_stmt) {
             pg_stmt_t *old = tcs->entries[i].pg_stmt;
             if (old && old != pg_stmt) {
-                pg_stmt_free(old);
+                // CRITICAL FIX: Use unref instead of free for proper refcounting
+                pg_stmt_unref(old);
             }
+            // CRITICAL FIX: Increment ref count when caching
+            pg_stmt_ref(pg_stmt);
             tcs->entries[i].pg_stmt = pg_stmt;
             return;
         }
     }
+
+    // CRITICAL FIX: Increment ref count when caching new entry
+    pg_stmt_ref(pg_stmt);
 
     // Add new entry
     if (tcs->count < MAX_CACHED_STMTS_PER_THREAD) {
@@ -254,7 +275,8 @@ void pg_register_cached_stmt(sqlite3_stmt *sqlite_stmt, pg_stmt_t *pg_stmt) {
     } else {
         // Evict oldest entry
         pg_stmt_t *old = tcs->entries[0].pg_stmt;
-        if (old) pg_stmt_free(old);
+        // CRITICAL FIX: Use unref instead of free for proper refcounting
+        if (old) pg_stmt_unref(old);
 
         memmove(&tcs->entries[0], &tcs->entries[1],
                 (MAX_CACHED_STMTS_PER_THREAD - 1) * sizeof(cached_stmt_entry_t));
@@ -282,9 +304,33 @@ void pg_clear_cached_stmt(sqlite3_stmt *sqlite_stmt) {
     for (int i = 0; i < tcs->count; i++) {
         if (tcs->entries[i].sqlite_stmt == sqlite_stmt) {
             pg_stmt_t *old = tcs->entries[i].pg_stmt;
-            if (old) pg_stmt_free(old);
+
+            // Clear entry pointer FIRST
+            tcs->entries[i].pg_stmt = NULL;
 
             // Shift remaining entries
+            for (int j = i; j < tcs->count - 1; j++) {
+                tcs->entries[j] = tcs->entries[j + 1];
+            }
+            tcs->count--;
+
+            // Unref AFTER removing from list (for TLS destructor ownership)
+            if (old) pg_stmt_unref(old);
+            return;
+        }
+    }
+}
+
+// CRITICAL FIX: Weak clear - removes from cache without unreferencing
+// Used by finalize() because global registry owns the reference
+void pg_clear_cached_stmt_weak(sqlite3_stmt *sqlite_stmt) {
+    thread_cached_stmts_t *tcs = get_thread_cached_stmts();
+    if (!tcs) return;
+
+    for (int i = 0; i < tcs->count; i++) {
+        if (tcs->entries[i].sqlite_stmt == sqlite_stmt) {
+            // Just remove from array - DON'T unref (weak reference)
+            tcs->entries[i].pg_stmt = NULL;
             for (int j = i; j < tcs->count - 1; j++) {
                 tcs->entries[j] = tcs->entries[j + 1];
             }
@@ -303,6 +349,7 @@ pg_stmt_t* pg_stmt_create(pg_connection_t *conn, const char *sql, sqlite3_stmt *
     if (!stmt) return NULL;
 
     pthread_mutex_init(&stmt->mutex, NULL);
+    atomic_store(&stmt->ref_count, 1);  // CRITICAL FIX: Initialize ref count
     stmt->conn = conn;
     stmt->shadow_stmt = shadow_stmt;
     stmt->sql = sql ? strdup(sql) : NULL;
@@ -310,6 +357,23 @@ pg_stmt_t* pg_stmt_create(pg_connection_t *conn, const char *sql, sqlite3_stmt *
     stmt->write_executed = 0;  // Initialize write execution guard
 
     return stmt;
+}
+
+// CRITICAL FIX: Reference counting to prevent double-free
+void pg_stmt_ref(pg_stmt_t *stmt) {
+    if (!stmt) return;
+    atomic_fetch_add(&stmt->ref_count, 1);
+}
+
+void pg_stmt_unref(pg_stmt_t *stmt) {
+    if (!stmt) return;
+    int old = atomic_fetch_sub(&stmt->ref_count, 1);
+    if (old == 1) {
+        // Last reference - actually free
+        pg_stmt_free(stmt);
+    } else if (old <= 0) {
+        LOG_ERROR("pg_stmt_unref: ref_count was %d, possible double-free!", old);
+    }
 }
 
 // Helper: check if param_value points to pre-allocated buffer

@@ -10,18 +10,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
+#include <stdatomic.h>
 
 // ============================================================================
 // Connection Pool Configuration
 // ============================================================================
 
-#define POOL_SIZE 30  // Max connections in pool
+// POOL_SIZE is defined in pg_types.h (30)
 
 typedef struct {
     pg_connection_t *conn;
-    pthread_t owner_thread;      // Thread that owns this connection (0 = free)
-    time_t last_used;            // Last time this connection was used
-    int in_use;                  // Currently being used in a query
+    pthread_t owner_thread;           // Thread that owns this connection (0 = free)
+    time_t last_used;                 // Last time this connection was used
+    _Atomic pool_slot_state_t state;  // Atomic state machine (replaces in_use)
+    _Atomic uint32_t generation;      // Increment on each reuse to detect stale refs
 } pool_slot_t;
 
 // ============================================================================
@@ -89,19 +92,24 @@ void pg_client_cleanup(void) {
     }
     pthread_mutex_unlock(&connections_mutex);
 
-    // Clean up pool
+    // Clean up pool - use atomic state transitions
     pthread_mutex_lock(&pool_mutex);
     for (int i = 0; i < POOL_SIZE; i++) {
+        // Force transition to FREE regardless of current state
+        pool_slot_state_t old_state = atomic_exchange(&library_pool[i].state, SLOT_FREE);
+
         if (library_pool[i].conn) {
             if (library_pool[i].conn->conn) {
-                LOG_INFO("Cleanup: closing pool connection %d (thread %p)",
-                        i, (void*)library_pool[i].owner_thread);
+                LOG_INFO("Cleanup: closing pool connection %d (state was %d, thread %p)",
+                        i, old_state, (void*)library_pool[i].owner_thread);
                 PQfinish(library_pool[i].conn->conn);
             }
             pthread_mutex_destroy(&library_pool[i].conn->mutex);
             free(library_pool[i].conn);
             library_pool[i].conn = NULL;
         }
+        library_pool[i].owner_thread = 0;
+        library_pool[i].generation = 0;
     }
     db_to_pool_count = 0;
     pthread_mutex_unlock(&pool_mutex);
@@ -227,29 +235,35 @@ static int is_library_db(const char *path) {
 }
 
 // Reap idle connections from pool (close connections idle > POOL_IDLE_TIMEOUT)
+// NOTE: Currently disabled (causes race conditions with new state machine)
+// Connections are cleaned up on close or reused via PHASE 2/4
 static void pool_reap_idle_connections(void) {
     time_t now = time(NULL);
     int reaped = 0;
 
-    // Must be called with pool_mutex held
+    // Only reap FREE slots with old connections - use atomic CAS to claim
     for (int i = 0; i < POOL_SIZE; i++) {
         if (library_pool[i].conn &&
-            library_pool[i].owner_thread != 0 &&
             (now - library_pool[i].last_used) > POOL_IDLE_TIMEOUT) {
 
-            LOG_INFO("Pool reaper: closing idle connection %d (idle %ld seconds, thread %p)",
-                    i, now - library_pool[i].last_used,
-                    (void*)library_pool[i].owner_thread);
+            // Try to claim the slot atomically
+            pool_slot_state_t expected = SLOT_FREE;
+            if (atomic_compare_exchange_strong(&library_pool[i].state,
+                                               &expected, SLOT_RESERVED)) {
+                LOG_INFO("Pool reaper: closing idle connection %d (idle %ld seconds)",
+                        i, now - library_pool[i].last_used);
 
-            if (library_pool[i].conn->conn) {
-                PQfinish(library_pool[i].conn->conn);
+                if (library_pool[i].conn->conn) {
+                    PQfinish(library_pool[i].conn->conn);
+                }
+                pthread_mutex_destroy(&library_pool[i].conn->mutex);
+                free(library_pool[i].conn);
+                library_pool[i].conn = NULL;
+                library_pool[i].owner_thread = 0;
+                library_pool[i].last_used = 0;
+                atomic_store(&library_pool[i].state, SLOT_FREE);
+                reaped++;
             }
-            pthread_mutex_destroy(&library_pool[i].conn->mutex);
-            free(library_pool[i].conn);
-            library_pool[i].conn = NULL;
-            library_pool[i].owner_thread = 0;
-            library_pool[i].last_used = 0;
-            reaped++;
         }
     }
 
@@ -271,28 +285,85 @@ static pg_connection_t* create_pool_connection(const char *db_path) {
     strncpy(conn->db_path, db_path ? db_path : "", sizeof(conn->db_path) - 1);
 
     char conninfo[1024];
+    // Include TCP keepalive to detect dead connections faster
     snprintf(conninfo, sizeof(conninfo),
-             "host=%s port=%d dbname=%s user=%s password=%s connect_timeout=5",
+             "host=%s port=%d dbname=%s user=%s password=%s "
+             "connect_timeout=5 keepalives=1 keepalives_idle=30 "
+             "keepalives_interval=10 keepalives_count=3",
              cfg->host, cfg->port, cfg->database, cfg->user, cfg->password);
 
     conn->conn = PQconnectdb(conninfo);
 
     if (PQstatus(conn->conn) != CONNECTION_OK) {
-        LOG_ERROR("Pool connection failed: %s", PQerrorMessage(conn->conn));
-        PQfinish(conn->conn);
+        const char *err = conn->conn ? PQerrorMessage(conn->conn) : "NULL connection";
+        LOG_ERROR("Pool connection failed: %s", err);
+        if (conn->conn) {
+            PQfinish(conn->conn);
+        }
         conn->conn = NULL;
     } else {
         char schema_cmd[256];
         snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
         PGresult *res = PQexec(conn->conn, schema_cmd);
         if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-            LOG_ERROR("Failed to set search_path: %s", PQresultErrorMessage(res));
+            const char *err = res ? PQresultErrorMessage(res) : "NULL result";
+            LOG_ERROR("Failed to set search_path: %s", err);
         }
-        PQclear(res);
+        if (res) PQclear(res);
         conn->is_pg_active = 1;
     }
 
     return conn;
+}
+
+// Helper: Perform reconnection for a slot (caller must own the slot via SLOT_RECONNECTING)
+static pg_connection_t* do_slot_reconnect(int slot_idx) {
+    pg_connection_t *conn = library_pool[slot_idx].conn;
+    if (!conn) {
+        atomic_store(&library_pool[slot_idx].state, SLOT_ERROR);
+        return NULL;
+    }
+
+    // Close old connection if exists
+    if (conn->conn) {
+        PQfinish(conn->conn);
+        conn->conn = NULL;
+    }
+
+    // Build connection string
+    pg_conn_config_t *cfg = pg_config_get();
+    char conninfo[1024];
+    snprintf(conninfo, sizeof(conninfo),
+             "host=%s port=%d dbname=%s user=%s password=%s "
+             "connect_timeout=5 keepalives=1 keepalives_idle=30 "
+             "keepalives_interval=10 keepalives_count=3",
+             cfg->host, cfg->port, cfg->database, cfg->user, cfg->password);
+
+    // Do network I/O (no mutex held - we own this slot via atomic state)
+    PGconn *new_pg_conn = PQconnectdb(conninfo);
+
+    if (PQstatus(new_pg_conn) == CONNECTION_OK) {
+        char schema_cmd[256];
+        snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
+        PGresult *res = PQexec(new_pg_conn, schema_cmd);
+        PQclear(res);
+
+        conn->conn = new_pg_conn;
+        conn->is_pg_active = 1;
+        library_pool[slot_idx].last_used = time(NULL);
+
+        LOG_INFO("Pool: reconnected slot %d", slot_idx);
+        atomic_store(&library_pool[slot_idx].state, SLOT_READY);
+        return conn;
+    } else {
+        LOG_ERROR("Pool: reconnect failed for slot %d: %s",
+                  slot_idx, PQerrorMessage(new_pg_conn));
+        PQfinish(new_pg_conn);
+        conn->conn = NULL;
+        conn->is_pg_active = 0;
+        atomic_store(&library_pool[slot_idx].state, SLOT_ERROR);
+        return NULL;
+    }
 }
 
 static pg_connection_t* pool_get_connection(const char *db_path) {
@@ -303,109 +374,158 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
     pthread_t current_thread = pthread_self();
     time_t now = time(NULL);
 
+    // Save db_path atomically (only first time)
     pthread_mutex_lock(&pool_mutex);
-
-    // Save the db_path for later use
     if (!library_db_path[0] && db_path) {
         strncpy(library_db_path, db_path, sizeof(library_db_path) - 1);
     }
+    pthread_mutex_unlock(&pool_mutex);
 
-    // Periodically reap idle connections (every ~10th call to reduce overhead)
-    static int reap_counter = 0;
-    if (++reap_counter >= 10) {
-        pool_reap_idle_connections();
-        reap_counter = 0;
-    }
-
-    // 1. First, find a connection already owned by this thread
+    // =========================================================================
+    // PHASE 1: Find thread's existing READY connection (lock-free)
+    // =========================================================================
     for (int i = 0; i < POOL_SIZE; i++) {
-        if (library_pool[i].conn &&
-            pthread_equal(library_pool[i].owner_thread, current_thread)) {
-            library_pool[i].last_used = now;
-            pg_connection_t *conn = library_pool[i].conn;
+        pool_slot_state_t state = atomic_load(&library_pool[i].state);
 
-            // Check if connection is still healthy
-            if (conn->conn && PQstatus(conn->conn) == CONNECTION_OK) {
-                pthread_mutex_unlock(&pool_mutex);
+        if (state == SLOT_READY &&
+            pthread_equal(library_pool[i].owner_thread, current_thread)) {
+
+            pg_connection_t *conn = library_pool[i].conn;
+            if (conn && conn->conn && PQstatus(conn->conn) == CONNECTION_OK) {
+                library_pool[i].last_used = now;
                 return conn;
             }
-            // Connection is dead, will be replaced below
-            break;
+
+            // Connection is dead - try to transition to RECONNECTING
+            pool_slot_state_t expected = SLOT_READY;
+            if (atomic_compare_exchange_strong(&library_pool[i].state,
+                                               &expected, SLOT_RECONNECTING)) {
+                // We own the reconnect
+                return do_slot_reconnect(i);
+            }
+            // Another thread beat us - continue searching
         }
     }
 
-    // 2. Find a free slot or create new connection
-    int oldest_idx = -1;
-    time_t oldest_time = now;
-    int free_idx = -1;
-
+    // =========================================================================
+    // PHASE 2: Claim FREE slot with existing connection (reuse released slots)
+    // =========================================================================
     for (int i = 0; i < POOL_SIZE; i++) {
-        if (!library_pool[i].conn) {
-            free_idx = i;
-            break;
-        }
-        // Track oldest for potential reuse
-        if (library_pool[i].last_used < oldest_time) {
-            oldest_time = library_pool[i].last_used;
-            oldest_idx = i;
-        }
-    }
+        // Only try slots that have an existing connection we can reuse
+        if (library_pool[i].conn == NULL) continue;
 
-    int use_idx = -1;
+        pool_slot_state_t expected = SLOT_FREE;
+        if (atomic_compare_exchange_strong(&library_pool[i].state,
+                                           &expected, SLOT_RESERVED)) {
+            // Successfully claimed slot atomically
+            library_pool[i].owner_thread = current_thread;
+            library_pool[i].last_used = now;
+            atomic_fetch_add(&library_pool[i].generation, 1);
 
-    if (free_idx >= 0) {
-        // Create new connection in free slot
-        use_idx = free_idx;
-        library_pool[use_idx].conn = create_pool_connection(db_path);
-        if (library_pool[use_idx].conn && library_pool[use_idx].conn->is_pg_active) {
-            LOG_INFO("Pool: created new connection in slot %d (total: %d)",
-                    use_idx, use_idx + 1);
-        }
-    } else if (oldest_idx >= 0) {
-        // Reuse oldest connection
-        use_idx = oldest_idx;
-        LOG_DEBUG("Pool: reusing slot %d from thread %p (idle %lds)",
-                 use_idx, (void*)library_pool[use_idx].owner_thread,
-                 now - library_pool[use_idx].last_used);
-    }
+            pg_connection_t *conn = library_pool[i].conn;
 
-    if (use_idx >= 0 && library_pool[use_idx].conn) {
-        library_pool[use_idx].owner_thread = current_thread;
-        library_pool[use_idx].last_used = now;
-
-        pg_connection_t *conn = library_pool[use_idx].conn;
-
-        // Verify connection is healthy
-        if (!conn->conn || PQstatus(conn->conn) != CONNECTION_OK) {
-            // Reconnect
-            if (conn->conn) {
-                PQfinish(conn->conn);
+            // Check if existing connection is still healthy
+            if (conn && conn->conn && PQstatus(conn->conn) == CONNECTION_OK) {
+                LOG_DEBUG("Pool: reusing existing connection in slot %d", i);
+                atomic_store(&library_pool[i].state, SLOT_READY);
+                return conn;
             }
-            pg_conn_config_t *cfg = pg_config_get();
-            char conninfo[1024];
-            snprintf(conninfo, sizeof(conninfo),
-                     "host=%s port=%d dbname=%s user=%s password=%s connect_timeout=5",
-                     cfg->host, cfg->port, cfg->database, cfg->user, cfg->password);
-            conn->conn = PQconnectdb(conninfo);
 
-            if (PQstatus(conn->conn) == CONNECTION_OK) {
-                char schema_cmd[256];
-                snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
-                PGresult *res = PQexec(conn->conn, schema_cmd);
-                PQclear(res);
-                conn->is_pg_active = 1;
-                LOG_INFO("Pool: reconnected slot %d", use_idx);
+            // Connection is dead - transition to RECONNECTING and fix it
+            atomic_store(&library_pool[i].state, SLOT_RECONNECTING);
+            return do_slot_reconnect(i);
+        }
+    }
+
+    // =========================================================================
+    // PHASE 3: Find empty FREE slot and create new connection
+    // =========================================================================
+    for (int i = 0; i < POOL_SIZE; i++) {
+        // Only try slots without existing connection
+        if (library_pool[i].conn != NULL) continue;
+
+        pool_slot_state_t expected = SLOT_FREE;
+        if (atomic_compare_exchange_strong(&library_pool[i].state,
+                                           &expected, SLOT_RESERVED)) {
+            // Successfully claimed slot atomically
+            library_pool[i].owner_thread = current_thread;
+            library_pool[i].last_used = now;
+            atomic_fetch_add(&library_pool[i].generation, 1);
+
+            LOG_DEBUG("Pool: claimed empty slot %d for thread %p",
+                     i, (void*)current_thread);
+
+            // Create connection (no mutex held - we own this slot)
+            pg_connection_t *new_conn = create_pool_connection(db_path);
+
+            if (new_conn && new_conn->is_pg_active) {
+                library_pool[i].conn = new_conn;
+                LOG_INFO("Pool: created new connection in slot %d", i);
+                atomic_store(&library_pool[i].state, SLOT_READY);
+                return new_conn;
             } else {
-                LOG_ERROR("Pool: reconnect failed for slot %d", use_idx);
-                conn->is_pg_active = 0;
+                // Creation failed - release slot
+                LOG_ERROR("Pool: failed to create connection for slot %d", i);
+                library_pool[i].conn = NULL;
+                library_pool[i].owner_thread = 0;
+                if (new_conn) {
+                    if (new_conn->conn) PQfinish(new_conn->conn);
+                    pthread_mutex_destroy(&new_conn->mutex);
+                    free(new_conn);
+                }
+                atomic_store(&library_pool[i].state, SLOT_FREE);
+                // Continue trying other slots
             }
         }
-
-        pthread_mutex_unlock(&pool_mutex);
-        return conn;
     }
 
-    pthread_mutex_unlock(&pool_mutex);
+    // =========================================================================
+    // PHASE 4: Try to claim ERROR slots (failed connections that need retry)
+    // =========================================================================
+    for (int i = 0; i < POOL_SIZE; i++) {
+        pool_slot_state_t expected = SLOT_ERROR;
+        if (atomic_compare_exchange_strong(&library_pool[i].state,
+                                           &expected, SLOT_RESERVED)) {
+            // Claimed error slot - clean up and recreate
+            library_pool[i].owner_thread = current_thread;
+            library_pool[i].last_used = now;
+            atomic_fetch_add(&library_pool[i].generation, 1);
+
+            // Free old connection if any
+            if (library_pool[i].conn) {
+                if (library_pool[i].conn->conn) {
+                    PQfinish(library_pool[i].conn->conn);
+                }
+                pthread_mutex_destroy(&library_pool[i].conn->mutex);
+                free(library_pool[i].conn);
+                library_pool[i].conn = NULL;
+            }
+
+            LOG_DEBUG("Pool: reclaiming error slot %d", i);
+
+            pg_connection_t *new_conn = create_pool_connection(db_path);
+            if (new_conn && new_conn->is_pg_active) {
+                library_pool[i].conn = new_conn;
+                LOG_INFO("Pool: recovered slot %d with new connection", i);
+                atomic_store(&library_pool[i].state, SLOT_READY);
+                return new_conn;
+            } else {
+                library_pool[i].conn = NULL;
+                library_pool[i].owner_thread = 0;
+                if (new_conn) {
+                    if (new_conn->conn) PQfinish(new_conn->conn);
+                    pthread_mutex_destroy(&new_conn->mutex);
+                    free(new_conn);
+                }
+                atomic_store(&library_pool[i].state, SLOT_FREE);
+            }
+        }
+    }
+
+    // =========================================================================
+    // PHASE 5: Pool is full - log and return NULL
+    // =========================================================================
+    LOG_DEBUG("Pool: no available slots for thread %p", (void*)current_thread);
     return NULL;
 }
 
@@ -436,15 +556,25 @@ void pg_close_pool_for_db(sqlite3 *db) {
         }
     }
 
-    // If we found a pool slot, mark it as free (reset owner_thread)
-    // Don't close the connection immediately - let the reaper handle it
-    // This allows other threads to reuse the connection if needed
+    // If we found a pool slot owned by current thread, transition to FREE
+    // The connection stays open for potential reuse by another thread
     if (pool_slot >= 0 && pool_slot < POOL_SIZE) {
-        if (library_pool[pool_slot].conn) {
-            LOG_INFO("Pool: releasing slot %d for db %p (thread %p)",
-                    pool_slot, (void*)db, (void*)library_pool[pool_slot].owner_thread);
-            library_pool[pool_slot].owner_thread = 0;  // Mark as free for reuse
-            library_pool[pool_slot].last_used = time(NULL);  // Update timestamp for reaper
+        pthread_t current = pthread_self();
+        if (library_pool[pool_slot].conn &&
+            pthread_equal(library_pool[pool_slot].owner_thread, current)) {
+
+            pool_slot_state_t current_state = atomic_load(&library_pool[pool_slot].state);
+            LOG_INFO("Pool: releasing slot %d for db %p (state=%d, thread %p)",
+                    pool_slot, (void*)db, current_state, (void*)current);
+
+            // Only release if in READY state (not while RECONNECTING)
+            if (current_state == SLOT_READY) {
+                library_pool[pool_slot].owner_thread = 0;
+                library_pool[pool_slot].last_used = time(NULL);
+                // Keep state READY - connection is still valid, just unowned
+                // Another thread will claim it in PHASE 1 or it will be reused
+                atomic_store(&library_pool[pool_slot].state, SLOT_FREE);
+            }
         }
     }
 
@@ -476,8 +606,11 @@ pg_connection_t* pg_connect(const char *db_path, sqlite3 *shadow_db) {
     conn->conn = PQconnectdb(conninfo);
 
     if (PQstatus(conn->conn) != CONNECTION_OK) {
-        LOG_ERROR("PostgreSQL connection failed: %s", PQerrorMessage(conn->conn));
-        PQfinish(conn->conn);
+        const char *err = conn->conn ? PQerrorMessage(conn->conn) : "NULL connection";
+        LOG_ERROR("PostgreSQL connection failed: %s", err);
+        if (conn->conn) {
+            PQfinish(conn->conn);
+        }
         conn->conn = NULL;
     } else {
         LOG_INFO("PostgreSQL connected for: %s", db_path);
@@ -486,9 +619,10 @@ pg_connection_t* pg_connect(const char *db_path, sqlite3 *shadow_db) {
         snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
         PGresult *res = PQexec(conn->conn, schema_cmd);
         if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-            LOG_ERROR("Failed to set search_path: %s", PQresultErrorMessage(res));
+            const char *err = res ? PQresultErrorMessage(res) : "NULL result";
+            LOG_ERROR("Failed to set search_path: %s", err);
         }
-        PQclear(res);
+        if (res) PQclear(res);
 
         conn->is_pg_active = 1;
     }
@@ -501,9 +635,18 @@ int pg_ensure_connection(pg_connection_t *conn) {
 
     pthread_mutex_lock(&conn->mutex);
 
+    // Check if connection exists and is healthy
     if (conn->conn && PQstatus(conn->conn) == CONNECTION_OK) {
-        pthread_mutex_unlock(&conn->mutex);
-        return 1;
+        // Additional health check: send a simple ping query
+        PGresult *res = PQexec(conn->conn, "SELECT 1");
+        if (res && PQresultStatus(res) == PGRES_TUPLES_OK) {
+            PQclear(res);
+            pthread_mutex_unlock(&conn->mutex);
+            return 1;
+        }
+        if (res) PQclear(res);
+        // Connection is broken, will reconnect below
+        LOG_INFO("Connection health check failed, will reconnect");
     }
 
     if (conn->conn) {
@@ -520,8 +663,11 @@ int pg_ensure_connection(pg_connection_t *conn) {
     conn->conn = PQconnectdb(conninfo);
 
     if (PQstatus(conn->conn) != CONNECTION_OK) {
-        LOG_ERROR("PostgreSQL reconnection failed: %s", PQerrorMessage(conn->conn));
-        PQfinish(conn->conn);
+        const char *err = conn->conn ? PQerrorMessage(conn->conn) : "NULL connection";
+        LOG_ERROR("PostgreSQL reconnection failed: %s", err);
+        if (conn->conn) {
+            PQfinish(conn->conn);
+        }
         conn->conn = NULL;
         conn->is_pg_active = 0;
         pthread_mutex_unlock(&conn->mutex);
@@ -534,9 +680,10 @@ int pg_ensure_connection(pg_connection_t *conn) {
     snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
     PGresult *res = PQexec(conn->conn, schema_cmd);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        LOG_ERROR("Failed to set search_path on reconnect: %s", PQresultErrorMessage(res));
+        const char *err = res ? PQresultErrorMessage(res) : "NULL result";
+        LOG_ERROR("Failed to set search_path on reconnect: %s", err);
     }
-    PQclear(res);
+    if (res) PQclear(res);
 
     conn->is_pg_active = 1;
     pthread_mutex_unlock(&conn->mutex);

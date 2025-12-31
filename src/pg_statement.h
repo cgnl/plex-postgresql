@@ -22,11 +22,14 @@ int pg_is_our_stmt(void *ptr);
 // TLS cached statement management
 void pg_register_cached_stmt(sqlite3_stmt *sqlite_stmt, pg_stmt_t *pg_stmt);
 pg_stmt_t* pg_find_cached_stmt(sqlite3_stmt *sqlite_stmt);
-void pg_clear_cached_stmt(sqlite3_stmt *sqlite_stmt);
+void pg_clear_cached_stmt(sqlite3_stmt *sqlite_stmt);      // For TLS destructor (unrefs)
+void pg_clear_cached_stmt_weak(sqlite3_stmt *sqlite_stmt); // For finalize (no unref)
 
 // Statement creation/destruction
 pg_stmt_t* pg_stmt_create(pg_connection_t *conn, const char *sql, sqlite3_stmt *shadow_stmt);
-void pg_stmt_free(pg_stmt_t *stmt);
+void pg_stmt_free(pg_stmt_t *stmt);  // Internal - prefer pg_stmt_unref
+void pg_stmt_ref(pg_stmt_t *stmt);   // CRITICAL FIX: Increment reference count
+void pg_stmt_unref(pg_stmt_t *stmt); // CRITICAL FIX: Decrement ref count, free if 0
 void pg_stmt_clear_result(pg_stmt_t *stmt);
 
 // Helpers for SQL transformation

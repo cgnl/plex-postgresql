@@ -262,7 +262,31 @@ static int parse_select_columns(const char *select_start, const char *from_pos,
         }
 
         // Extract column name
+        const char *before_extract = p;
         p = extract_column_name(p, col_name, sizeof(col_name));
+
+        // CRITICAL: If extract_column_name didn't advance, skip one character to prevent infinite loop
+        if (p == before_extract && *p) {
+            p++;
+            // Skip to next comma or end
+            while (*p && *p != ',' && p < from_pos) {
+                if (*p == '(') {
+                    p = skip_to_matching_paren(p);
+                    if (*p == ')') p++;
+                } else if (*p == '\'') {
+                    p++;
+                    while (*p && *p != '\'') {
+                        if (*p == '\\' && *(p+1)) p++;
+                        if (*p) p++;
+                    }
+                    if (*p) p++;
+                } else {
+                    p++;
+                }
+            }
+            if (*p == ',') p++;
+            continue;
+        }
 
         if (col_name[0]) {
             // Skip if this looks like a constant or expression result
@@ -327,7 +351,15 @@ static int parse_group_by_columns(const char *group_by_start, const char *group_
         if (p >= group_by_end) break;
 
         char col_name[MAX_COLUMN_LEN];
+        const char *before_extract = p;
         p = extract_column_name(p, col_name, sizeof(col_name));
+
+        // CRITICAL: If extract_column_name didn't advance, skip to next comma to prevent infinite loop
+        if (p == before_extract && *p) {
+            while (*p && *p != ',' && p < group_by_end) p++;
+            if (*p == ',') p++;
+            continue;
+        }
 
         if (col_name[0] && !isdigit(col_name[0])) {
             // Add to list if not a number (PostgreSQL allows GROUP BY 1,2,3)

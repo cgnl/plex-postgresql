@@ -13,8 +13,8 @@
 #include <ctype.h>
 
 #define MAX_SQL_LEN 131072
-#define MAX_PARAMS 512
 #define MAX_PARAM_NAME 64
+// Note: MAX_PARAMS is defined in pg_types.h (256) for struct array sizes
 
 // ============================================================================
 // Helper Functions (sql_tr_helpers.c)
