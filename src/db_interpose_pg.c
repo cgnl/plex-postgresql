@@ -1000,14 +1000,7 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                                 (void*)pthread_self(), (void*)cached_exec_conn);
                     }
 
-                    // DEADLOCK FIX: Use trylock for connection mutex
-                    if (pthread_mutex_trylock(&cached_exec_conn->mutex) != 0) {
-                        LOG_DEBUG("CACHED WRITE: connection mutex contention, falling back to SQLite");
-                        if (insert_sql) free(insert_sql);
-                        sql_translation_free(&trans);
-                        if (expanded_sql) sqlite3_free(expanded_sql);
-                        return sqlite3_step(pStmt);
-                    }
+                    // Execute cached write - no connection mutex needed (per-thread connection)
                     PGresult *res = PQexec(cached_exec_conn->conn, exec_sql);
                     ExecStatusType status = PQresultStatus(res);
 
@@ -1028,7 +1021,6 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
 
                     if (insert_sql) free(insert_sql);
                     PQclear(res);
-                    pthread_mutex_unlock(&cached_exec_conn->mutex);
 
                     // CRITICAL FIX: Create cached stmt entry and mark as executed
                     if (!cached) {
@@ -1105,19 +1097,12 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                             }
                         }
                         if (new_stmt) {
-                            // DEADLOCK FIX: Use trylock for connection mutex
-                            if (pthread_mutex_trylock(&cached_read_conn->mutex) != 0) {
-                                LOG_DEBUG("CACHED READ: connection mutex contention, falling back to SQLite");
-                                sql_translation_free(&trans);
-                                if (expanded_sql) sqlite3_free(expanded_sql);
-                                return sqlite3_step(pStmt);
-                            }
+                            // Execute cached read - no connection mutex needed (per-thread connection)
                             new_stmt->result = PQexec(cached_read_conn->conn, trans.sql);
                             if (PQresultStatus(new_stmt->result) == PGRES_TUPLES_OK) {
                                 new_stmt->num_rows = PQntuples(new_stmt->result);
                                 new_stmt->num_cols = PQnfields(new_stmt->result);
                                 new_stmt->current_row = 0;
-                                pthread_mutex_unlock(&cached_read_conn->mutex);
                                 // Log result count for play_queue_generators
                                 if (strstr(sql, "play_queue_generators")) {
                                     LOG_INFO("CACHED SELECT play_queue_generators returned %d rows", new_stmt->num_rows);
@@ -1131,7 +1116,6 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                                 return (new_stmt->num_rows > 0) ? SQLITE_ROW : SQLITE_DONE;
                             } else {
                                 const char *err = (cached_read_conn && cached_read_conn->conn) ? PQerrorMessage(cached_read_conn->conn) : "NULL connection";
-                                pthread_mutex_unlock(&cached_read_conn->mutex);
                                 log_sql_fallback(sql, trans.sql, err, "CACHED READ");
                                 PQclear(new_stmt->result);
                                 new_stmt->result = NULL;
@@ -1161,13 +1145,10 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
     }
 
     if (pg_stmt && pg_stmt->pg_sql && exec_conn && exec_conn->conn) {
-        // DEADLOCK FIX: Use trylock instead of blocking lock
-        // If another thread is using this statement, fall back to SQLite
-        // This prevents the deadlock where 40+ threads block waiting for one mutex
-        if (pthread_mutex_trylock(&pg_stmt->mutex) != 0) {
-            LOG_DEBUG("STEP: mutex contention on pg_stmt %p, falling back to SQLite", (void*)pg_stmt);
-            return sqlite3_step(pStmt);
-        }
+        // Lock statement mutex to protect statement state
+        // NOTE: exec_conn->mutex is NOT needed because each thread has its own
+        // connection from the pool (per-thread connection model)
+        pthread_mutex_lock(&pg_stmt->mutex);
 
         const char *paramValues[MAX_PARAMS] = {NULL};  // Initialize to prevent garbage access
         for (int i = 0; i < pg_stmt->param_count && i < MAX_PARAMS; i++) {
@@ -1187,16 +1168,13 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     for (int i = 0; i < pg_stmt->param_count && i < 5; i++) {
                         LOG_INFO("  PARAM[%d] = %s", i+1, paramValues[i] ? paramValues[i] : "NULL");
                     }
-                    // Debug: check search_path (use trylock to avoid deadlock)
+                    // Debug: check search_path
                     if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "directories")) {
-                        if (pthread_mutex_trylock(&exec_conn->mutex) == 0) {
-                            PGresult *sp = PQexec(exec_conn->conn, "SHOW search_path");
-                            if (PQresultStatus(sp) == PGRES_TUPLES_OK && PQntuples(sp) > 0) {
-                                LOG_INFO("  search_path = %s", PQgetvalue(sp, 0, 0));
-                            }
-                            PQclear(sp);
-                            pthread_mutex_unlock(&exec_conn->mutex);
+                        PGresult *sp = PQexec(exec_conn->conn, "SHOW search_path");
+                        if (PQresultStatus(sp) == PGRES_TUPLES_OK && PQntuples(sp) > 0) {
+                            LOG_INFO("  search_path = %s", PQgetvalue(sp, 0, 0));
                         }
+                        PQclear(sp);
                     }
                 }
 
@@ -1212,16 +1190,9 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     return SQLITE_ERROR;
                 }
 
-                // DEADLOCK FIX: Use trylock for connection mutex too
-                // If another operation is using this connection, fall back to SQLite
-                if (pthread_mutex_trylock(&exec_conn->mutex) != 0) {
-                    LOG_DEBUG("STEP READ: connection mutex contention, falling back to SQLite");
-                    pthread_mutex_unlock(&pg_stmt->mutex);
-                    return sqlite3_step(pStmt);
-                }
+                // Execute query - no connection mutex needed (per-thread connection)
                 pg_stmt->result = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
                     pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
-                pthread_mutex_unlock(&exec_conn->mutex);
 
                 // Check for query errors
                 ExecStatusType status = PQresultStatus(pg_stmt->result);
@@ -1329,24 +1300,7 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 return SQLITE_ERROR;
             }
 
-            // DEADLOCK FIX: Use trylock for connection mutex
-            // For WRITES, we can't fall back to SQLite (data consistency)
-            // Retry a few times before giving up
-            int got_lock = 0;
-            for (int retry = 0; retry < 10; retry++) {
-                if (pthread_mutex_trylock(&exec_conn->mutex) == 0) {
-                    got_lock = 1;
-                    break;
-                }
-                usleep(1000);  // 1ms wait between retries
-            }
-            if (!got_lock) {
-                LOG_ERROR("STEP WRITE: connection mutex contention after 10 retries");
-                pg_stmt->write_executed = 1;
-                pthread_mutex_unlock(&pg_stmt->mutex);
-                return SQLITE_BUSY;
-            }
-
+            // Execute write - no connection mutex needed (per-thread connection)
             PGresult *res = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
                 pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
 
@@ -1374,7 +1328,6 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
             // Mark as executed to prevent re-execution on subsequent step() calls
             pg_stmt->write_executed = 1;
             PQclear(res);
-            pthread_mutex_unlock(&exec_conn->mutex);
         }
 
         pthread_mutex_unlock(&pg_stmt->mutex);
