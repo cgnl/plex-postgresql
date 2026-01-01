@@ -1212,11 +1212,14 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                             pg_stmt_cache_add(exec_conn, pg_stmt->sql_hash, pg_stmt->stmt_name, pg_stmt->param_count);
                             cached_name = pg_stmt->stmt_name;
                             is_cached = 1;
+                            LOG_DEBUG("PREPARED_STMT: New statement %s (params=%d)", pg_stmt->stmt_name, pg_stmt->param_count);
                         } else {
                             // Prepare failed - fall back to PQexecParams
                             LOG_DEBUG("PQprepare failed for %s: %s", pg_stmt->stmt_name, PQerrorMessage(exec_conn->conn));
                         }
                         PQclear(prep_res);
+                    } else {
+                        LOG_DEBUG("PREPARED_STMT: Cache hit for %s", cached_name);
                     }
 
                     if (is_cached && cached_name) {
