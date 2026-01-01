@@ -53,6 +53,11 @@ char* translate_iif(const char *sql) {
 // ============================================================================
 
 char* translate_typeof(const char *sql) {
+    // Fast path: if no "typeof" in query, nothing to translate
+    if (!strcasestr(sql, "typeof(")) {
+        return strdup(sql);
+    }
+
     char *temp = str_replace_nocase(sql, "typeof(", "pg_typeof(");
     if (!temp) return NULL;
 

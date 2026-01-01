@@ -13,6 +13,16 @@
 char* sql_translate_types(const char *sql) {
     if (!sql) return NULL;
 
+    // Fast path: if no type-related patterns, skip all translations
+    // These patterns only appear in DDL statements (CREATE TABLE, etc.)
+    if (!strcasestr(sql, "autoincrement") &&
+        !strcasestr(sql, "dt_integer") &&
+        !strcasestr(sql, "integer(8)") &&
+        !strcasestr(sql, " blob") &&
+        !strcasestr(sql, " boolean")) {
+        return strdup(sql);
+    }
+
     char *current = strdup(sql);
     if (!current) return NULL;
 

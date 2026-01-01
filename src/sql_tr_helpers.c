@@ -13,6 +13,19 @@ char* str_replace(const char *str, const char *old, const char *new_str) {
     if (!str || !old || !new_str) return NULL;
 
     size_t old_len = strlen(old);
+    if (old_len == 0) return strdup(str);
+
+    // Fast path: check if first char exists before expensive strstr
+    char first = old[0];
+    int found_first = 0;
+    for (const char *scan = str; *scan; scan++) {
+        if (*scan == first) {
+            found_first = 1;
+            break;
+        }
+    }
+    if (!found_first) return strdup(str);
+
     size_t new_len = strlen(new_str);
 
     // Count occurrences
@@ -54,6 +67,23 @@ char* str_replace_nocase(const char *str, const char *old, const char *new_str) 
     if (!str || !old || !new_str) return NULL;
 
     size_t old_len = strlen(old);
+    if (old_len == 0) return strdup(str);
+
+    // Fast path: check if first char of pattern exists (case insensitive)
+    // This avoids expensive strcasestr scan for patterns that can't match
+    char first = old[0];
+    char first_lower = (first >= 'A' && first <= 'Z') ? (first | 0x20) : first;
+    char first_upper = (first >= 'a' && first <= 'z') ? (first & ~0x20) : first;
+    int found_first = 0;
+    for (const char *scan = str; *scan; scan++) {
+        char c = *scan;
+        if (c == first_lower || c == first_upper) {
+            found_first = 1;
+            break;
+        }
+    }
+    if (!found_first) return strdup(str);
+
     size_t new_len = strlen(new_str);
 
     // Count occurrences first (case insensitive)

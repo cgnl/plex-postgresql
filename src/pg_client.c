@@ -235,8 +235,14 @@ pg_connection_t* pg_find_any_library_connection(void) {
 // Connection Pool for library.db
 // ============================================================================
 
+// Fast suffix check - avoids full strstr scan
 static int is_library_db(const char *path) {
-    return path && strstr(path, "com.plexapp.plugins.library.db") != NULL;
+    if (!path) return 0;
+    static const char suffix[] = "com.plexapp.plugins.library.db";
+    static const size_t suffix_len = sizeof(suffix) - 1;  // 30 chars
+    size_t path_len = strlen(path);
+    if (path_len < suffix_len) return 0;
+    return memcmp(path + path_len - suffix_len, suffix, suffix_len) == 0;
 }
 
 // Reap idle connections from pool (close connections idle > POOL_IDLE_TIMEOUT)

@@ -214,7 +214,39 @@ static int parse_select_columns(const char *select_start, const char *from_pos,
             continue;
         }
 
-        // Not an aggregate - extract column reference
+        // Check if this is a non-aggregate function call (e.g., upper(...) as c)
+        if (*p == '(') {
+            // Skip the function call
+            p = skip_to_matching_paren(p);
+            if (*p == ')') p++;
+
+            p = skip_ws(p);
+
+            // Check for AS alias - if present, use the alias for GROUP BY
+            if (strncasecmp(p, "as", 2) == 0 && !is_ident_char(p[2])) {
+                p += 2;
+                p = skip_ws(p);
+
+                char alias[MAX_COLUMN_LEN];
+                p = extract_column_name(p, alias, sizeof(alias));
+
+                if (alias[0] && !column_exists(cols, col_count, alias)) {
+                    strncpy(cols[col_count].name, alias, MAX_COLUMN_LEN - 1);
+                    cols[col_count].name[MAX_COLUMN_LEN - 1] = '\0';
+                    cols[col_count].is_aggregate = 0;
+                    cols[col_count].is_alias = 1;
+                    col_count++;
+                }
+            }
+            // If no alias, skip - function expressions without aliases
+            // shouldn't be added to GROUP BY by name
+
+            p = skip_ws(p);
+            if (*p == ',') p++;
+            continue;
+        }
+
+        // Not a function call - extract column reference
         p = func_start; // Reset
 
         char col_name[MAX_COLUMN_LEN];

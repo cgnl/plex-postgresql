@@ -141,6 +141,11 @@ char* add_subquery_alias(const char *sql) {
 char* translate_case_booleans(const char *sql) {
     if (!sql) return NULL;
 
+    // Fast path: if no "end)" in query, no CASE/boolean translations needed
+    if (!strcasestr(sql, "end)") && !strcasestr(sql, "(0 ") && !strcasestr(sql, "(1 ")) {
+        return strdup(sql);
+    }
+
     char *current = strdup(sql);
     if (!current) return NULL;
 
@@ -366,6 +371,11 @@ static void convert_fts_term(const char *sqlite_term, char *pg_term, size_t pg_t
 
 char* translate_fts(const char *sql) {
     if (!sql) return NULL;
+
+    // Fast path: if no "fts4" in query, no FTS translation needed
+    if (!strcasestr(sql, "fts4")) {
+        return strdup(sql);
+    }
 
     // Allocate result buffer (generous size)
     char *result = malloc(strlen(sql) * 3 + 1024);
@@ -846,11 +856,16 @@ char* fix_json_operator_on_text(const char *sql) {
                                 // -> column LIKE '%"key":"0"%' (simplified for version checking)
                                 out += sprintf(out, " LIKE '%%\"%s\":\"0\"%%'", json_key);
                                 // Skip the < and the value
-                                p = strchr(after, '\'');
-                                if (p) {
-                                    p = strchr(p + 1, '\'');
-                                    if (p) p++;
+                                const char *quote1 = strchr(after, '\'');
+                                if (quote1) {
+                                    const char *quote2 = strchr(quote1 + 1, '\'');
+                                    if (quote2) {
+                                        p = quote2 + 1;
+                                        continue;
+                                    }
                                 }
+                                // Fallback: skip to after the JSON operator
+                                p = key_end + 1;
                                 continue;
                             }
                         }
