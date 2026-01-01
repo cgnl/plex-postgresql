@@ -35,4 +35,10 @@ void pg_set_global_metadata_id(sqlite3_int64 id);
 sqlite3_int64 pg_get_global_last_insert_rowid(void);
 void pg_set_global_last_insert_rowid(sqlite3_int64 id);
 
+// Prepared statement cache management
+uint64_t pg_hash_sql(const char *sql);
+int pg_stmt_cache_lookup(pg_connection_t *conn, uint64_t sql_hash, const char **stmt_name);
+int pg_stmt_cache_add(pg_connection_t *conn, uint64_t sql_hash, const char *stmt_name, int param_count);
+void pg_stmt_cache_clear(pg_connection_t *conn);
+
 #endif // PG_CLIENT_H

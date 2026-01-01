@@ -344,6 +344,9 @@ static pg_connection_t* do_slot_reconnect(int slot_idx) {
         return NULL;
     }
 
+    // Clear prepared statement cache - statements are invalidated on reconnect
+    pg_stmt_cache_clear(conn);
+
     // Close old connection if exists
     if (conn->conn) {
         PQfinish(conn->conn);
@@ -444,6 +447,7 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
                     if (ready > 0) {
                         // Data waiting = orphaned results, reset connection
                         LOG_INFO("Pool: slot %d has pending data, resetting", i);
+                        pg_stmt_cache_clear(conn);  // Clear cache before reset
                         PQreset(conn->conn);
                         if (PQstatus(conn->conn) == CONNECTION_OK) {
                             pg_conn_config_t *cfg = pg_config_get();
@@ -492,6 +496,7 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
             // This is safer than trying to drain stale results which can crash
             if (conn && conn->conn) {
                 LOG_DEBUG("Pool: resetting connection in slot %d for reuse", i);
+                pg_stmt_cache_clear(conn);  // Clear cache before reset
                 PQreset(conn->conn);
 
                 if (PQstatus(conn->conn) == CONNECTION_OK) {
@@ -796,6 +801,9 @@ int pg_ensure_connection(pg_connection_t *conn) {
 void pg_close(pg_connection_t *conn) {
     if (!conn) return;
 
+    // Clear prepared statement cache before closing
+    pg_stmt_cache_clear(conn);
+
     pthread_mutex_lock(&conn->mutex);
     if (conn->conn) {
         PQfinish(conn->conn);
@@ -839,4 +847,120 @@ void pg_set_global_last_insert_rowid(sqlite3_int64 id) {
     pthread_mutex_lock(&global_rowid_mutex);
     global_last_insert_rowid = id;
     pthread_mutex_unlock(&global_rowid_mutex);
+}
+
+// ============================================================================
+// Prepared Statement Cache Management
+// ============================================================================
+
+// FNV-1a hash - fast with good distribution
+uint64_t pg_hash_sql(const char *sql) {
+    if (!sql) return 0;
+
+    uint64_t hash = 14695981039346656037ULL;  // FNV offset basis
+    while (*sql) {
+        hash ^= (uint64_t)(unsigned char)*sql++;
+        hash *= 1099511628211ULL;  // FNV prime
+    }
+    return hash;
+}
+
+// Lookup statement in cache by hash
+// Returns 1 if found (stmt_name set), 0 if not found
+int pg_stmt_cache_lookup(pg_connection_t *conn, uint64_t sql_hash, const char **stmt_name) {
+    if (!conn || !stmt_name) return 0;
+
+    stmt_cache_t *cache = &conn->stmt_cache;
+
+    for (int i = 0; i < cache->count; i++) {
+        if (cache->entries[i].sql_hash == sql_hash && cache->entries[i].prepared) {
+            // Update last_used for LRU
+            cache->entries[i].last_used = time(NULL);
+            *stmt_name = cache->entries[i].stmt_name;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// Add statement to cache
+// Returns index of entry, or -1 on failure
+int pg_stmt_cache_add(pg_connection_t *conn, uint64_t sql_hash, const char *stmt_name, int param_count) {
+    if (!conn || !stmt_name) return -1;
+
+    stmt_cache_t *cache = &conn->stmt_cache;
+
+    // Check if already exists (update it)
+    for (int i = 0; i < cache->count; i++) {
+        if (cache->entries[i].sql_hash == sql_hash) {
+            cache->entries[i].prepared = 1;
+            cache->entries[i].param_count = param_count;
+            cache->entries[i].last_used = time(NULL);
+            strncpy(cache->entries[i].stmt_name, stmt_name, sizeof(cache->entries[i].stmt_name) - 1);
+            cache->entries[i].stmt_name[sizeof(cache->entries[i].stmt_name) - 1] = '\0';
+            LOG_DEBUG("Updated prepared statement in cache: %s (hash=%llx)", stmt_name, (unsigned long long)sql_hash);
+            return i;
+        }
+    }
+
+    // Need to add new entry
+    int idx;
+    if (cache->count < STMT_CACHE_SIZE) {
+        // Room available
+        idx = cache->count++;
+    } else {
+        // Cache full - evict LRU entry
+        idx = 0;
+        time_t oldest = cache->entries[0].last_used;
+        for (int i = 1; i < STMT_CACHE_SIZE; i++) {
+            if (cache->entries[i].last_used < oldest) {
+                oldest = cache->entries[i].last_used;
+                idx = i;
+            }
+        }
+
+        // Deallocate the old prepared statement on PostgreSQL
+        if (cache->entries[idx].prepared && conn->conn) {
+            char dealloc[64];
+            snprintf(dealloc, sizeof(dealloc), "DEALLOCATE %s", cache->entries[idx].stmt_name);
+            PGresult *res = PQexec(conn->conn, dealloc);
+            if (res) PQclear(res);
+            LOG_DEBUG("Evicted prepared statement from cache: %s", cache->entries[idx].stmt_name);
+        }
+    }
+
+    // Fill in the entry
+    cache->entries[idx].sql_hash = sql_hash;
+    cache->entries[idx].param_count = param_count;
+    cache->entries[idx].prepared = 1;
+    cache->entries[idx].last_used = time(NULL);
+    strncpy(cache->entries[idx].stmt_name, stmt_name, sizeof(cache->entries[idx].stmt_name) - 1);
+    cache->entries[idx].stmt_name[sizeof(cache->entries[idx].stmt_name) - 1] = '\0';
+
+    LOG_DEBUG("Added prepared statement to cache: %s (hash=%llx, idx=%d)", stmt_name, (unsigned long long)sql_hash, idx);
+    return idx;
+}
+
+// Clear all cached statements for a connection (called on disconnect/reset)
+void pg_stmt_cache_clear(pg_connection_t *conn) {
+    if (!conn) return;
+
+    stmt_cache_t *cache = &conn->stmt_cache;
+
+    // Deallocate all prepared statements on PostgreSQL
+    if (conn->conn) {
+        for (int i = 0; i < cache->count; i++) {
+            if (cache->entries[i].prepared) {
+                char dealloc[64];
+                snprintf(dealloc, sizeof(dealloc), "DEALLOCATE %s", cache->entries[i].stmt_name);
+                PGresult *res = PQexec(conn->conn, dealloc);
+                if (res) PQclear(res);
+            }
+        }
+    }
+
+    // Clear the cache
+    memset(cache, 0, sizeof(stmt_cache_t));
+    LOG_DEBUG("Cleared prepared statement cache for connection %p", (void*)conn);
 }

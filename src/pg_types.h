@@ -41,6 +41,26 @@
 // Connection pool size
 #define POOL_SIZE 30
 
+// Prepared statement cache size per connection
+#define STMT_CACHE_SIZE 256
+
+// ============================================================================
+// Prepared Statement Cache (per-connection)
+// ============================================================================
+
+typedef struct {
+    uint64_t sql_hash;           // FNV-1a hash of SQL string
+    char stmt_name[32];          // "ps_<hash>" - PostgreSQL statement name
+    int param_count;             // Number of parameters
+    int prepared;                // 1 = prepared on this connection
+    time_t last_used;            // For LRU eviction
+} prepared_stmt_cache_entry_t;
+
+typedef struct {
+    prepared_stmt_cache_entry_t entries[STMT_CACHE_SIZE];
+    int count;
+} stmt_cache_t;
+
 // ============================================================================
 // Connection Pool State Machine (thread-safe with atomic CAS)
 // ============================================================================
@@ -85,6 +105,9 @@ typedef struct pg_connection {
     sqlite3_int64 last_generator_metadata_id;  // Track metadata_item_id from generator URI
     char last_error[1024];           // Track last PostgreSQL error message
     int last_error_code;             // Track last SQLite-style error code
+
+    // Prepared statement cache for this connection
+    stmt_cache_t stmt_cache;
 } pg_connection_t;
 
 // ============================================================================
@@ -99,6 +122,11 @@ typedef struct pg_stmt {
     char *sql;                       // Original SQL
     char *pg_sql;                    // Translated PostgreSQL SQL
     PGresult *result;
+
+    // Prepared statement support
+    uint64_t sql_hash;               // FNV-1a hash of pg_sql for cache lookup
+    char stmt_name[32];              // "ps_<hash>" - PostgreSQL statement name
+    int use_prepared;                // 1 = use prepared statements for this query
     int current_row;
     int num_rows;
     int num_cols;

@@ -545,6 +545,14 @@ static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
                             pg_stmt->pg_sql = with_returning;
                         }
                     }
+
+                    // Calculate hash and statement name for prepared statement support
+                    if (pg_stmt->pg_sql) {
+                        pg_stmt->sql_hash = pg_hash_sql(pg_stmt->pg_sql);
+                        snprintf(pg_stmt->stmt_name, sizeof(pg_stmt->stmt_name),
+                                 "ps_%llx", (unsigned long long)pg_stmt->sql_hash);
+                        pg_stmt->use_prepared = 1;  // Enable prepared statements
+                    }
                 }
                 sql_translation_free(&trans);
             }
@@ -1198,8 +1206,42 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
                 // libpq is not thread-safe when sharing PGconn between threads
                 pthread_mutex_lock(&exec_conn->mutex);
-                pg_stmt->result = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
-                    pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
+
+                // Use prepared statements for better performance (skip parse/plan overhead)
+                if (pg_stmt->use_prepared && pg_stmt->stmt_name[0]) {
+                    const char *cached_name = NULL;
+                    int is_cached = pg_stmt_cache_lookup(exec_conn, pg_stmt->sql_hash, &cached_name);
+
+                    if (!is_cached) {
+                        // Prepare statement on this connection
+                        PGresult *prep_res = PQprepare(exec_conn->conn, pg_stmt->stmt_name,
+                                                        pg_stmt->pg_sql, pg_stmt->param_count, NULL);
+                        if (PQresultStatus(prep_res) == PGRES_COMMAND_OK) {
+                            pg_stmt_cache_add(exec_conn, pg_stmt->sql_hash, pg_stmt->stmt_name, pg_stmt->param_count);
+                            cached_name = pg_stmt->stmt_name;
+                            is_cached = 1;
+                        } else {
+                            // Prepare failed - fall back to PQexecParams
+                            LOG_DEBUG("PQprepare failed for %s: %s", pg_stmt->stmt_name, PQerrorMessage(exec_conn->conn));
+                        }
+                        PQclear(prep_res);
+                    }
+
+                    if (is_cached && cached_name) {
+                        // Execute prepared statement
+                        pg_stmt->result = PQexecPrepared(exec_conn->conn, cached_name,
+                            pg_stmt->param_count, paramValues, NULL, NULL, 0);
+                    } else {
+                        // Fallback to PQexecParams
+                        pg_stmt->result = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
+                            pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
+                    }
+                } else {
+                    // No prepared statement support for this query
+                    pg_stmt->result = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
+                        pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
+                }
+
                 pthread_mutex_unlock(&exec_conn->mutex);
 
                 // Check for query errors
@@ -1310,8 +1352,43 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
 
             // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
             pthread_mutex_lock(&exec_conn->mutex);
-            PGresult *res = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
-                pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
+
+            PGresult *res = NULL;
+
+            // Use prepared statements for better performance (skip parse/plan overhead)
+            if (pg_stmt->use_prepared && pg_stmt->stmt_name[0]) {
+                const char *cached_name = NULL;
+                int is_cached = pg_stmt_cache_lookup(exec_conn, pg_stmt->sql_hash, &cached_name);
+
+                if (!is_cached) {
+                    // Prepare statement on this connection
+                    PGresult *prep_res = PQprepare(exec_conn->conn, pg_stmt->stmt_name,
+                                                    pg_stmt->pg_sql, pg_stmt->param_count, NULL);
+                    if (PQresultStatus(prep_res) == PGRES_COMMAND_OK) {
+                        pg_stmt_cache_add(exec_conn, pg_stmt->sql_hash, pg_stmt->stmt_name, pg_stmt->param_count);
+                        cached_name = pg_stmt->stmt_name;
+                        is_cached = 1;
+                    } else {
+                        // Prepare failed - fall back to PQexecParams
+                        LOG_DEBUG("PQprepare (write) failed for %s: %s", pg_stmt->stmt_name, PQerrorMessage(exec_conn->conn));
+                    }
+                    PQclear(prep_res);
+                }
+
+                if (is_cached && cached_name) {
+                    // Execute prepared statement
+                    res = PQexecPrepared(exec_conn->conn, cached_name,
+                        pg_stmt->param_count, paramValues, NULL, NULL, 0);
+                } else {
+                    // Fallback to PQexecParams
+                    res = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
+                        pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
+                }
+            } else {
+                // No prepared statement support for this query
+                res = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
+                    pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
+            }
 
             ExecStatusType status = PQresultStatus(res);
             if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
