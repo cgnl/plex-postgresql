@@ -346,11 +346,16 @@ static int parse_select_columns(const char *select_start, const char *from_pos,
         if (strncasecmp(p, "as", 2) == 0 && !is_ident_char(p[2])) {
             p += 2;
             p = skip_ws(p);
-            // Skip alias name
+            // Skip alias name (handles "double", 'single', and unquoted identifiers)
             if (*p == '"') {
                 p++;
                 while (*p && *p != '"') p++;
                 if (*p == '"') p++;
+            } else if (*p == '\'') {
+                // SQLite allows single-quoted aliases
+                p++;
+                while (*p && *p != '\'') p++;
+                if (*p == '\'') p++;
             } else {
                 while (*p && is_ident_char(*p)) p++;
             }
