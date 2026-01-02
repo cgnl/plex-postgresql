@@ -210,16 +210,14 @@ char* sql_translate_keywords(const char *sql) {
     // IN () in SQLite returns 0 rows (empty set), PostgreSQL rejects the syntax
     // Use integer literal -1 instead of NULL to avoid type inference issues
     // (-1 will never match any positive ID, and the WHERE FALSE ensures no rows)
-    temp = str_replace(current, " in ()", " IN (SELECT -1 WHERE FALSE)");
+    // Use case-insensitive replace to handle both "IN" and "in"
+    temp = str_replace_nocase(current, " in ()", " IN (SELECT -1 WHERE FALSE)");
     free(current);
     current = temp;
-    temp = str_replace(current, " IN ()", " IN (SELECT -1 WHERE FALSE)");
+    temp = str_replace_nocase(current, " in (  )", " IN (SELECT -1 WHERE FALSE)");
     free(current);
     current = temp;
-    temp = str_replace(current, " IN (  )", " IN (SELECT -1 WHERE FALSE)");
-    free(current);
-    current = temp;
-    temp = str_replace(current, " IN ( )", " IN (SELECT -1 WHERE FALSE)");
+    temp = str_replace_nocase(current, " in ( )", " IN (SELECT -1 WHERE FALSE)");
     free(current);
     current = temp;
 
