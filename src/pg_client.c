@@ -42,8 +42,9 @@ static pool_slot_t library_pool[POOL_SIZE];
 static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char library_db_path[512] = {0};
 
-// Connection idle timeout (seconds) - close connections idle longer than this
-#define POOL_IDLE_TIMEOUT 60
+// Connection idle timeout (seconds) - release slots idle longer than this
+// Must be long enough for slow queries and Plex processing between step() calls
+#define POOL_IDLE_TIMEOUT 300
 
 // Track mapping from sqlite3* handles to pool slots for cleanup on close
 static struct {
@@ -409,13 +410,14 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
     pthread_mutex_unlock(&pool_mutex);
 
     // =========================================================================
-    // PHASE 0: Cleanup stale READY connections (idle > 30s)
+    // PHASE 0: Cleanup stale READY connections (idle > POOL_IDLE_TIMEOUT)
     // Release slots that haven't been used - the owning thread is likely gone
     // Phase 2 will reset these connections when claimed
+    // CRITICAL: Timeout must be long enough for slow queries and Plex processing
     // =========================================================================
     for (int i = 0; i < POOL_SIZE; i++) {
         pool_slot_state_t state = atomic_load(&library_pool[i].state);
-        if (state == SLOT_READY && (now - library_pool[i].last_used) > 30) {
+        if (state == SLOT_READY && (now - library_pool[i].last_used) > POOL_IDLE_TIMEOUT) {
             // Mark as FREE so Phase 2 can claim and reset it
             pool_slot_state_t expected = SLOT_READY;
             if (atomic_compare_exchange_strong(&library_pool[i].state, &expected, SLOT_FREE)) {
@@ -436,30 +438,14 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
 
             pg_connection_t *conn = library_pool[i].conn;
             if (conn && conn->conn && PQstatus(conn->conn) == CONNECTION_OK) {
-                // Check if socket has pending data (orphaned results from timed-out queries)
-                int sock = PQsocket(conn->conn);
-                if (sock >= 0) {
-                    fd_set read_fds;
-                    struct timeval tv = {0, 0};  // Zero timeout = non-blocking check
-                    FD_ZERO(&read_fds);
-                    FD_SET(sock, &read_fds);
-                    int ready = select(sock + 1, &read_fds, NULL, NULL, &tv);
-                    if (ready > 0) {
-                        // Data waiting = orphaned results, reset connection
-                        LOG_INFO("Pool: slot %d has pending data, resetting", i);
-                        pg_stmt_cache_clear(conn);  // Clear cache before reset
-                        PQreset(conn->conn);
-                        if (PQstatus(conn->conn) == CONNECTION_OK) {
-                            pg_conn_config_t *cfg = pg_config_get();
-                            char schema_cmd[256];
-                            snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
-                            PGresult *res = PQexec(conn->conn, schema_cmd);
-                            PQclear(res);
-                            res = PQexec(conn->conn, "SET statement_timeout = '10s'");
-                            PQclear(res);
-                        }
-                    }
-                }
+                // CRITICAL FIX: Do NOT check for pending data here!
+                // When processing multiple statements, pending data is VALID response
+                // data from queries we're actively executing. Resetting would cause
+                // deadlock: PQexecPrepared waits for response, but we just reset it.
+                //
+                // Orphaned data (from timeouts) will be handled by:
+                // 1. Query errors triggering pg_pool_check_connection_health()
+                // 2. Connection reset when slot is released to another thread (PHASE 2)
                 library_pool[i].last_used = now;
                 return conn;
             }
@@ -609,13 +595,97 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
     // =========================================================================
     // PHASE 5: Pool is full - log and return NULL
     // =========================================================================
-    LOG_DEBUG("Pool: no available slots for thread %p", (void*)current_thread);
+    // Dump slot states for debugging
+    for (int i = 0; i < POOL_SIZE; i++) {
+        pool_slot_state_t state = atomic_load(&library_pool[i].state);
+        LOG_ERROR("Pool slot %d: state=%d conn=%p owner=%p",
+                 i, (int)state, (void*)library_pool[i].conn, (void*)library_pool[i].owner_thread);
+    }
+    LOG_ERROR("Pool: no available slots for thread %p (all %d slots busy)", (void*)current_thread, POOL_SIZE);
     return NULL;
 }
 
 // Public function for getting thread connection (now uses pool)
 pg_connection_t* pg_get_thread_connection(const char *db_path) {
     return pool_get_connection(db_path);
+}
+
+// Update last_used timestamp for a connection to prevent premature pool release
+// CRITICAL: Call this during long-running operations to keep connection alive
+void pg_pool_touch_connection(pg_connection_t *conn) {
+    if (!conn) return;
+
+    pthread_t current_thread = pthread_self();
+    time_t now = time(NULL);
+
+    // Find the slot for this connection (lock-free)
+    for (int i = 0; i < POOL_SIZE; i++) {
+        if (library_pool[i].conn == conn &&
+            pthread_equal(library_pool[i].owner_thread, current_thread)) {
+            library_pool[i].last_used = now;
+            return;
+        }
+    }
+}
+
+// Check connection health after query error, reset if corrupted
+// Call this after any query that returns an unexpected error
+// Returns 1 if connection was reset, 0 if still healthy
+int pg_pool_check_connection_health(pg_connection_t *conn) {
+    if (!conn || !conn->conn) return 0;
+
+    // Check if connection is still valid
+    ConnStatusType status = PQstatus(conn->conn);
+    if (status == CONNECTION_OK) {
+        return 0;  // Connection is healthy
+    }
+
+    // Connection is bad - need to reset
+    LOG_ERROR("Pool: connection health check failed (status=%d), resetting", status);
+
+    pthread_t current_thread = pthread_self();
+
+    // Find our slot and transition to RECONNECTING
+    for (int i = 0; i < POOL_SIZE; i++) {
+        if (library_pool[i].conn == conn &&
+            pthread_equal(library_pool[i].owner_thread, current_thread)) {
+
+            pool_slot_state_t expected = SLOT_READY;
+            if (atomic_compare_exchange_strong(&library_pool[i].state,
+                                               &expected, SLOT_RECONNECTING)) {
+                // Clear prepared statement cache
+                pg_stmt_cache_clear(conn);
+
+                // Reset connection
+                PQreset(conn->conn);
+
+                if (PQstatus(conn->conn) == CONNECTION_OK) {
+                    // Re-apply settings
+                    pg_conn_config_t *cfg = pg_config_get();
+                    char schema_cmd[256];
+                    snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
+                    PGresult *res = PQexec(conn->conn, schema_cmd);
+                    PQclear(res);
+                    res = PQexec(conn->conn, "SET statement_timeout = '10s'");
+                    PQclear(res);
+
+                    LOG_INFO("Pool: connection reset successful for slot %d", i);
+                    library_pool[i].last_used = time(NULL);
+                    atomic_store(&library_pool[i].state, SLOT_READY);
+                    return 1;
+                } else {
+                    // Reset failed - mark as error
+                    LOG_ERROR("Pool: connection reset failed for slot %d", i);
+                    atomic_store(&library_pool[i].state, SLOT_ERROR);
+                    conn->is_pg_active = 0;
+                    return 1;
+                }
+            }
+            break;
+        }
+    }
+
+    return 0;
 }
 
 // Close pool connection for a specific database handle

@@ -313,6 +313,9 @@ static int my_sqlite3_exec(sqlite3 *db, const char *sql,
                 } else {
                     const char *err = (pg_conn && pg_conn->conn) ? PQerrorMessage(pg_conn->conn) : "NULL connection";
                     LOG_ERROR("PostgreSQL exec error: %s", err);
+                    // CRITICAL: Check if connection is corrupted and needs reset
+                    // Note: pg_conn may be a pool connection for library.db
+                    pg_pool_check_connection_health(pg_conn);
                 }
 
                 if (insert_sql) free(insert_sql);
@@ -552,7 +555,7 @@ static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
                         pg_stmt->sql_hash = pg_hash_sql(pg_stmt->pg_sql);
                         snprintf(pg_stmt->stmt_name, sizeof(pg_stmt->stmt_name),
                                  "ps_%llx", (unsigned long long)pg_stmt->sql_hash);
-                        pg_stmt->use_prepared = 1;  // Enable prepared statements
+                        pg_stmt->use_prepared = 1;  // Use prepared statements for better caching
                     }
                 }
                 sql_translation_free(&trans);
@@ -1008,8 +1011,25 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                                 (void*)pthread_self(), (void*)cached_exec_conn);
                     }
 
-                    // Execute cached write - no connection mutex needed (per-thread connection)
+                    // CRITICAL: Touch connection to prevent pool from releasing it during query
+                    pg_pool_touch_connection(cached_exec_conn);
+
+                    // CRITICAL: Lock connection mutex to prevent concurrent libpq access
+                    pthread_mutex_lock(&cached_exec_conn->mutex);
+
+                    // Drain any pending results before executing
+                    PQsetnonblocking(cached_exec_conn->conn, 0);
+                    while (PQisBusy(cached_exec_conn->conn)) {
+                        PQconsumeInput(cached_exec_conn->conn);
+                    }
+                    PGresult *pending;
+                    while ((pending = PQgetResult(cached_exec_conn->conn)) != NULL) {
+                        LOG_ERROR("CACHED EXEC: Drained orphaned result from connection %p", (void*)cached_exec_conn);
+                        PQclear(pending);
+                    }
+
                     PGresult *res = PQexec(cached_exec_conn->conn, exec_sql);
+                    pthread_mutex_unlock(&cached_exec_conn->mutex);
                     ExecStatusType status = PQresultStatus(res);
 
                     if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
@@ -1025,6 +1045,8 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     } else {
                         const char *err = (pg_conn && pg_conn->conn) ? PQerrorMessage(pg_conn->conn) : "NULL connection";
                         log_sql_fallback(sql, exec_sql, err, "CACHED WRITE");
+                        // CRITICAL: Check if connection is corrupted and needs reset
+                        pg_pool_check_connection_health(cached_exec_conn);
                     }
 
                     if (insert_sql) free(insert_sql);
@@ -1084,15 +1106,7 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     // No result yet - execute PostgreSQL query
                     sql_translation_t trans = sql_translate(sql);
                     if (trans.success && trans.sql) {
-                        // Log cached SELECT on play_queue_generators
-                        if (strstr(sql, "play_queue_generators")) {
-                            LOG_INFO("CACHED SELECT play_queue_generators on thread %p conn %p: %s",
-                                    (void*)pthread_self(), (void*)cached_read_conn, trans.sql);
-                        }
-                        // Log cached media queries
-                        if (strstr(trans.sql, "media_parts") || strstr(trans.sql, "media_items")) {
-                            LOG_INFO("CACHED MEDIA QUERY: %s", trans.sql);
-                        }
+                        // Verbose query logging disabled for performance
 
                         pg_stmt_t *new_stmt = cached;
                         if (!new_stmt) {
@@ -1105,20 +1119,34 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                             }
                         }
                         if (new_stmt) {
-                            // Execute cached read - no connection mutex needed (per-thread connection)
+                            // CRITICAL: Touch connection to prevent pool from releasing it during query
+                            pg_pool_touch_connection(cached_read_conn);
+
+                            // CRITICAL: Lock connection mutex to prevent concurrent libpq access
+                            pthread_mutex_lock(&cached_read_conn->mutex);
+
+                            // Drain any pending results before executing
+                            PQsetnonblocking(cached_read_conn->conn, 0);
+                            while (PQisBusy(cached_read_conn->conn)) {
+                                PQconsumeInput(cached_read_conn->conn);
+                            }
+                            PGresult *pending_read;
+                            while ((pending_read = PQgetResult(cached_read_conn->conn)) != NULL) {
+                                LOG_ERROR("CACHED READ: Drained orphaned result from connection %p", (void*)cached_read_conn);
+                                PQclear(pending_read);
+                            }
+
+                            LOG_INFO("PQEXEC CACHED READ: conn=%p sql_len=%zu sql=%.60s",
+                                     (void*)cached_read_conn, strlen(trans.sql), trans.sql);
                             new_stmt->result = PQexec(cached_read_conn->conn, trans.sql);
+                            LOG_INFO("PQEXEC CACHED READ DONE: conn=%p result=%p",
+                                     (void*)cached_read_conn, (void*)new_stmt->result);
+                            pthread_mutex_unlock(&cached_read_conn->mutex);
                             if (PQresultStatus(new_stmt->result) == PGRES_TUPLES_OK) {
                                 new_stmt->num_rows = PQntuples(new_stmt->result);
                                 new_stmt->num_cols = PQnfields(new_stmt->result);
                                 new_stmt->current_row = 0;
-                                // Log result count for play_queue_generators
-                                if (strstr(sql, "play_queue_generators")) {
-                                    LOG_INFO("CACHED SELECT play_queue_generators returned %d rows", new_stmt->num_rows);
-                                }
-                                // Log cached media results
-                                if (strstr(trans.sql, "media_parts") || strstr(trans.sql, "media_items")) {
-                                    LOG_INFO("CACHED MEDIA QUERY returned %d rows", new_stmt->num_rows);
-                                }
+                                // Verbose result logging disabled for performance
                                 sql_translation_free(&trans);
                                 if (expanded_sql) sqlite3_free(expanded_sql);
                                 return (new_stmt->num_rows > 0) ? SQLITE_ROW : SQLITE_DONE;
@@ -1127,6 +1155,8 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                                 log_sql_fallback(sql, trans.sql, err, "CACHED READ");
                                 PQclear(new_stmt->result);
                                 new_stmt->result = NULL;
+                                // CRITICAL: Check if connection is corrupted and needs reset
+                                pg_pool_check_connection_health(cached_read_conn);
                             }
                         }
                     }
@@ -1149,6 +1179,11 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
         pg_connection_t *thread_conn = pg_get_thread_connection(pg_stmt->conn->db_path);
         if (thread_conn && thread_conn->is_pg_active && thread_conn->conn) {
             exec_conn = thread_conn;
+        } else if (thread_conn) {
+            LOG_ERROR("STEP: thread_conn not usable (is_pg_active=%d, conn=%p)",
+                     thread_conn->is_pg_active, (void*)thread_conn->conn);
+        } else {
+            LOG_ERROR("STEP: pg_get_thread_connection returned NULL");
         }
     }
 
@@ -1164,48 +1199,97 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
         }
 
         if (pg_stmt->is_pg == 2) {  // READ
-            if (!pg_stmt->result) {
-                // Log SELECT on play_queue_generators for debugging
-                if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "play_queue_generators")) {
-                    LOG_INFO("SELECT play_queue_generators on thread %p conn %p: %s",
-                            (void*)pthread_self(), (void*)exec_conn, pg_stmt->pg_sql);
-                }
-                // Log media_parts queries with parameters
-                if (pg_stmt->pg_sql && (strstr(pg_stmt->pg_sql, "media_parts") || strstr(pg_stmt->pg_sql, "media_items"))) {
-                    LOG_INFO("MEDIA QUERY (params=%d): %s", pg_stmt->param_count, pg_stmt->pg_sql);
-                    for (int i = 0; i < pg_stmt->param_count && i < 5; i++) {
-                        LOG_INFO("  PARAM[%d] = %s", i+1, paramValues[i] ? paramValues[i] : "NULL");
-                    }
-                    // Debug: check search_path
-                    if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "directories")) {
-                        PGresult *sp = PQexec(exec_conn->conn, "SHOW search_path");
-                        if (PQresultStatus(sp) == PGRES_TUPLES_OK && PQntuples(sp) > 0) {
-                            LOG_INFO("  search_path = %s", PQgetvalue(sp, 0, 0));
-                        }
-                        PQclear(sp);
-                    }
-                }
+            // CRITICAL FIX: Prevent re-execution after SQLITE_DONE was returned
+            // Without this, Plex calling step() after DONE would re-execute the query
+            if (pg_stmt->read_done) {
+                pthread_mutex_unlock(&pg_stmt->mutex);
+                return SQLITE_DONE;
+            }
 
-                // Log translated query for debugging
-                if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "distinct")) {
-                    LOG_INFO("[DISTINCT QUERY] %.200s...", pg_stmt->pg_sql);
-                }
+            // Only log when result is NULL (new query) to reduce log spam
+            if (!pg_stmt->result) {
+                LOG_DEBUG("STEP READ: thread=%p stmt=%p exec_conn=%p",
+                         (void*)pthread_self(), (void*)pg_stmt, (void*)exec_conn);
+            }
+
+            // CRITICAL FIX: Check if result belongs to a different connection
+            // If statement is being used by a different thread/connection, we must
+            // re-execute the query on THIS thread's connection to avoid protocol desync
+            if (pg_stmt->result && pg_stmt->result_conn != exec_conn) {
+                LOG_ERROR("STEP: Result from different connection! Clearing result (result_conn=%p exec_conn=%p)",
+                         (void*)pg_stmt->result_conn, (void*)exec_conn);
+                PQclear(pg_stmt->result);
+                pg_stmt->result = NULL;
+                pg_stmt->result_conn = NULL;
+                pg_stmt->current_row = 0;
+            }
+
+            if (!pg_stmt->result) {
+                // Track which thread is executing this statement
+                pthread_t current = pthread_self();
+                pg_stmt->executing_thread = current;
 
                 // Validate connection before use to prevent crash
                 if (!exec_conn || !exec_conn->conn || PQstatus(exec_conn->conn) != CONNECTION_OK) {
-                    LOG_ERROR("STEP SELECT: Invalid connection");
+                    LOG_ERROR("STEP SELECT: Invalid connection (exec_conn=%p, conn=%p, status=%d)",
+                             (void*)exec_conn,
+                             exec_conn ? (void*)exec_conn->conn : NULL,
+                             exec_conn && exec_conn->conn ? (int)PQstatus(exec_conn->conn) : -1);
                     pthread_mutex_unlock(&pg_stmt->mutex);
                     return SQLITE_ERROR;
                 }
 
-                // Execute query - no connection mutex needed (per-thread connection)
+                // CRITICAL: Touch connection to prevent pool from releasing it during long queries
+                pg_pool_touch_connection(exec_conn);
+
+                // CRITICAL: Lock connection mutex for ENTIRE query lifecycle
+                // This prevents protocol desync - PQprepare and PQexecPrepared must be atomic
+                pthread_mutex_lock(&exec_conn->mutex);
+
+                // CRITICAL: Check connection status before query
+                // If connection is in a bad state, reset it
+                ConnStatusType conn_status = PQstatus(exec_conn->conn);
+                if (conn_status != CONNECTION_OK) {
+                    LOG_ERROR("STEP READ: Connection bad (status=%d), resetting...", (int)conn_status);
+                    PQreset(exec_conn->conn);
+                    if (PQstatus(exec_conn->conn) != CONNECTION_OK) {
+                        LOG_ERROR("STEP READ: Reset failed, connection lost");
+                        pthread_mutex_unlock(&exec_conn->mutex);
+                        pthread_mutex_unlock(&pg_stmt->mutex);
+                        return SQLITE_ERROR;
+                    }
+                    // Re-apply settings after reset
+                    pg_conn_config_t *cfg = pg_config_get();
+                    if (cfg) {
+                        char schema_cmd[256];
+                        snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
+                        PGresult *r = PQexec(exec_conn->conn, schema_cmd);
+                        PQclear(r);
+                        r = PQexec(exec_conn->conn, "SET statement_timeout = '10s'");
+                        PQclear(r);
+                    }
+                }
+
+                // Ensure connection is in blocking mode and consume any pending data
+                PQsetnonblocking(exec_conn->conn, 0);  // Force blocking mode
+                while (PQisBusy(exec_conn->conn)) {
+                    PQconsumeInput(exec_conn->conn);
+                }
+                PGresult *pending;
+                while ((pending = PQgetResult(exec_conn->conn)) != NULL) {
+                    LOG_ERROR("STEP: Drained orphaned result from connection %p", (void*)exec_conn);
+                    PQclear(pending);
+                }
+
                 // Use prepared statements for better performance (skip parse/plan overhead)
                 if (pg_stmt->use_prepared && pg_stmt->stmt_name[0]) {
+                    LOG_INFO("PREPARED PATH: use_prepared=%d stmt_name=%s sql=%.60s",
+                             pg_stmt->use_prepared, pg_stmt->stmt_name, pg_stmt->pg_sql);
                     const char *cached_name = NULL;
                     int is_cached = pg_stmt_cache_lookup(exec_conn, pg_stmt->sql_hash, &cached_name);
 
                     if (!is_cached) {
-                        // Prepare statement on this connection
+                        // Prepare statement on this connection (mutex already held)
                         PGresult *prep_res = PQprepare(exec_conn->conn, pg_stmt->stmt_name,
                                                         pg_stmt->pg_sql, pg_stmt->param_count, NULL);
                         if (PQresultStatus(prep_res) == PGRES_COMMAND_OK) {
@@ -1233,9 +1317,15 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     }
                 } else {
                     // No prepared statement support for this query
+                    LOG_INFO("EXEC_PARAMS READ: conn=%p params=%d sql=%.60s",
+                             (void*)exec_conn, pg_stmt->param_count, pg_stmt->pg_sql);
                     pg_stmt->result = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
                         pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
+                    LOG_INFO("EXEC_PARAMS READ DONE: conn=%p result=%p",
+                             (void*)exec_conn, (void*)pg_stmt->result);
                 }
+
+                pthread_mutex_unlock(&exec_conn->mutex);
 
                 // Check for query errors
                 ExecStatusType status = PQresultStatus(pg_stmt->result);
@@ -1249,19 +1339,18 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     pg_stmt->num_rows = PQntuples(pg_stmt->result);
                     pg_stmt->num_cols = PQnfields(pg_stmt->result);
                     pg_stmt->current_row = 0;
+                    pg_stmt->result_conn = exec_conn;  // Track which connection owns this result
 
-                    // Log result count for play_queue_generators
-                    if (pg_stmt->pg_sql && strstr(pg_stmt->pg_sql, "play_queue_generators")) {
-                        LOG_INFO("SELECT play_queue_generators returned %d rows", PQntuples(pg_stmt->result));
-                    }
                     // Verbose query logging disabled for performance
-                    // Enable DEBUG level logging to see query details
                 } else {
                     const char *err = (exec_conn && exec_conn->conn) ? PQerrorMessage(exec_conn->conn) : "NULL connection";
                     log_sql_fallback(pg_stmt->sql, pg_stmt->pg_sql,
                                      err, "PREPARED READ");
                     PQclear(pg_stmt->result);
                     pg_stmt->result = NULL;
+                    pg_stmt->result_conn = NULL;
+                    // CRITICAL: Check if connection is corrupted and needs reset
+                    pg_pool_check_connection_health(exec_conn);
                 }
             } else {
                 pg_stmt->current_row++;
@@ -1273,6 +1362,8 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     // Prevents memory accumulation when Plex doesn't call reset()
                     PQclear(pg_stmt->result);
                     pg_stmt->result = NULL;
+                    pg_stmt->result_conn = NULL;
+                    pg_stmt->read_done = 1;  // Prevent re-execution on next step() call
                     pthread_mutex_unlock(&pg_stmt->mutex);
                     return SQLITE_DONE;
                 }
@@ -1343,7 +1434,24 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 return SQLITE_ERROR;
             }
 
-            // Execute write - no connection mutex needed (per-thread connection)
+            // CRITICAL: Touch connection to prevent pool from releasing it during query
+            pg_pool_touch_connection(exec_conn);
+
+            // CRITICAL: Lock connection mutex to ensure atomic query execution
+            pthread_mutex_lock(&exec_conn->mutex);
+
+            // CRITICAL: Ensure connection is in blocking mode and consume any pending data
+            PQsetnonblocking(exec_conn->conn, 0);
+            while (PQisBusy(exec_conn->conn)) {
+                PQconsumeInput(exec_conn->conn);
+            }
+            PGresult *pending;
+            while ((pending = PQgetResult(exec_conn->conn)) != NULL) {
+                LOG_ERROR("STEP WRITE: Drained orphaned result from connection %p", (void*)exec_conn);
+                PQclear(pending);
+            }
+
+            // Execute write
             PGresult *res = NULL;
 
             // Use prepared statements for better performance (skip parse/plan overhead)
@@ -1381,6 +1489,8 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     pg_stmt->param_count, NULL, paramValues, NULL, NULL, 0);
             }
 
+            pthread_mutex_unlock(&exec_conn->mutex);
+
             ExecStatusType status = PQresultStatus(res);
             if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
                 exec_conn->last_changes = atoi(PQcmdTuples(res) ?: "1");
@@ -1400,6 +1510,8 @@ static int my_sqlite3_step(sqlite3_stmt *pStmt) {
             } else {
                 const char *err = (exec_conn && exec_conn->conn) ? PQerrorMessage(exec_conn->conn) : "NULL connection";
                 LOG_ERROR("STEP PG write error: %s", err);
+                // CRITICAL: Check if connection is corrupted and needs reset
+                pg_pool_check_connection_health(exec_conn);
             }
 
             // Mark as executed to prevent re-execution on subsequent step() calls

@@ -24,6 +24,98 @@ static volatile int logging_initialized = 0;
 static pthread_once_t logging_init_once = PTHREAD_ONCE_INIT;
 
 // ============================================================================
+// Throttling State (prevents disk space exhaustion from query explosions)
+// ============================================================================
+
+#define THROTTLE_WINDOW_SEC 1           // Time window for counting
+#define THROTTLE_THRESHOLD 1000         // Queries per window before throttling
+#define THROTTLE_SAMPLE_RATE 1000       // Log 1 in N queries when throttled
+#define THROTTLE_SUMMARY_INTERVAL 10    // Log summary every N seconds when throttled
+
+static atomic_long query_count = 0;           // Queries in current window
+static atomic_long query_count_total = 0;     // Total queries since throttle started
+static atomic_long suppressed_count = 0;      // Suppressed log entries
+static time_t window_start = 0;               // Start of current counting window
+static time_t last_summary = 0;               // Last time we logged a summary
+static atomic_int throttle_active = 0;        // 1 = currently throttling
+
+// ============================================================================
+// Throttle Check (returns 1 if message should be logged, 0 if suppressed)
+// ============================================================================
+
+static int should_log_message(void) {
+    time_t now = time(NULL);
+
+    // Reset window if expired
+    if (now != window_start) {
+        long prev_count = atomic_exchange(&query_count, 1);
+        window_start = now;
+
+        // Check if we should exit throttle mode (low query rate)
+        if (prev_count < THROTTLE_THRESHOLD / 10 && atomic_load(&throttle_active)) {
+            atomic_store(&throttle_active, 0);
+            long total = atomic_exchange(&query_count_total, 0);
+            long suppressed = atomic_exchange(&suppressed_count, 0);
+            // Log exit from throttle mode (will be logged since throttle is now off)
+            if (log_file) {
+                pthread_mutex_lock(&log_mutex);
+                fprintf(log_file, "[%04d-%02d-%02d %02d:%02d:%02d] [INFO] THROTTLE OFF: %ld queries, %ld suppressed\n",
+                        (int)(1900 + (now / 31536000) % 200), (int)((now / 2592000) % 12 + 1), (int)((now / 86400) % 31 + 1),
+                        (int)((now % 86400) / 3600), (int)((now % 3600) / 60), (int)(now % 60),
+                        total, suppressed);
+                fflush(log_file);
+                pthread_mutex_unlock(&log_mutex);
+            }
+        }
+        return 1; // Always log first message in new window
+    }
+
+    long count = atomic_fetch_add(&query_count, 1) + 1;
+
+    // Enter throttle mode if threshold exceeded
+    if (count >= THROTTLE_THRESHOLD && !atomic_load(&throttle_active)) {
+        atomic_store(&throttle_active, 1);
+        atomic_store(&query_count_total, count);
+        last_summary = now;
+        if (log_file) {
+            pthread_mutex_lock(&log_mutex);
+            fprintf(log_file, "[THROTTLE] Query explosion detected: %ld queries/sec, sampling 1:%d\n",
+                    count, THROTTLE_SAMPLE_RATE);
+            fflush(log_file);
+            pthread_mutex_unlock(&log_mutex);
+        }
+    }
+
+    // If throttling, sample and log summaries
+    if (atomic_load(&throttle_active)) {
+        atomic_fetch_add(&query_count_total, 1);
+
+        // Log periodic summary
+        if (now - last_summary >= THROTTLE_SUMMARY_INTERVAL) {
+            last_summary = now;
+            long total = atomic_load(&query_count_total);
+            long suppressed = atomic_load(&suppressed_count);
+            if (log_file) {
+                pthread_mutex_lock(&log_mutex);
+                fprintf(log_file, "[THROTTLE] Status: %ld queries total, %ld suppressed, rate ~%ld/sec\n",
+                        total, suppressed, count);
+                fflush(log_file);
+                pthread_mutex_unlock(&log_mutex);
+            }
+            return 1;
+        }
+
+        // Sample: only log every Nth message
+        if (count % THROTTLE_SAMPLE_RATE != 0) {
+            atomic_fetch_add(&suppressed_count, 1);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+// ============================================================================
 // Initialization
 // ============================================================================
 
@@ -89,6 +181,9 @@ void pg_log_message_internal(int level, const char *fmt, ...) {
     if (!logging_initialized) pg_logging_init();
     if (level > current_log_level) return;
     if (!log_file) return;
+
+    // Throttle check (skip if query explosion detected)
+    if (!should_log_message()) return;
 
     // Format message BEFORE taking mutex to minimize contention
     char buffer[4096];

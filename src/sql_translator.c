@@ -136,22 +136,14 @@ char* sql_translate_functions(const char *sql) {
     // Fix for metadata_item_views query with max(viewed_at) - must run AFTER GROUP BY fix
     // This handles the case where ORDER BY uses a column that appears in an aggregate
     if (strcasestr(current, "max(viewed_at") && strcasestr(current, "order by viewed_at")) {
-        LOG_ERROR("ATTEMPTING FIX: Found max(viewed_at with order by viewed_at");
-        LOG_ERROR("SQL BEFORE FIX: %.500s", current);
-
         // Replace "order by viewed_at" with "order by max(viewed_at)"
         temp = str_replace_nocase(current, "order by viewed_at desc", "order by max(viewed_at) desc");
         if (!temp) {
-            LOG_ERROR("First replacement failed, trying without DESC");
             temp = str_replace_nocase(current, "order by viewed_at", "order by max(viewed_at)");
         }
         if (temp) {
-            LOG_ERROR("REPLACEMENT SUCCEEDED");
-            LOG_ERROR("SQL AFTER FIX: %.500s", temp);
             free(current);
             current = temp;
-        } else {
-            LOG_ERROR("REPLACEMENT FAILED - both attempts returned NULL");
         }
     }
 

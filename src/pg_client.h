@@ -26,6 +26,15 @@ pg_connection_t* pg_find_any_library_connection(void);
 // Thread-local connection (one PG connection per thread for library.db)
 pg_connection_t* pg_get_thread_connection(const char *db_path);
 
+// Update last_used timestamp to prevent pool slot from being released
+// CRITICAL: Call during long-running operations to keep connection alive
+void pg_pool_touch_connection(pg_connection_t *conn);
+
+// Check connection health after query error, reset if corrupted
+// Call this after any query that returns an unexpected error
+// Returns 1 if connection was reset, 0 if still healthy
+int pg_pool_check_connection_health(pg_connection_t *conn);
+
 // Close pool connection for a database handle (called on sqlite3_close)
 void pg_close_pool_for_db(sqlite3 *db);
 

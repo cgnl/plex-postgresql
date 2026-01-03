@@ -134,6 +134,9 @@ typedef struct pg_stmt {
     int is_cached;                   // 1 if from TLS (cached stmt)
     int needs_requery;               // 1 if reset() was called
     int write_executed;              // 1 if write has been executed (prevents duplicate execution)
+    int read_done;                   // 1 if read has returned SQLITE_DONE (prevents re-execution)
+    pthread_t executing_thread;      // Thread currently executing this statement (for debug)
+    pg_connection_t *result_conn;    // Connection that the current result belongs to
 
     char *param_values[MAX_PARAMS];
     int param_lengths[MAX_PARAMS];

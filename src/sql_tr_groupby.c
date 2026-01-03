@@ -116,6 +116,17 @@ static const char* extract_column_name(const char *p, char *buf, size_t bufsize)
                 buf[idx++] = '"';
                 p++;
             }
+        } else if (*p == '\'') {
+            // Single-quoted identifier (SQLite allows this for column names like 'index')
+            buf[idx++] = '"'; // Convert to PostgreSQL style
+            p++;
+            while (*p && *p != '\'' && idx < bufsize - 1) {
+                buf[idx++] = *p++;
+            }
+            if (*p == '\'') {
+                buf[idx++] = '"';
+                p++;
+            }
         } else {
             break;
         }
@@ -479,8 +490,8 @@ char* fix_group_by_strict_complete(const char *sql) {
     // Parse existing GROUP BY columns
     int groupby_count = parse_group_by_columns(group_by_pos, group_by_end, groupby_cols, MAX_COLUMNS);
 
-    // Debug: log column counts
-    LOG_INFO("GROUP_BY_REWRITER: select_count=%d, groupby_count=%d, from_pos offset=%ld",
+    // Debug: log column counts (use LOG_DEBUG for less noise)
+    LOG_DEBUG("GROUP_BY_REWRITER: select_count=%d, groupby_count=%d, from_pos offset=%ld",
               select_count, groupby_count, (long)(from_pos - select_pos));
 
     // Find columns missing from GROUP BY
@@ -562,7 +573,7 @@ char* fix_group_by_strict_complete(const char *sql) {
     size_t suffix_actual_len = strlen(group_by_end);
     memcpy(p, group_by_end, suffix_actual_len + 1);  // +1 for null terminator
 
-    LOG_INFO("GROUP_BY_REWRITER: Added %d missing columns to GROUP BY", missing_count);
+    LOG_DEBUG("GROUP_BY_REWRITER: Added %d missing columns to GROUP BY", missing_count);
 
     free(select_cols);
     free(groupby_cols);

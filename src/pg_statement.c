@@ -355,6 +355,7 @@ pg_stmt_t* pg_stmt_create(pg_connection_t *conn, const char *sql, sqlite3_stmt *
     stmt->sql = sql ? strdup(sql) : NULL;
     stmt->current_row = -1;
     stmt->write_executed = 0;  // Initialize write execution guard
+    stmt->read_done = 0;       // Initialize read completion guard
 
     return stmt;
 }
@@ -438,6 +439,7 @@ void pg_stmt_clear_result(pg_stmt_t *stmt) {
     stmt->num_rows = 0;
     stmt->num_cols = 0;
     stmt->write_executed = 0;  // Reset write execution guard
+    stmt->read_done = 0;       // Reset read completion guard
 
     // Clear decoded blob cache
     for (int i = 0; i < MAX_PARAMS; i++) {
