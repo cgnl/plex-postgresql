@@ -54,10 +54,11 @@ macos: src/db_interpose_pg.c $(OBJECTS)
 		-I/opt/homebrew/opt/postgresql@15/include -Iinclude -Isrc \
 		-L/opt/homebrew/opt/postgresql@15/lib -lpq
 
-# Explicit Linux build
-linux: src/db_interpose_pg_linux.c src/sql_translator.c include/sql_translator.h $(OBJECTS)
-	gcc -shared -fPIC -o db_interpose_pg.so src/db_interpose_pg_linux.c src/fishhook.c $(OBJECTS) \
-		-Iinclude -Isrc -lsqlite3 -ldl -lpthread
+# Explicit Linux build (uses refactored version with shared modules)
+linux: src/db_interpose_pg_linux.c $(OBJECTS)
+	gcc -shared -fPIC -o db_interpose_pg.so src/db_interpose_pg_linux.c $(OBJECTS) \
+		-I/usr/include/postgresql -Iinclude -Isrc \
+		-lpq -lsqlite3 -ldl -lpthread
 
 # Object rules
 # SQL Translator module compilation rules

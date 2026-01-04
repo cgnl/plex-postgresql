@@ -36,13 +36,16 @@ wait_for_postgres() {
 init_schema() {
     local schema="${PLEX_PG_SCHEMA:-plex}"
 
+    # Create schema if it doesn't exist
+    psql -c "CREATE SCHEMA IF NOT EXISTS $schema;" 2>/dev/null || true
+
     # Check table count
     local table_count=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ')
 
     if [ "$table_count" -gt "0" ] 2>/dev/null; then
-        echo "PostgreSQL schema ready with $table_count tables"
+        echo "PostgreSQL schema '$schema' ready with $table_count tables"
     else
-        echo "PostgreSQL schema not initialized (PostgreSQL will init from mounted schema)"
+        echo "PostgreSQL schema '$schema' created (empty, Plex will create tables)"
     fi
 }
 

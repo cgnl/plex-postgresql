@@ -7,7 +7,7 @@ A shim library that intercepts Plex's SQLite calls and redirects them to Postgre
 | Platform | Status |
 |----------|--------|
 | macOS | ✅ Working |
-| Linux | 🚧 WIP |
+| Linux | ⚠️ Untested |
 
 ## Quick Start (macOS)
 
@@ -50,6 +50,59 @@ pkill -x "Plex Media Server" 2>/dev/null
 ./scripts/uninstall_wrappers.sh
 ```
 
+## Quick Start (Linux) - Untested
+
+### 1. Setup PostgreSQL
+
+```bash
+sudo apt install postgresql-15
+sudo -u postgres createuser plex
+sudo -u postgres createdb -O plex plex
+sudo -u postgres psql -c "ALTER USER plex PASSWORD 'plex';"
+psql -U plex -d plex -c "CREATE SCHEMA plex;"
+```
+
+### 2. Build & Install
+
+```bash
+# Install dependencies
+sudo apt install build-essential libsqlite3-dev libpq-dev
+
+git clone https://github.com/cgnl/plex-postgresql.git
+cd plex-postgresql
+make linux
+sudo make install
+
+# Stop Plex, install wrappers
+sudo systemctl stop plexmediaserver
+sudo ./scripts/install_wrappers_linux.sh
+```
+
+### 3. Configure & Start
+
+```bash
+# Add to /etc/default/plexmediaserver:
+# PLEX_PG_HOST=localhost
+# PLEX_PG_DATABASE=plex
+# PLEX_PG_USER=plex
+# PLEX_PG_PASSWORD=plex
+
+sudo systemctl start plexmediaserver
+```
+
+### Uninstall
+
+```bash
+sudo systemctl stop plexmediaserver
+sudo ./scripts/uninstall_wrappers_linux.sh
+```
+
+### Docker
+
+```bash
+docker-compose up -d
+```
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -65,7 +118,8 @@ pkill -x "Plex Media Server" 2>/dev/null
 ## How It Works
 
 ```
-Plex → SQLite API → DYLD_INTERPOSE shim → SQL Translator → PostgreSQL
+macOS: Plex → SQLite API → DYLD_INTERPOSE shim → SQL Translator → PostgreSQL
+Linux: Plex → SQLite API → LD_PRELOAD shim    → SQL Translator → PostgreSQL
 ```
 
 The shim intercepts all `sqlite3_*` calls, translates SQL syntax (placeholders, functions, types), and executes on PostgreSQL via libpq.

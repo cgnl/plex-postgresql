@@ -8,9 +8,11 @@ services:
       POSTGRES_DB: plex
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Do NOT pre-create schema - let Plex create it dynamically
-      # The shim forwards all DDL to both SQLite and PostgreSQL
-      # - ./schema:/docker-entrypoint-initdb.d:ro
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c work_mem=16MB
+      -c maintenance_work_mem=128MB
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U plex"]
       interval: 5s
@@ -36,6 +38,9 @@ services:
       - PLEX_PG_USER=plex
       - PLEX_PG_PASSWORD=plex
       - PLEX_PG_SCHEMA=plex
+      - PLEX_PG_POOL_SIZE=50
+      # Logging: 0=ERROR, 1=INFO, 2=DEBUG
+      - PLEX_PG_LOG_LEVEL=1
     volumes:
       - plex_config:/config
       # Uncomment and edit to mount your media
