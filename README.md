@@ -107,29 +107,35 @@ cd plex-postgresql
 make clean && make
 ```
 
-### 4. Configure Environment
+### 4. Install Wrappers
+
+This installs wrapper scripts that auto-inject the PostgreSQL shim whenever Plex starts:
 
 ```bash
-export PLEX_PG_HOST=localhost
-export PLEX_PG_PORT=5432
-export PLEX_PG_DATABASE=plex
-export PLEX_PG_USER=plex
-export PLEX_PG_PASSWORD=plex
-export PLEX_PG_SCHEMA=plex
+# Stop Plex first
+pkill -x "Plex Media Server" 2>/dev/null
+
+# Install wrappers (backs up original binaries to .original)
+./scripts/install_wrappers.sh
 ```
 
-### 5. Start Plex with PostgreSQL
+The wrappers configure these environment variables with defaults:
+- `PLEX_PG_HOST=localhost`
+- `PLEX_PG_PORT=5432`
+- `PLEX_PG_DATABASE=plex`
+- `PLEX_PG_USER=plex`
+- `PLEX_PG_PASSWORD=plex`
+- `PLEX_PG_SCHEMA=plex`
+
+### 5. Start Plex
+
+Simply start Plex normally - the shim is auto-injected by the wrapper:
 
 ```bash
-make run
+open "/Applications/Plex Media Server.app"
 ```
 
-Or manually:
-
-```bash
-DYLD_INSERT_LIBRARIES="$(pwd)/db_interpose_pg.dylib" \
-"/Applications/Plex Media Server.app/Contents/MacOS/Plex Media Server"
-```
+Or via launchd, watchdog, etc. No special environment setup needed.
 
 ### 6. Monitor & Verify
 
@@ -139,6 +145,15 @@ tail -f /tmp/plex_redirect_pg.log
 
 # Analyze fallbacks
 ./scripts/analyze_fallbacks.sh
+```
+
+### Uninstall
+
+To restore original Plex binaries and stop using PostgreSQL:
+
+```bash
+pkill -x "Plex Media Server.original" 2>/dev/null
+./scripts/uninstall_wrappers.sh
 ```
 
 ## How It Works
