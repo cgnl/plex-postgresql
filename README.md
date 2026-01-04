@@ -1,5 +1,8 @@
 # plex-postgresql
 
+[![en](https://img.shields.io/badge/lang-en-red.svg)](README.md)
+[![es](https://img.shields.io/badge/lang-es-yellow.svg)](README.es.md)
+
 **Run Plex Media Server with PostgreSQL instead of SQLite.**
 
 A shim library that intercepts Plex's SQLite calls and redirects them to PostgreSQL. Zero Plex modifications required.
