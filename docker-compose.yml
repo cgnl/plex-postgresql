@@ -46,8 +46,8 @@ services:
       # Uncomment and edit to mount your media
       # - /path/to/media:/media:ro
     ports:
-      - "32401:32400"
-      - "32401:32400/udp"
+      - "8080:32400"
+      - "8080:32400/udp"
       - "32470:32469"
       - "32470:32469/udp"
       # Skip 1900/udp - conflicts with local Plex

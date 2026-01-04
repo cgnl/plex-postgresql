@@ -58,44 +58,44 @@ init_schema() {
     fi
 }
 
-# Pre-initialize SQLite database with correct schema
+# Pre-initialize a single SQLite database
+init_single_sqlite_db() {
+    local db_file="$1"
+    local schema_file="$2"
+    local db_name
+    db_name=$(basename "$db_file")
+
+    if [ ! -f "$db_file" ]; then
+        echo "Pre-initializing SQLite database $db_name..."
+        if [ -f "$schema_file" ]; then
+            # Ignore errors from virtual tables (spellfix1, fts4, rtree)
+            sqlite3 "$db_file" < "$schema_file" 2>&1 || true
+            sqlite3 "$db_file" "INSERT OR IGNORE INTO schema_migrations (version) VALUES ('pg_adapter_1.0.0');" 2>/dev/null || true
+            echo "SQLite database $db_name initialized"
+        else
+            echo "WARNING: Schema file not found: $schema_file"
+        fi
+        chown abc:abc "$db_file" 2>/dev/null || true
+    else
+        # Database exists, ensure it has the min_version column
+        if ! sqlite3 "$db_file" "SELECT min_version FROM schema_migrations LIMIT 1" >/dev/null 2>&1; then
+            echo "Adding min_version column to $db_name..."
+            sqlite3 "$db_file" "ALTER TABLE schema_migrations ADD COLUMN min_version TEXT;" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Pre-initialize SQLite databases with correct schema
 # This is needed because SOCI validates the SQLite schema before our shim can intercept
 init_sqlite_schema() {
     local db_dir="/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
     local schema_file="/usr/local/lib/plex-postgresql/sqlite_schema.sql"
 
-    # Both main library and blobs databases need proper schema
-    local db_files=(
-        "$db_dir/com.plexapp.plugins.library.db"
-        "$db_dir/com.plexapp.plugins.library.blobs.db"
-    )
-
     mkdir -p "$db_dir"
 
-    for db_file in "${db_files[@]}"; do
-        local db_name=$(basename "$db_file")
-
-        if [ ! -f "$db_file" ]; then
-            echo "Pre-initializing SQLite database $db_name with correct schema..."
-            if [ -f "$schema_file" ]; then
-                # Ignore errors from virtual tables (spellfix1, fts4, rtree) which require special modules
-                sqlite3 "$db_file" < "$schema_file" 2>&1 || true
-                # Add pg_adapter marker
-                sqlite3 "$db_file" "INSERT OR IGNORE INTO schema_migrations (version) VALUES ('pg_adapter_1.0.0');" 2>/dev/null || true
-                echo "SQLite database $db_name pre-initialized from schema file"
-            else
-                echo "WARNING: SQLite schema file not found: $schema_file"
-            fi
-            chown abc:abc "$db_file" 2>/dev/null || true
-        else
-            # Database exists, ensure it has the min_version column
-            if ! sqlite3 "$db_file" "SELECT min_version FROM schema_migrations LIMIT 1" >/dev/null 2>&1; then
-                echo "Adding min_version column to existing SQLite schema_migrations in $db_name..."
-                sqlite3 "$db_file" "ALTER TABLE schema_migrations ADD COLUMN min_version TEXT;" 2>/dev/null || true
-                echo "Column added to $db_name"
-            fi
-        fi
-    done
+    # Initialize both databases explicitly
+    init_single_sqlite_db "$db_dir/com.plexapp.plugins.library.db" "$schema_file"
+    init_single_sqlite_db "$db_dir/com.plexapp.plugins.library.blobs.db" "$schema_file"
 }
 
 # Modify s6 run script to inject LD_PRELOAD
