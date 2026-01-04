@@ -13,6 +13,10 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+
+// Socket timeout for PostgreSQL connections (prevents infinite poll() waits)
+#define PG_SOCKET_TIMEOUT_SEC 60
 
 // ============================================================================
 // Connection Pool Configuration
@@ -64,6 +68,30 @@ static pthread_mutex_t global_rowid_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Forward declarations
 static int is_library_db(const char *path);
 static pg_connection_t* pool_get_connection(const char *db_path);
+
+// Helper: Set socket timeouts on PostgreSQL connection to prevent infinite waits
+static void pg_set_socket_timeout(PGconn *pg_conn) {
+    if (!pg_conn) return;
+
+    int sock = PQsocket(pg_conn);
+    if (sock < 0) {
+        LOG_ERROR("pg_set_socket_timeout: invalid socket");
+        return;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = PG_SOCKET_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        LOG_ERROR("pg_set_socket_timeout: failed to set SO_RCVTIMEO");
+    }
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        LOG_ERROR("pg_set_socket_timeout: failed to set SO_SNDTIMEO");
+    }
+
+    LOG_DEBUG("Socket timeout set to %d seconds for socket %d", PG_SOCKET_TIMEOUT_SEC, sock);
+}
 
 // ============================================================================
 // Initialization
@@ -314,6 +342,9 @@ static pg_connection_t* create_pool_connection(const char *db_path) {
         }
         conn->conn = NULL;
     } else {
+        // Set socket timeout to prevent infinite poll() waits on dead connections
+        pg_set_socket_timeout(conn->conn);
+
         char schema_cmd[256];
         snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
         PGresult *res = PQexec(conn->conn, schema_cmd);
@@ -324,8 +355,7 @@ static pg_connection_t* create_pool_connection(const char *db_path) {
         if (res) PQclear(res);
 
         // Set statement_timeout to prevent infinite hangs on PostgreSQL lock contention
-        // 10 seconds is long enough for complex queries but fails fast under heavy load
-        res = PQexec(conn->conn, "SET statement_timeout = '10s'");
+        res = PQexec(conn->conn, "SET statement_timeout = '60s'");
         if (PQresultStatus(res) != PGRES_COMMAND_OK) {
             LOG_ERROR("Failed to set statement_timeout: %s", PQresultErrorMessage(res));
         }
@@ -367,13 +397,16 @@ static pg_connection_t* do_slot_reconnect(int slot_idx) {
     PGconn *new_pg_conn = PQconnectdb(conninfo);
 
     if (PQstatus(new_pg_conn) == CONNECTION_OK) {
+        // Set socket timeout to prevent infinite poll() waits
+        pg_set_socket_timeout(new_pg_conn);
+
         char schema_cmd[256];
         snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
         PGresult *res = PQexec(new_pg_conn, schema_cmd);
         PQclear(res);
 
         // Set statement_timeout to prevent infinite hangs
-        res = PQexec(new_pg_conn, "SET statement_timeout = '10s'");
+        res = PQexec(new_pg_conn, "SET statement_timeout = '60s'");
         PQclear(res);
 
         conn->conn = new_pg_conn;
@@ -779,6 +812,9 @@ pg_connection_t* pg_connect(const char *db_path, sqlite3 *shadow_db) {
     } else {
         LOG_INFO("PostgreSQL connected for: %s", db_path);
 
+        // Set socket timeout to prevent infinite poll() waits
+        pg_set_socket_timeout(conn->conn);
+
         char schema_cmd[256];
         snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
         PGresult *res = PQexec(conn->conn, schema_cmd);
@@ -789,7 +825,7 @@ pg_connection_t* pg_connect(const char *db_path, sqlite3 *shadow_db) {
         if (res) PQclear(res);
 
         // Set statement_timeout to prevent infinite hangs
-        res = PQexec(conn->conn, "SET statement_timeout = '10s'");
+        res = PQexec(conn->conn, "SET statement_timeout = '60s'");
         if (PQresultStatus(res) != PGRES_COMMAND_OK) {
             LOG_ERROR("Failed to set statement_timeout: %s", PQresultErrorMessage(res));
         }
@@ -847,6 +883,9 @@ int pg_ensure_connection(pg_connection_t *conn) {
 
     LOG_INFO("PostgreSQL reconnected successfully");
 
+    // Set socket timeout to prevent infinite poll() waits
+    pg_set_socket_timeout(conn->conn);
+
     char schema_cmd[256];
     snprintf(schema_cmd, sizeof(schema_cmd), "SET search_path TO %s, public", cfg->schema);
     PGresult *res = PQexec(conn->conn, schema_cmd);
@@ -857,7 +896,7 @@ int pg_ensure_connection(pg_connection_t *conn) {
     if (res) PQclear(res);
 
     // Set statement_timeout to prevent infinite hangs
-    res = PQexec(conn->conn, "SET statement_timeout = '10s'");
+    res = PQexec(conn->conn, "SET statement_timeout = '60s'");
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         LOG_ERROR("Failed to set statement_timeout on reconnect: %s", PQresultErrorMessage(res));
     }
