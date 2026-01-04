@@ -1,7 +1,7 @@
 #!/bin/bash
 # Monitor for hung Plex Media Scanner processes and capture lldb backtrace
 
-THRESHOLD=3  # seconds in UN state before capturing
+THRESHOLD=30  # seconds in UN state before capturing
 LOG_DIR="/tmp/plex_hung_scanners"
 mkdir -p "$LOG_DIR"
 
