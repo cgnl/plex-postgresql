@@ -13,7 +13,7 @@ ifeq ($(UNAME_S),Darwin)
     PG_LIB = /opt/homebrew/opt/postgresql@15/lib
     # Added -Isrc to find new headers
     CFLAGS = -Wall -Wextra -O2 -I$(PG_INCLUDE) -Iinclude -Isrc
-    LDFLAGS = -L. -lpq -lpgcommon -lpgport
+    LDFLAGS = -L$(PG_LIB) -lpq
     TARGET = db_interpose_pg.dylib
     SOURCE = src/db_interpose_pg.c
     SHARED_FLAGS = -dynamiclib -undefined dynamic_lookup
