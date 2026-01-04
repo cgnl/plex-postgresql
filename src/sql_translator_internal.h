@@ -9,8 +9,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>  // for strcasestr, strncasecmp
+#include <strings.h>  // for strncasecmp
 #include <ctype.h>
+
+// Safe strcasestr - musl's version has issues, use our own
+char* safe_strcasestr(const char *haystack, const char *needle);
+#ifdef strcasestr
+#undef strcasestr
+#endif
+#define strcasestr safe_strcasestr
 
 #define MAX_SQL_LEN 131072
 #define MAX_PARAM_NAME 64

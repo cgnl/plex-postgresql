@@ -62,10 +62,11 @@ RUN mkdir -p /libs && \
 # Runtime stage
 FROM linuxserver/plex:latest
 
-# Install PostgreSQL client for health checks and sqlite3 for schema fixes
+# Install PostgreSQL client for health checks, sqlite3 for schema fixes, gdb for debugging
 RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-client \
     sqlite3 \
+    gdb \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /usr/local/lib/plex-postgresql

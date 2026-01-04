@@ -5,9 +5,9 @@
 
 #include "pg_config.h"
 #include "pg_logging.h"
+#include "sql_translator_internal.h"  // for safe_strcasestr
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <ctype.h>
 
 // ============================================================================
