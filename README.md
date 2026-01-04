@@ -6,8 +6,8 @@ A shim library that intercepts Plex's SQLite calls and redirects them to Postgre
 
 | Platform | Status |
 |----------|--------|
-| macOS | ✅ Working |
-| Linux (Docker) | ✅ Working |
+| macOS | ✅ Production tested |
+| Linux (Docker) | ✅ Working (init & run tested, not production tested) |
 | Linux (Native) | ⚠️ Untested |
 
 ## Quick Start (Docker)
