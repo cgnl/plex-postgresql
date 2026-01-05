@@ -683,6 +683,17 @@ char* translate_distinct_orderby(const char *sql) {
             }
         }
 
+        // Special case: decade query - ORDER BY metadata_items.year but SELECT has year/10*10 AS year
+        // Fix: Replace ORDER BY metadata_items.year with ORDER BY year (the alias)
+        if (strcasestr(sql, "year/10*10") && strcasestr(sql, "as year")) {
+            const char *order_col = strcasestr(order_by_pos, "metadata_items.year");
+            if (order_col) {
+                LOG_INFO("Fixing decade query: ORDER BY metadata_items.year -> ORDER BY year");
+                char *result = str_replace_nocase(sql, "order by metadata_items.year", "order by year");
+                return result ? result : strdup(sql);
+            }
+        }
+
         // Check for common Plex ORDER BY patterns that use table aliases not in SELECT
         // These patterns cause "ORDER BY expressions must appear in select list" errors
         const char *problem_patterns[] = {
