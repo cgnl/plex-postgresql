@@ -52,7 +52,7 @@ SERVER_BINARY="$SCRIPT_DIR/Plex Media Server.original"
 SHIM_DIR="/Users/sander/plex-postgresql"
 
 # PostgreSQL configuration
-export PLEX_PG_HOST="${PLEX_PG_HOST:-localhost}"
+export PLEX_PG_HOST="${PLEX_PG_HOST:-/tmp}"
 export PLEX_PG_PORT="${PLEX_PG_PORT:-5432}"
 export PLEX_PG_DATABASE="${PLEX_PG_DATABASE:-plex}"
 export PLEX_PG_USER="${PLEX_PG_USER:-plex}"
