@@ -112,7 +112,13 @@ char* sql_translate_functions(const char *sql) {
     TRANSLATE(fix_forward_reference_joins);
 
     // 15a. Fix integer/text mismatch
+    if (strcasestr(current, "download_queue_items")) {
+        LOG_INFO("BEFORE fix_integer_text_mismatch: %.300s", current);
+    }
     TRANSLATE(fix_integer_text_mismatch);
+    if (strcasestr(current, "download_queue_items")) {
+        LOG_INFO("AFTER fix_integer_text_mismatch: %.300s", current);
+    }
 
     // 15b. Fix GROUP BY strict mode (legacy single-case handler)
     TRANSLATE(fix_group_by_strict);

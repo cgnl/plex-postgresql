@@ -55,6 +55,9 @@ static const char *ANYWHERE_SKIP_PATTERNS[] = {
     "spellfix",
     "icu_load_collation",
     // typeof() and last_insert_rowid() are translated by sql_translator, not skipped
+    // Dynamic column update (no-op: SET $col=$col)
+    "SET $2=$2",
+    "SET $1=$1",
     NULL
 };
 

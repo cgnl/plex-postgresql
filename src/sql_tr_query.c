@@ -670,14 +670,16 @@ char* translate_distinct_orderby(const char *sql) {
         return strdup(sql);
     }
 
-    // Check if ORDER BY uses aggregate functions (count, sum, avg, max, min)
+    // Check if ORDER BY uses aggregate functions or random()
     const char *order_by_pos = strcasestr(sql, "order by");
     if (order_by_pos) {
-        // Look for aggregate functions in ORDER BY clause
-        const char *agg_funcs[] = {"count(", "sum(", "avg(", "max(", "min(", NULL};
-        for (int i = 0; agg_funcs[i]; i++) {
-            if (strcasestr(order_by_pos, agg_funcs[i])) {
-                // Found aggregate in ORDER BY - remove DISTINCT
+        // Look for aggregate functions or random() in ORDER BY clause
+        // random() is incompatible with DISTINCT because it's not in SELECT list
+        const char *incompatible_funcs[] = {"count(", "sum(", "avg(", "max(", "min(", "random()", NULL};
+        for (int i = 0; incompatible_funcs[i]; i++) {
+            if (strcasestr(order_by_pos, incompatible_funcs[i])) {
+                // Found incompatible function in ORDER BY - remove DISTINCT
+                LOG_INFO("Removing DISTINCT due to ORDER BY %s", incompatible_funcs[i]);
                 char *result = str_replace_nocase(sql, "select distinct", "select");
                 return result ? result : strdup(sql);
             }
@@ -808,6 +810,34 @@ char* fix_integer_text_mismatch(const char *sql) {
 
     // Note: Pattern 3 (tag_id) removed - tag_id compares with tg.id (both INTEGER)
     // Only metadata_item_id directly compares with json_array_elements values
+
+    // Pattern 4: status IN (SELECT ... FROM json_array_elements
+    // di."status" is INTEGER in download_queue_items, value::text is TEXT
+    // Direct pattern match for the download_queue_items query
+    if (strcasestr(current, "download_queue_items") && strcasestr(current, "json_array_elements")) {
+        LOG_INFO("Pattern 4 matched: download_queue_items with json_array_elements");
+        LOG_INFO("Query before fix: %.200s", current);
+        // Match: di."status" IN (SELECT value::text
+        // Fix:   di."status"::text IN (SELECT value::text
+        temp = str_replace_nocase(current,
+            "di.\"status\" IN",
+            "di.\"status\"::text IN");
+        if (temp && temp != current) {
+            LOG_INFO("Pattern 4 replacement succeeded");
+            free(current);
+            current = temp;
+        } else {
+            LOG_INFO("Pattern 4 replacement did NOT change anything");
+        }
+    }
+
+    // Generic pattern for any "status" column with json_array_elements
+    if (strcasestr(current, "\"status\" IN") && strcasestr(current, "json_array_elements")) {
+        temp = str_replace_nocase(current,
+            "\"status\" IN",
+            "\"status\"::text IN");
+        if (temp) { free(current); current = temp; }
+    }
 
     return current;
 }

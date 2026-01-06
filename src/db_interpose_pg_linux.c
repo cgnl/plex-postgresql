@@ -1209,6 +1209,52 @@ static inline int is_preallocated_buffer(pg_stmt_t *stmt, int idx) {
            stmt->param_values[idx] < stmt->param_buffers[idx] + 32;
 }
 
+// Helper: check if data contains binary bytes (non-UTF8 safe)
+// Returns 1 if data contains bytes that would be invalid in UTF-8 text
+static int contains_binary_bytes(const unsigned char *data, size_t len) {
+    if (!data || len == 0) return 0;
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = data[i];
+        // Control characters (except tab, newline, carriage return)
+        if (c < 0x20 && c != 0x09 && c != 0x0A && c != 0x0D) {
+            return 1;
+        }
+        // Check for invalid UTF-8 lead bytes or 0x7F (DEL)
+        if (c == 0x7F || c == 0xC0 || c == 0xC1 || c >= 0xF5) {
+            return 1;
+        }
+        // Gzip magic bytes (0x1f 0x8b) - common binary data
+        if (i == 0 && len >= 2 && c == 0x1f && data[1] == 0x8b) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Helper: convert binary data to PostgreSQL hex format (\xHEXHEX...)
+// Caller must free the returned string
+static char* bytes_to_pg_hex(const unsigned char *data, size_t len) {
+    if (!data || len == 0) return strdup("");
+
+    // Format: \x followed by 2 hex chars per byte
+    size_t hex_len = 2 + (len * 2) + 1;  // \x + hex + null
+    char *hex = malloc(hex_len);
+    if (!hex) return NULL;
+
+    hex[0] = '\\';
+    hex[1] = 'x';
+
+    static const char hex_chars[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        hex[2 + i*2] = hex_chars[(data[i] >> 4) & 0x0F];
+        hex[2 + i*2 + 1] = hex_chars[data[i] & 0x0F];
+    }
+    hex[hex_len - 1] = '\0';
+
+    return hex;
+}
+
 int sqlite3_bind_text(sqlite3_stmt *pStmt, int idx, const char *val,
                                  int nBytes, void (*destructor)(void*)) {
     int rc = orig_sqlite3_bind_text(pStmt, idx, val, nBytes, destructor);
@@ -1224,7 +1270,15 @@ int sqlite3_bind_text(sqlite3_stmt *pStmt, int idx, const char *val,
                 free(pg_stmt->param_values[pg_idx]);
                 pg_stmt->param_values[pg_idx] = NULL;  // Prevent dangling pointer
             }
-            if (nBytes < 0) {
+
+            size_t actual_len = (nBytes < 0) ? strlen(val) : (size_t)nBytes;
+
+            // Check if data contains binary bytes (non-UTF8)
+            // If so, convert to PostgreSQL hex format for BYTEA columns
+            if (contains_binary_bytes((const unsigned char*)val, actual_len)) {
+                LOG_DEBUG("bind_text: detected binary data at idx=%d, len=%zu, converting to hex", idx, actual_len);
+                pg_stmt->param_values[pg_idx] = bytes_to_pg_hex((const unsigned char*)val, actual_len);
+            } else if (nBytes < 0) {
                 pg_stmt->param_values[pg_idx] = strdup(val);
             } else {
                 pg_stmt->param_values[pg_idx] = malloc(nBytes + 1);
@@ -1253,12 +1307,12 @@ int sqlite3_bind_blob(sqlite3_stmt *pStmt, int idx, const void *val,
                 free(pg_stmt->param_values[pg_idx]);
                 pg_stmt->param_values[pg_idx] = NULL;  // Prevent dangling pointer
             }
-            pg_stmt->param_values[pg_idx] = malloc(nBytes);
-            if (pg_stmt->param_values[pg_idx]) {
-                memcpy(pg_stmt->param_values[pg_idx], val, nBytes);
-            }
-            pg_stmt->param_lengths[pg_idx] = nBytes;
-            pg_stmt->param_formats[pg_idx] = 1;  // binary
+            // Convert binary data to PostgreSQL hex format for BYTEA columns
+            // This works in text mode (paramFormats=NULL means text mode)
+            LOG_DEBUG("bind_blob: converting %d bytes to hex at idx=%d", nBytes, idx);
+            pg_stmt->param_values[pg_idx] = bytes_to_pg_hex((const unsigned char*)val, (size_t)nBytes);
+            pg_stmt->param_lengths[pg_idx] = 0;  // Use strlen for text mode
+            pg_stmt->param_formats[pg_idx] = 0;  // text mode (hex string)
         }
         pthread_mutex_unlock(&pg_stmt->mutex);
     }
@@ -1280,12 +1334,11 @@ int sqlite3_bind_blob64(sqlite3_stmt *pStmt, int idx, const void *val,
                 free(pg_stmt->param_values[pg_idx]);
                 pg_stmt->param_values[pg_idx] = NULL;  // Prevent dangling pointer
             }
-            pg_stmt->param_values[pg_idx] = malloc((size_t)nBytes);
-            if (pg_stmt->param_values[pg_idx]) {
-                memcpy(pg_stmt->param_values[pg_idx], val, (size_t)nBytes);
-            }
-            pg_stmt->param_lengths[pg_idx] = (int)nBytes;
-            pg_stmt->param_formats[pg_idx] = 1;  // binary
+            // Convert binary data to PostgreSQL hex format for BYTEA columns
+            LOG_DEBUG("bind_blob64: converting %llu bytes to hex at idx=%d", (unsigned long long)nBytes, idx);
+            pg_stmt->param_values[pg_idx] = bytes_to_pg_hex((const unsigned char*)val, (size_t)nBytes);
+            pg_stmt->param_lengths[pg_idx] = 0;  // Use strlen for text mode
+            pg_stmt->param_formats[pg_idx] = 0;  // text mode (hex string)
         }
         pthread_mutex_unlock(&pg_stmt->mutex);
     }
@@ -1308,7 +1361,15 @@ int sqlite3_bind_text64(sqlite3_stmt *pStmt, int idx, const char *val,
                 free(pg_stmt->param_values[pg_idx]);
                 pg_stmt->param_values[pg_idx] = NULL;  // Prevent dangling pointer
             }
-            if (nBytes == (sqlite3_uint64)-1) {
+
+            size_t actual_len = (nBytes == (sqlite3_uint64)-1) ? strlen(val) : (size_t)nBytes;
+
+            // Check if data contains binary bytes (non-UTF8)
+            // If so, convert to PostgreSQL hex format for BYTEA columns
+            if (contains_binary_bytes((const unsigned char*)val, actual_len)) {
+                LOG_DEBUG("bind_text64: detected binary data at idx=%d, len=%zu, converting to hex", idx, actual_len);
+                pg_stmt->param_values[pg_idx] = bytes_to_pg_hex((const unsigned char*)val, actual_len);
+            } else if (nBytes == (sqlite3_uint64)-1) {
                 pg_stmt->param_values[pg_idx] = strdup(val);
             } else {
                 pg_stmt->param_values[pg_idx] = malloc((size_t)nBytes + 1);
