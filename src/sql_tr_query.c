@@ -426,19 +426,29 @@ char* translate_fts(const char *sql) {
                     char *quote_start = scan + 1;
                     char *quote_end = strchr(quote_start, '\'');
                     if (quote_end) {
+                        // HEAP allocation to prevent stack overflow (Plex uses ~388KB of stack)
+                        char *search_term = calloc(256, 1);
+                        char *pg_term = calloc(512, 1);
+                        char *replacement = malloc(1024);
+
+                        if (!search_term || !pg_term || !replacement) {
+                            free(search_term);
+                            free(pg_term);
+                            free(replacement);
+                            pos++;
+                            continue;
+                        }
+
                         // We have the full term
-                        char search_term[256] = {0};
                         size_t term_len = quote_end - quote_start;
                         if (term_len > 254) term_len = 254;
                         strncpy(search_term, quote_start, term_len);
 
-                        char pg_term[512] = {0};
-                        convert_fts_term(search_term, pg_term, sizeof(pg_term));
+                        convert_fts_term(search_term, pg_term, 512);
 
                         // Construct replacement: col_fts @@ to_tsquery(...)
-                        char replacement[1024];
-                        snprintf(replacement, sizeof(replacement), 
-                            "%s @@ to_tsquery('simple', '%s')", 
+                        snprintf(replacement, 1024,
+                            "%s @@ to_tsquery('simple', '%s')",
                             maps[i].replacement, pg_term);
 
                         // Replacment logic
@@ -454,6 +464,10 @@ char* translate_fts(const char *sql) {
 
                         pos += new_len; // advance
                         changed = 1;
+
+                        free(search_term);
+                        free(pg_term);
+                        free(replacement);
                         continue; // look for next occurrence
                     }
                 }
@@ -476,6 +490,11 @@ char* translate_fts(const char *sql) {
 char* fix_forward_reference_joins(const char *sql) {
     if (!sql) return NULL;
 
+    // Debug: log if this is the OnDeck query
+    if (strcasestr(sql, "metadata_item_settings") && strcasestr(sql, "grandparents")) {
+        LOG_INFO("FIX_FORWARD_REF: Processing OnDeck query");
+    }
+
     const char *first_alias_join = strcasestr(sql, "join metadata_items as ");
     if (!first_alias_join) return strdup(sql);
 
@@ -496,6 +515,8 @@ char* fix_forward_reference_joins(const char *sql) {
     }
 
     if (!has_forward_ref) return strdup(sql);
+
+    LOG_INFO("FIX_FORWARD_REF: Found forward reference, reordering JOINs");
 
     // Move the unaliased join before the aliased joins
     const char *move_start = unaliased_join + 1;
@@ -610,19 +631,32 @@ char* translate_null_sorting(const char *sql) {
     };
 
     for (int i = 0; columns[i]; i++) {
-        char pattern1[256], pattern2[256], pattern3[256], pattern4[256];
-        char replacement[256];
+        // HEAP allocation to prevent stack overflow (Plex uses ~388KB of stack)
+        char *pattern1 = malloc(256);
+        char *pattern2 = malloc(256);
+        char *pattern3 = malloc(256);
+        char *pattern4 = malloc(256);
+        char *replacement = malloc(256);
+
+        if (!pattern1 || !pattern2 || !pattern3 || !pattern4 || !replacement) {
+            free(pattern1);
+            free(pattern2);
+            free(pattern3);
+            free(pattern4);
+            free(replacement);
+            continue;
+        }
 
         // Pattern with no space after comma, lowercase asc
-        snprintf(pattern1, sizeof(pattern1), "%s IS NULL,%s asc", columns[i], columns[i]);
+        snprintf(pattern1, 256, "%s IS NULL,%s asc", columns[i], columns[i]);
         // Pattern with space after comma, lowercase asc
-        snprintf(pattern2, sizeof(pattern2), "%s IS NULL, %s asc", columns[i], columns[i]);
+        snprintf(pattern2, 256, "%s IS NULL, %s asc", columns[i], columns[i]);
         // Pattern with no space after comma, uppercase ASC
-        snprintf(pattern3, sizeof(pattern3), "%s IS NULL,%s ASC", columns[i], columns[i]);
+        snprintf(pattern3, 256, "%s IS NULL,%s ASC", columns[i], columns[i]);
         // Pattern with space after comma, uppercase ASC
-        snprintf(pattern4, sizeof(pattern4), "%s IS NULL, %s ASC", columns[i], columns[i]);
+        snprintf(pattern4, 256, "%s IS NULL, %s ASC", columns[i], columns[i]);
 
-        snprintf(replacement, sizeof(replacement), "%s ASC NULLS LAST", columns[i]);
+        snprintf(replacement, 256, "%s ASC NULLS LAST", columns[i]);
 
         char *temp;
 
@@ -631,6 +665,11 @@ char* translate_null_sorting(const char *sql) {
         if (temp && strcmp(temp, current) != 0) {
             free(current);
             current = temp;
+            free(pattern1);
+            free(pattern2);
+            free(pattern3);
+            free(pattern4);
+            free(replacement);
             continue;
         }
         free(temp);
@@ -639,6 +678,11 @@ char* translate_null_sorting(const char *sql) {
         if (temp && strcmp(temp, current) != 0) {
             free(current);
             current = temp;
+            free(pattern1);
+            free(pattern2);
+            free(pattern3);
+            free(pattern4);
+            free(replacement);
             continue;
         }
         free(temp);
@@ -647,6 +691,11 @@ char* translate_null_sorting(const char *sql) {
         if (temp && strcmp(temp, current) != 0) {
             free(current);
             current = temp;
+            free(pattern1);
+            free(pattern2);
+            free(pattern3);
+            free(pattern4);
+            free(replacement);
             continue;
         }
         free(temp);
@@ -655,9 +704,21 @@ char* translate_null_sorting(const char *sql) {
         if (temp && strcmp(temp, current) != 0) {
             free(current);
             current = temp;
+            free(pattern1);
+            free(pattern2);
+            free(pattern3);
+            free(pattern4);
+            free(replacement);
             continue;
         }
         free(temp);
+
+        // Free buffers if no match
+        free(pattern1);
+        free(pattern2);
+        free(pattern3);
+        free(pattern4);
+        free(replacement);
     }
 
     return current;
@@ -709,7 +770,10 @@ char* translate_distinct_orderby(const char *sql) {
             const char *pattern_pos = strcasestr(order_by_pos, problem_patterns[i]);
             if (pattern_pos) {
                 // Extract the full column reference (e.g., "grandparents.title_sort")
-                char col_ref[256];
+                // HEAP allocation to prevent stack overflow (Plex uses ~388KB of stack)
+                char *col_ref = malloc(256);
+                if (!col_ref) continue;
+
                 const char *start = pattern_pos;
                 const char *end = start;
 
@@ -719,17 +783,19 @@ char* translate_distinct_orderby(const char *sql) {
                 }
 
                 size_t col_len = end - start;
-                if (col_len < sizeof(col_ref)) {
+                if (col_len < 256) {
                     memcpy(col_ref, start, col_len);
                     col_ref[col_len] = '\0';
 
                     // Check if this column is in the SELECT clause
                     if (!column_in_select(sql, col_ref)) {
                         LOG_INFO("Removing DISTINCT due to ORDER BY column not in SELECT: %s", col_ref);
+                        free(col_ref);
                         char *result = str_replace_nocase(sql, "select distinct", "select");
                         return result ? result : strdup(sql);
                     }
                 }
+                free(col_ref);
             }
         }
     }
@@ -931,9 +997,15 @@ char* fix_json_operator_on_text(const char *sql) {
                     const char *key_end = strchr(key_start, '\'');
 
                     if (key_end) {
-                        char json_key[256];
+                        // HEAP allocation to prevent stack overflow (Plex uses ~388KB of stack)
+                        char *json_key = malloc(256);
+                        if (!json_key) {
+                            *out++ = *p++;
+                            continue;
+                        }
+
                         size_t key_len = key_end - key_start;
-                        if (key_len < sizeof(json_key)) {
+                        if (key_len < 256) {
                             memcpy(json_key, key_start, key_len);
                             json_key[key_len] = '\0';
 
@@ -951,12 +1023,14 @@ char* fix_json_operator_on_text(const char *sql) {
                                 // column ->> '$.key' IS NULL
                                 // -> (column IS NULL OR column NOT LIKE '%"key"%')
                                 out += sprintf(out, " NOT LIKE '%%\"%s\"%%'", json_key);
+                                free(json_key);
                                 p = after + 7;
                                 continue;
                             } else if (strncmp(after, "<", 1) == 0) {
                                 // column ->> '$.key' < 'value'
                                 // -> column LIKE '%"key":"0"%' (simplified for version checking)
                                 out += sprintf(out, " LIKE '%%\"%s\":\"0\"%%'", json_key);
+                                free(json_key);
                                 // Skip the < and the value
                                 const char *quote1 = strchr(after, '\'');
                                 if (quote1) {
@@ -971,6 +1045,7 @@ char* fix_json_operator_on_text(const char *sql) {
                                 continue;
                             }
                         }
+                        free(json_key);
                     }
                 }
             }
@@ -1043,4 +1118,89 @@ char* fix_collections_query(const char *sql) {
     // }
 
     return result;
+}
+
+// ============================================================================
+// Fix JOIN order for PostgreSQL (tables must be defined before referenced)
+// ============================================================================
+//
+// SQLite allows: JOIN table AS alias ON alias.col = table.col ... JOIN table ON ...
+// PostgreSQL requires: JOIN table ON ... JOIN table AS alias ON alias.col = table.col
+//
+// This fixes the OnDeck query pattern where metadata_items is referenced before defined.
+
+char* fix_join_order(const char *sql) {
+    if (!sql) return NULL;
+
+    // Only process queries with metadata_item_settings and multiple metadata_items joins
+    if (!strcasestr(sql, "metadata_item_settings") ||
+        !strcasestr(sql, "join metadata_items as parents") ||
+        !strcasestr(sql, "join metadata_items on")) {
+        return strdup(sql);
+    }
+
+    // Find the positions of the key JOIN clauses
+    char *parents_join = strcasestr(sql, "join metadata_items as parents");
+    char *base_join = strcasestr(sql, "join metadata_items on");
+
+    if (!parents_join || !base_join) {
+        return strdup(sql);
+    }
+
+    // If parents_join comes BEFORE base_join, we need to reorder
+    if (parents_join < base_join) {
+        LOG_INFO("FIX_JOIN_ORDER: Reordering metadata_items joins for PostgreSQL compatibility");
+
+        // Find the end of base_join clause (up to WHERE or next JOIN that isn't part of this pattern)
+        char *where_pos = strcasestr(base_join, " where ");
+
+        if (!where_pos) {
+            return strdup(sql);  // Can't find WHERE, don't modify
+        }
+
+        // Calculate the base_join clause text
+        // It starts at base_join and goes up to (but not including) " where "
+        size_t base_join_len = where_pos - base_join;
+        char *base_join_text = malloc(base_join_len + 1);
+        if (!base_join_text) return strdup(sql);
+        strncpy(base_join_text, base_join, base_join_len);
+        base_join_text[base_join_len] = '\0';
+
+        // Build the new SQL:
+        // 1. Everything before parents_join
+        // 2. base_join clause (moved here)
+        // 3. parents_join clause
+        // 4. grandparents_join clause (if exists)
+        // 5. WHERE clause and rest
+
+        size_t result_size = strlen(sql) + 100;
+        char *result = malloc(result_size);
+        if (!result) {
+            free(base_join_text);
+            return strdup(sql);
+        }
+
+        // Copy everything before parents_join
+        size_t prefix_len = parents_join - sql;
+        strncpy(result, sql, prefix_len);
+        result[prefix_len] = '\0';
+
+        // Add base_join (without the WHERE part)
+        strcat(result, base_join_text);
+        strcat(result, " ");
+
+        // Add parents_join up to (but not including) base_join
+        size_t parents_clause_len = base_join - parents_join;
+        strncat(result, parents_join, parents_clause_len);
+
+        // Add WHERE and everything after
+        strcat(result, where_pos);
+
+        free(base_join_text);
+
+        LOG_INFO("FIX_JOIN_ORDER: Result: %.200s", result);
+        return result;
+    }
+
+    return strdup(sql);
 }

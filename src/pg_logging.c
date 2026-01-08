@@ -183,17 +183,22 @@ void pg_log_message_internal(int level, const char *fmt, ...) {
     if (!log_file) return;
 
     // Throttle check (skip if query explosion detected)
-    if (!should_log_message()) return;
+    // Always log ERROR messages, regardless of throttle
+    if (level != PG_LOG_ERROR && !should_log_message()) return;
 
-    // Format message BEFORE taking mutex to minimize contention
-    char buffer[4096];
+    // HEAP allocation to prevent stack overflow (Plex uses ~388KB of stack)
+    // Previously this 4KB buffer on stack caused crashes when combined with Plex's deep recursion
+    #define LOG_BUFFER_SIZE 4096
+    char *buffer = malloc(LOG_BUFFER_SIZE);
+    if (!buffer) return;
+
     int offset = 0;
 
     // Timestamp
     time_t now = time(NULL);
     struct tm tm_buf;
     struct tm *tm = localtime_r(&now, &tm_buf);  // Thread-safe version
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset,
+    offset += snprintf(buffer + offset, LOG_BUFFER_SIZE - offset,
                        "[%04d-%02d-%02d %02d:%02d:%02d] ",
                        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
                        tm->tm_hour, tm->tm_min, tm->tm_sec);
@@ -206,16 +211,16 @@ void pg_log_message_internal(int level, const char *fmt, ...) {
         case PG_LOG_DEBUG: tag = "[DEBUG] "; break;
         default: tag = "[???] "; break;
     }
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s", tag);
+    offset += snprintf(buffer + offset, LOG_BUFFER_SIZE - offset, "%s", tag);
 
     // Message
     va_list args;
     va_start(args, fmt);
-    offset += vsnprintf(buffer + offset, sizeof(buffer) - offset, fmt, args);
+    offset += vsnprintf(buffer + offset, LOG_BUFFER_SIZE - offset, fmt, args);
     va_end(args);
 
     // Newline
-    if (offset < (int)sizeof(buffer) - 1) {
+    if (offset < LOG_BUFFER_SIZE - 1) {
         buffer[offset++] = '\n';
         buffer[offset] = '\0';
     }
@@ -225,6 +230,8 @@ void pg_log_message_internal(int level, const char *fmt, ...) {
     fputs(buffer, log_file);
     fflush(log_file);
     pthread_mutex_unlock(&log_mutex);
+
+    free(buffer);
 }
 
 // ============================================================================

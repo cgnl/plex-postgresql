@@ -16,7 +16,7 @@ ifeq ($(UNAME_S),Darwin)
     LDFLAGS = -L$(PG_LIB) -lpq
     TARGET = db_interpose_pg.dylib
     SOURCE = src/db_interpose_pg.c
-    SHARED_FLAGS = -dynamiclib -undefined dynamic_lookup
+    SHARED_FLAGS = -dynamiclib -flat_namespace -undefined dynamic_lookup
 else
     # Linux
     CC = gcc
@@ -37,21 +37,26 @@ SQL_TR_OBJS = src/sql_translator.o src/sql_tr_helpers.o src/sql_tr_placeholders.
 # PG modules
 PG_MODULES = src/pg_config.o src/pg_logging.o src/pg_client.o src/pg_statement.o
 
+# DB Interpose modules (split from db_interpose_pg.c for maintainability)
+DB_INTERPOSE_OBJS = src/db_interpose_core.o src/db_interpose_open.o src/db_interpose_exec.o \
+                    src/db_interpose_prepare.o src/db_interpose_bind.o src/db_interpose_step.o \
+                    src/db_interpose_column.o src/db_interpose_metadata.o
+
 # All objects (macOS includes fishhook, Linux doesn't)
-OBJECTS = $(SQL_TR_OBJS) $(PG_MODULES) src/fishhook.o
+OBJECTS = $(SQL_TR_OBJS) $(PG_MODULES) $(DB_INTERPOSE_OBJS) src/fishhook.o
 LINUX_OBJECTS = $(SQL_TR_OBJS) $(PG_MODULES)
 
 .PHONY: all clean install test macos linux run stop
 
 all: $(TARGET)
 
-# Build the shim library (auto-detect platform)
-$(TARGET): $(SOURCE) $(OBJECTS)
-	$(CC) $(SHARED_FLAGS) -o $@ $< $(OBJECTS) $(CFLAGS) $(LDFLAGS)
+# Build the shim library (auto-detect platform) - uses modular approach
+$(TARGET): $(OBJECTS)
+	$(CC) $(SHARED_FLAGS) -o $@ $(OBJECTS) $(CFLAGS) $(LDFLAGS)
 
 # Explicit macOS build - use dynamic_lookup instead of linking sqlite3
-macos: src/db_interpose_pg.c $(OBJECTS)
-	clang -dynamiclib -flat_namespace -undefined dynamic_lookup -o db_interpose_pg.dylib $< $(OBJECTS) \
+macos: $(OBJECTS)
+	clang -dynamiclib -flat_namespace -undefined dynamic_lookup -o db_interpose_pg.dylib $(OBJECTS) \
 		-I/opt/homebrew/opt/postgresql@15/include -Iinclude -Isrc \
 		-L/opt/homebrew/opt/postgresql@15/lib -lpq
 
@@ -108,9 +113,34 @@ src/pg_statement.o: src/pg_statement.c src/pg_statement.h src/pg_types.h src/pg_
 src/fishhook.o: src/fishhook.c include/fishhook.h
 	$(CC) -c -O2 -Iinclude -o $@ $<
 
+# DB Interpose module compilation rules
+src/db_interpose_core.o: src/db_interpose_core.c src/db_interpose.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
+src/db_interpose_open.o: src/db_interpose_open.c src/db_interpose.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
+src/db_interpose_exec.o: src/db_interpose_exec.c src/db_interpose.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
+src/db_interpose_prepare.o: src/db_interpose_prepare.c src/db_interpose.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
+src/db_interpose_bind.o: src/db_interpose_bind.c src/db_interpose.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
+src/db_interpose_step.o: src/db_interpose_step.c src/db_interpose.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
+src/db_interpose_column.o: src/db_interpose_column.c src/db_interpose.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
+src/db_interpose_metadata.o: src/db_interpose_metadata.c src/db_interpose.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
 # Clean build artifacts
 clean:
-	rm -f db_interpose_pg.dylib db_interpose_pg.so $(OBJECTS) $(PG_MODULES)
+	rm -f db_interpose_pg.dylib db_interpose_pg.so $(OBJECTS) $(PG_MODULES) $(DB_INTERPOSE_OBJS)
 
 # Install to system location
 install: $(TARGET)

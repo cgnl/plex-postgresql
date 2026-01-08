@@ -29,17 +29,213 @@
 // Recursion prevention for interposed functions
 // ============================================================================
 
-// With DYLD_FORCE_FLAT_NAMESPACE=1, we CANNOT use dlsym/dlopen to get the
-// original SQLite functions - all calls will go through our interpose!
-// Instead, we use a thread-local flag to detect and prevent recursion.
+// With DYLD_INTERPOSE, ALL calls to sqlite3_prepare_v2 go through our shim,
+// including calls from within our own code. We use RTLD_NEXT to get a pointer
+// to the original SQLite function, bypassing our interpose.
 
 static __thread int in_interpose_call = 0;
+
+// Track recursion depth for prepare_v2 to detect infinite loops
+// SQLite can call prepare_v2 internally, which calls our shim again
+static __thread int prepare_v2_depth = 0;
+
+// Pointers to the REAL SQLite functions (resolved from system SQLite)
+// We load the SYSTEM libsqlite3.dylib directly to bypass our interpose entirely.
+// CRITICAL: We need pointers for ALL functions we might call from within our shim
+// to prevent infinite recursion via DYLD_INTERPOSE.
+static void *sqlite_handle = NULL;
+static int (*real_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
+static const char* (*real_sqlite3_errmsg)(sqlite3*) = NULL;
+static int (*real_sqlite3_errcode)(sqlite3*) = NULL;
 
 // ============================================================================
 // Globals (minimal - most state is in modules)
 // ============================================================================
 
 static int shim_initialized = 0;
+
+// ============================================================================
+// Worker Thread with Large Stack (8MB)
+// ============================================================================
+// When Plex's thread has insufficient stack for SQL parsing, we delegate
+// the work to our own thread which has plenty of stack space.
+
+#define WORKER_STACK_SIZE (8 * 1024 * 1024)  // 8MB stack for worker
+
+typedef enum {
+    WORK_NONE = 0,
+    WORK_PREPARE_V2,
+    WORK_SHUTDOWN
+} work_type_t;
+
+typedef struct {
+    // Input (set by caller)
+    work_type_t type;
+    sqlite3 *db;
+    const char *zSql;
+    int nByte;
+
+    // Output (set by worker)
+    sqlite3_stmt *stmt;
+    const char *tail;
+    int result;
+
+    // Synchronization
+    int work_ready;
+    int work_done;
+} worker_request_t;
+
+static pthread_t worker_thread;
+static pthread_mutex_t worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t worker_cond_request = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t worker_cond_response = PTHREAD_COND_INITIALIZER;
+static worker_request_t worker_request;
+static volatile int worker_running = 0;
+
+// Forward declarations for functions used by worker
+static int my_sqlite3_prepare_v2_internal(sqlite3 *db, const char *zSql, int nByte,
+                                          sqlite3_stmt **ppStmt, const char **pzTail,
+                                          int from_worker);
+
+static void* worker_thread_func(void *arg) {
+    (void)arg;
+    LOG_INFO("WORKER: Thread started with %d MB stack", WORKER_STACK_SIZE / (1024*1024));
+
+    while (1) {
+        pthread_mutex_lock(&worker_mutex);
+
+        // Wait for work
+        while (!worker_request.work_ready && worker_running) {
+            pthread_cond_wait(&worker_cond_request, &worker_mutex);
+        }
+
+        if (!worker_running) {
+            pthread_mutex_unlock(&worker_mutex);
+            break;
+        }
+
+        worker_request.work_ready = 0;
+
+        // Handle the request
+        if (worker_request.type == WORK_SHUTDOWN) {
+            worker_request.work_done = 1;
+            pthread_cond_signal(&worker_cond_response);
+            pthread_mutex_unlock(&worker_mutex);
+            break;
+        }
+
+        if (worker_request.type == WORK_PREPARE_V2) {
+            sqlite3_stmt *stmt = NULL;
+            const char *tail = NULL;
+
+            // Call internal prepare with from_worker=1 to avoid recursion
+            int rc = my_sqlite3_prepare_v2_internal(
+                worker_request.db,
+                worker_request.zSql,
+                worker_request.nByte,
+                &stmt,
+                &tail,
+                1  // from_worker - prevents re-delegation
+            );
+
+            worker_request.stmt = stmt;
+            worker_request.tail = tail;
+            worker_request.result = rc;
+        }
+
+        worker_request.work_done = 1;
+        pthread_cond_signal(&worker_cond_response);
+        pthread_mutex_unlock(&worker_mutex);
+    }
+
+    LOG_INFO("WORKER: Thread exiting");
+    return NULL;
+}
+
+static int worker_init(void) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        LOG_ERROR("WORKER: Failed to init thread attributes");
+        return -1;
+    }
+
+    // Set 8MB stack size
+    if (pthread_attr_setstacksize(&attr, WORKER_STACK_SIZE) != 0) {
+        LOG_ERROR("WORKER: Failed to set stack size");
+        pthread_attr_destroy(&attr);
+        return -1;
+    }
+
+    worker_running = 1;
+    memset(&worker_request, 0, sizeof(worker_request));
+
+    if (pthread_create(&worker_thread, &attr, worker_thread_func, NULL) != 0) {
+        LOG_ERROR("WORKER: Failed to create thread");
+        worker_running = 0;
+        pthread_attr_destroy(&attr);
+        return -1;
+    }
+
+    pthread_attr_destroy(&attr);
+    LOG_INFO("WORKER: Initialized with %d MB stack", WORKER_STACK_SIZE / (1024*1024));
+    return 0;
+}
+
+static void worker_cleanup(void) {
+    if (!worker_running) return;
+
+    pthread_mutex_lock(&worker_mutex);
+    worker_request.type = WORK_SHUTDOWN;
+    worker_request.work_ready = 1;
+    worker_running = 0;
+    pthread_cond_signal(&worker_cond_request);
+    pthread_mutex_unlock(&worker_mutex);
+
+    pthread_join(worker_thread, NULL);
+    LOG_INFO("WORKER: Cleaned up");
+}
+
+// Delegate prepare_v2 to worker thread (called when stack is low)
+static int delegate_prepare_to_worker(sqlite3 *db, const char *zSql, int nByte,
+                                      sqlite3_stmt **ppStmt, const char **pzTail) {
+    if (!worker_running) {
+        LOG_ERROR("WORKER: Not running, cannot delegate");
+        return SQLITE_ERROR;
+    }
+
+    LOG_INFO("WORKER: Delegating query (%.100s)", zSql ? zSql : "NULL");
+
+    pthread_mutex_lock(&worker_mutex);
+
+    // Set up request
+    worker_request.type = WORK_PREPARE_V2;
+    worker_request.db = db;
+    worker_request.zSql = zSql;
+    worker_request.nByte = nByte;
+    worker_request.stmt = NULL;
+    worker_request.tail = NULL;
+    worker_request.result = SQLITE_ERROR;
+    worker_request.work_done = 0;
+    worker_request.work_ready = 1;
+
+    // Signal worker
+    pthread_cond_signal(&worker_cond_request);
+
+    // Wait for response
+    while (!worker_request.work_done) {
+        pthread_cond_wait(&worker_cond_response, &worker_mutex);
+    }
+
+    // Get results
+    if (ppStmt) *ppStmt = worker_request.stmt;
+    if (pzTail) *pzTail = worker_request.tail;
+    int result = worker_request.result;
+
+    pthread_mutex_unlock(&worker_mutex);
+
+    LOG_INFO("WORKER: Delegation complete, rc=%d", result);
+    return result;
+}
 
 // ============================================================================
 // Fake sqlite3_value for PostgreSQL results
@@ -423,23 +619,135 @@ static char* simplify_fts_for_sqlite(const char *sql) {
     return result;
 }
 
-static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
-                                  sqlite3_stmt **ppStmt, const char **pzTail) {
+// Internal prepare_v2 implementation - called either directly or from worker thread
+// from_worker: 0 = called from Plex's thread, 1 = called from worker with large stack
+static int my_sqlite3_prepare_v2_internal(sqlite3 *db, const char *zSql, int nByte,
+                                          sqlite3_stmt **ppStmt, const char **pzTail,
+                                          int from_worker) {
+    // CRITICAL: Track recursion depth to prevent infinite loops
+    // SQLite can internally call prepare_v2 again, creating deep recursion
+    prepare_v2_depth++;
+
+    // If recursion is too deep, bail out immediately to prevent stack overflow
+    // Normal operations should never recurse more than 5-10 times
+    // The crash on 2026-01-06 showed 218 recursive frames!
+    if (prepare_v2_depth > 100) {
+        LOG_ERROR("RECURSION LIMIT: prepare_v2 called %d times (depth=%d)!",
+                  prepare_v2_depth, prepare_v2_depth);
+        LOG_ERROR("  This indicates infinite recursion - ABORTING to prevent crash");
+        LOG_ERROR("  Query: %.200s", zSql ? zSql : "NULL");
+        prepare_v2_depth--;
+        if (ppStmt) *ppStmt = NULL;
+        if (pzTail) *pzTail = NULL;
+        return SQLITE_ERROR;
+    }
+
+    // CRITICAL FIX: Stack overflow protection
+    // Get thread stack bounds to detect how much stack we have left
+    pthread_t self = pthread_self();
+    void *stack_addr = pthread_get_stackaddr_np(self);
+    size_t stack_size = pthread_get_stacksize_np(self);
+
+    // Calculate stack base and current position
+    char *stack_base = (char*)stack_addr;
+    char local_var;
+    char *current_stack = &local_var;
+
+    // Calculate how much stack we've used
+    // Stack grows downward on macOS/ARM64
+    ptrdiff_t stack_used = stack_base - current_stack;
+    if (stack_used < 0) stack_used = -stack_used;
+
+    // Calculate how much stack is left
+    ptrdiff_t stack_remaining = (ptrdiff_t)stack_size - stack_used;
+
+    // WORKER THREAD DELEGATION:
+    // If stack is low and we're NOT already on the worker thread, delegate to worker
+    // The worker has 8MB stack so it can handle complex queries safely
+    // CRITICAL: Must delegate EARLY - Plex uses ~500KB of 544KB stack before reaching us!
+    // With only ~44KB remaining, even our check logic can overflow the stack.
+    // Delegate when less than 400KB remains to be safe.
+    #define WORKER_DELEGATION_THRESHOLD 400000  // 400KB - delegate early!
+
+    // DISABLED: Worker delegation has deadlock issues. The recursion prevention
+    // fix (using real_sqlite3_* via dlsym) should be enough now.
+    // TODO: Fix worker thread synchronization if still needed
+    #if 0
+    if (!from_worker && stack_remaining < WORKER_DELEGATION_THRESHOLD && worker_running) {
+        LOG_INFO("WORKER DELEGATION: stack_remaining=%ld bytes < %d, delegating to worker",
+                 (long)stack_remaining, WORKER_DELEGATION_THRESHOLD);
+        prepare_v2_depth--;  // Worker will increment again
+        return delegate_prepare_to_worker(db, zSql, nByte, ppStmt, pzTail);
+    }
+    #endif
+
+    // If we're on worker thread, we have 8MB stack so only use minimal threshold
+    int stack_threshold = from_worker ? 32000 : 32000;  // 32KB minimum
+
+    if (stack_remaining < stack_threshold) {
+        LOG_ERROR("STACK PROTECTION TRIGGERED: stack_used=%ld/%ld bytes, remaining=%ld bytes (from_worker=%d)",
+                 (long)stack_used, (long)stack_size, (long)stack_remaining, from_worker);
+        LOG_ERROR("  SQLite needs ~400KB stack. Query rejected to prevent crash.");
+        LOG_ERROR("  Query: %.200s", zSql ? zSql : "NULL");
+
+        // CRITICAL FIX: Set error state on db handle for SOCI compatibility
+        // When we return an error code without calling real sqlite3_prepare_v2,
+        // the db's internal error state is not set, causing SOCI to call
+        // sqlite3_errmsg() and get "not an error" instead of our error message.
+        // We need to track this error state ourselves.
+        pg_connection_t *pg_conn = pg_find_connection(db);
+        if (pg_conn) {
+            pg_conn->last_error_code = SQLITE_NOMEM;
+            snprintf(pg_conn->last_error, sizeof(pg_conn->last_error),
+                     "Stack protection: insufficient stack space (used=%ld/%ld, remaining=%ld). "
+                     "Query too complex for available stack.",
+                     (long)stack_used, (long)stack_size, (long)stack_remaining);
+        }
+
+        // Return error immediately - do NOT call sqlite3_prepare_v2
+        prepare_v2_depth--;  // Decrement before return
+        if (ppStmt) *ppStmt = NULL;
+        if (pzTail) *pzTail = NULL;
+        return SQLITE_NOMEM;  // Out of memory (stack is memory!)
+    }
+
+    // Skip complex processing only if stack is really tight (not on worker)
+    int skip_complex_processing = 0;
+    if (!from_worker && stack_remaining < 64000) {
+        skip_complex_processing = 1;
+        LOG_INFO("STACK CAUTION: stack_used=%ld/%ld bytes, remaining=%ld - skipping complex processing",
+                 (long)stack_used, (long)stack_size, (long)stack_remaining);
+    }
+
     // CRITICAL FIX: NULL check to prevent crash in strcasestr
     if (!zSql) {
         LOG_ERROR("prepare_v2 called with NULL SQL");
-        return sqlite3_prepare_v2(db, zSql, nByte, ppStmt, pzTail);
+        int rc;
+        if (real_sqlite3_prepare_v2) {
+            rc = real_sqlite3_prepare_v2(db, zSql, nByte, ppStmt, pzTail);
+        } else {
+            rc = SQLITE_ERROR;
+            if (ppStmt) *ppStmt = NULL;
+        }
+        prepare_v2_depth--;  // Decrement before return
+        return rc;
+    }
+
+    // DEBUG: Log queries with backticks (the failing OnDeck query pattern)
+    if (strchr(zSql, '`')) {
+        LOG_INFO("BACKTICK_QUERY: skip_complex=%d len=%d sql=%.200s",
+                 skip_complex_processing, (int)strlen(zSql), zSql);
     }
 
     // Debug: log INSERT INTO metadata_items
-    if (strncasecmp(zSql, "INSERT", 6) == 0 && strcasestr(zSql, "metadata_items")) {
+    if (!skip_complex_processing && strncasecmp(zSql, "INSERT", 6) == 0 && strcasestr(zSql, "metadata_items")) {
         LOG_INFO("PREPARE_V2 INSERT metadata_items: %.300s", zSql);
         if (strcasestr(zSql, "icu_root")) {
             LOG_INFO("PREPARE_V2 has icu_root - will clean!");
         }
     }
 
-    pg_connection_t *pg_conn = pg_find_connection(db);
+    pg_connection_t *pg_conn = skip_complex_processing ? NULL : pg_find_connection(db);
     int is_write = is_write_operation(zSql);
     int is_read = is_read_operation(zSql);
 
@@ -449,7 +757,8 @@ static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
 
     // ALWAYS simplify FTS queries for SQLite, even without PG connection
     // because SQLite shadow DB doesn't have FTS virtual tables
-    if (strcasestr(zSql, "fts4_")) {
+    // BUT skip if we're in deep recursion to save stack
+    if (!skip_complex_processing && strcasestr(zSql, "fts4_")) {
         cleaned_sql = simplify_fts_for_sqlite(zSql);
         if (cleaned_sql) {
             sql_for_sqlite = cleaned_sql;
@@ -458,7 +767,8 @@ static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
     }
 
     // ALWAYS remove "collate icu_root" since SQLite shadow DB doesn't support it
-    if (strcasestr(sql_for_sqlite, "collate icu_root")) {
+    // BUT skip if we're in deep recursion to save stack
+    if (!skip_complex_processing && strcasestr(sql_for_sqlite, "collate icu_root")) {
         char *temp = malloc(strlen(sql_for_sqlite) + 1);
         if (temp) {
             strcpy(temp, sql_for_sqlite);
@@ -477,10 +787,39 @@ static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
         }
     }
 
-    int rc = sqlite3_prepare_v2(db, sql_for_sqlite, cleaned_sql ? -1 : nByte, ppStmt, pzTail);
+    // CRITICAL: Use real_sqlite3_prepare_v2 to bypass DYLD_INTERPOSE
+    // Otherwise we get infinite recursion since sqlite3_prepare_v2 calls us again!
+    int rc;
+    if (real_sqlite3_prepare_v2) {
+        rc = real_sqlite3_prepare_v2(db, sql_for_sqlite, cleaned_sql ? -1 : nByte, ppStmt, pzTail);
+    } else {
+        // Fallback - this will likely cause recursion but better than crash
+        LOG_ERROR("CRITICAL: real_sqlite3_prepare_v2 not initialized!");
+        rc = SQLITE_ERROR;
+        if (ppStmt) *ppStmt = NULL;
+    }
+
+    // CRITICAL FIX: Clear our tracked error state on success
+    // This ensures sqlite3_errmsg/errcode return correct values
+    pg_connection_t *pg_conn_for_clear = pg_find_connection(db);
+    if (pg_conn_for_clear) {
+        if (rc == SQLITE_OK) {
+            pg_conn_for_clear->last_error_code = SQLITE_OK;
+            pg_conn_for_clear->last_error[0] = '\0';
+        } else {
+            // Track actual SQLite error for consistency
+            pg_conn_for_clear->last_error_code = rc;
+            const char *sqlite_err = sqlite3_errmsg(db);
+            if (sqlite_err) {
+                snprintf(pg_conn_for_clear->last_error, sizeof(pg_conn_for_clear->last_error),
+                         "%s", sqlite_err);
+            }
+        }
+    }
 
     if (rc != SQLITE_OK || !*ppStmt) {
         if (cleaned_sql) free(cleaned_sql);
+        prepare_v2_depth--;  // Decrement before return
         return rc;
     }
 
@@ -566,7 +905,58 @@ static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
     }
 
     if (cleaned_sql) free(cleaned_sql);
+    prepare_v2_depth--;  // Decrement before return
     return rc;
+}
+
+// Lazy init for real SQLite functions (in case called before constructor)
+static void ensure_real_sqlite_loaded(void) {
+    if (real_sqlite3_prepare_v2) return;  // Already loaded
+
+    const char *sqlite_paths[] = {
+        "/Applications/Plex Media Server.app/Contents/Frameworks/libsqlite3_orig.dylib",
+        "/Applications/Plex Media Server.app/Contents/Frameworks/libsqlite3.dylib",
+        "/usr/lib/libsqlite3.dylib",
+        NULL
+    };
+
+    for (int i = 0; sqlite_paths[i] != NULL && !sqlite_handle; i++) {
+        sqlite_handle = dlopen(sqlite_paths[i], RTLD_LAZY | RTLD_LOCAL);
+    }
+
+    if (sqlite_handle) {
+        real_sqlite3_prepare_v2 = dlsym(sqlite_handle, "sqlite3_prepare_v2");
+        real_sqlite3_errmsg = dlsym(sqlite_handle, "sqlite3_errmsg");
+        real_sqlite3_errcode = dlsym(sqlite_handle, "sqlite3_errcode");
+    }
+}
+
+// Public wrapper - delegates to worker thread if stack is low
+static int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
+                                  sqlite3_stmt **ppStmt, const char **pzTail) {
+    // CRITICAL: Ensure real SQLite is loaded (may be called before constructor!)
+    ensure_real_sqlite_loaded();
+
+    // CRITICAL FIX: Prevent infinite recursion when our internal code calls sqlite3_prepare_v2
+    // With DYLD_INTERPOSE, ALL calls to sqlite3_prepare_v2 come through here, including
+    // our own internal calls on lines 711 and 770. Use thread-local flag to detect this.
+    if (in_interpose_call) {
+        // We're already inside our shim - this is a recursive call from our own code.
+        // Call the REAL sqlite3_prepare_v2 directly via our resolved function pointer.
+        // This bypasses DYLD_INTERPOSE and prevents infinite recursion.
+        if (real_sqlite3_prepare_v2) {
+            return real_sqlite3_prepare_v2(db, zSql, nByte, ppStmt, pzTail);
+        } else {
+            // Fallback if real function pointer wasn't resolved (should never happen)
+            LOG_ERROR("CRITICAL: real_sqlite3_prepare_v2 is NULL during recursive call!");
+            return SQLITE_ERROR;
+        }
+    }
+
+    in_interpose_call = 1;
+    int result = my_sqlite3_prepare_v2_internal(db, zSql, nByte, ppStmt, pzTail, 0);
+    in_interpose_call = 0;
+    return result;
 }
 
 static int my_sqlite3_prepare(sqlite3 *db, const char *zSql, int nByte,
@@ -2342,6 +2732,67 @@ static sqlite3_int64 my_sqlite3_last_insert_rowid(sqlite3 *db) {
     return result;
 }
 
+// ============================================================================
+// Interposed SQLite Functions - Error Handling
+// ============================================================================
+
+// CRITICAL FIX for SOCI "not an error" exception:
+// When we abort prepare_v2 early (e.g., stack protection), we return an error
+// code BUT never call the real sqlite3_prepare_v2, so SQLite's internal error
+// state remains SQLITE_OK. SOCI then calls sqlite3_errmsg() and gets "not an
+// error" instead of our actual error message. We must intercept errmsg/errcode
+// to return our tracked error state when we've set it.
+
+static const char* my_sqlite3_errmsg(sqlite3 *db) {
+    // CRITICAL: Prevent recursion when called from within our shim
+    if (in_interpose_call && real_sqlite3_errmsg) {
+        return real_sqlite3_errmsg(db);
+    }
+
+    // Check if we have a tracked error for this db
+    pg_connection_t *pg_conn = pg_find_connection(db);
+    if (pg_conn && pg_conn->last_error_code != SQLITE_OK && pg_conn->last_error[0] != '\0') {
+        // Return our tracked error message
+        return pg_conn->last_error;
+    }
+    // Otherwise, fall through to real SQLite
+    // CRITICAL: Use real function pointer if available to avoid recursion
+    if (real_sqlite3_errmsg) {
+        return real_sqlite3_errmsg(db);
+    }
+    return sqlite3_errmsg(db);
+}
+
+static int my_sqlite3_errcode(sqlite3 *db) {
+    // CRITICAL: Prevent recursion when called from within our shim
+    if (in_interpose_call && real_sqlite3_errcode) {
+        return real_sqlite3_errcode(db);
+    }
+
+    // Check if we have a tracked error for this db
+    pg_connection_t *pg_conn = pg_find_connection(db);
+    if (pg_conn && pg_conn->last_error_code != SQLITE_OK) {
+        // Return our tracked error code
+        return pg_conn->last_error_code;
+    }
+    // Otherwise, fall through to real SQLite
+    // CRITICAL: Use real function pointer if available to avoid recursion
+    if (real_sqlite3_errcode) {
+        return real_sqlite3_errcode(db);
+    }
+    return sqlite3_errcode(db);
+}
+
+static int my_sqlite3_extended_errcode(sqlite3 *db) {
+    // For extended error codes, we just use the basic error code
+    // since we don't track extended codes
+    pg_connection_t *pg_conn = pg_find_connection(db);
+    if (pg_conn && pg_conn->last_error_code != SQLITE_OK) {
+        return pg_conn->last_error_code;
+    }
+    return sqlite3_extended_errcode(db);
+}
+
 static int my_sqlite3_get_table(sqlite3 *db, const char *sql, char ***pazResult,
                                  int *pnRow, int *pnColumn, char **pzErrMsg) {
     // CRITICAL FIX: NULL check to prevent crash
@@ -2404,6 +2855,11 @@ DYLD_INTERPOSE(my_sqlite3_changes, sqlite3_changes)
 DYLD_INTERPOSE(my_sqlite3_changes64, sqlite3_changes64)
 DYLD_INTERPOSE(my_sqlite3_last_insert_rowid, sqlite3_last_insert_rowid)
 DYLD_INTERPOSE(my_sqlite3_get_table, sqlite3_get_table)
+
+// Error handling - CRITICAL for SOCI compatibility
+DYLD_INTERPOSE(my_sqlite3_errmsg, sqlite3_errmsg)
+DYLD_INTERPOSE(my_sqlite3_errcode, sqlite3_errcode)
+DYLD_INTERPOSE(my_sqlite3_extended_errcode, sqlite3_extended_errcode)
 
 DYLD_INTERPOSE(my_sqlite3_prepare, sqlite3_prepare)
 DYLD_INTERPOSE(my_sqlite3_prepare_v2, sqlite3_prepare_v2)
@@ -2501,10 +2957,55 @@ static void shim_init(void) {
     fprintf(stderr, "[SHIM_INIT] Logging initialized\n");
     fflush(stderr);
 
+    // CRITICAL FIX: Load SYSTEM SQLite library to bypass our DYLD_INTERPOSE
+    // We need to call the REAL sqlite3_prepare_v2 from our internal code without recursion.
+    // RTLD_NEXT doesn't work reliably with DYLD_INTERPOSE, so we explicitly load
+    // the system libsqlite3.dylib or Plex's bundled version.
+    const char *sqlite_paths[] = {
+        "/Applications/Plex Media Server.app/Contents/Frameworks/libsqlite3_orig.dylib",
+        "/Applications/Plex Media Server.app/Contents/Frameworks/libsqlite3.dylib",
+        "/usr/lib/libsqlite3.dylib",
+        NULL
+    };
+
+    for (int i = 0; sqlite_paths[i] != NULL && sqlite_handle == NULL; i++) {
+        sqlite_handle = dlopen(sqlite_paths[i], RTLD_LAZY | RTLD_LOCAL);
+        if (sqlite_handle) {
+            fprintf(stderr, "[SHIM_INIT] Loaded SQLite from: %s\n", sqlite_paths[i]);
+            break;
+        }
+    }
+
+    if (!sqlite_handle) {
+        fprintf(stderr, "[SHIM_INIT] ERROR: Failed to load any SQLite library: %s\n", dlerror());
+        LOG_ERROR("CRITICAL: Failed to load SQLite library - recursion prevention will not work!");
+    } else {
+        // Resolve ALL SQLite functions we might call from within our shim
+        real_sqlite3_prepare_v2 = dlsym(sqlite_handle, "sqlite3_prepare_v2");
+        real_sqlite3_errmsg = dlsym(sqlite_handle, "sqlite3_errmsg");
+        real_sqlite3_errcode = dlsym(sqlite_handle, "sqlite3_errcode");
+
+        if (!real_sqlite3_prepare_v2 || !real_sqlite3_errmsg || !real_sqlite3_errcode) {
+            fprintf(stderr, "[SHIM_INIT] ERROR: Failed to resolve SQLite functions:\n");
+            fprintf(stderr, "  prepare_v2: %p, errmsg: %p, errcode: %p\n",
+                    (void*)real_sqlite3_prepare_v2, (void*)real_sqlite3_errmsg, (void*)real_sqlite3_errcode);
+            LOG_ERROR("CRITICAL: Failed to resolve all real SQLite functions!");
+        } else {
+            fprintf(stderr, "[SHIM_INIT] Resolved real SQLite functions:\n");
+            fprintf(stderr, "  prepare_v2: %p\n  errmsg: %p\n  errcode: %p\n",
+                    (void*)real_sqlite3_prepare_v2, (void*)real_sqlite3_errmsg, (void*)real_sqlite3_errcode);
+            LOG_INFO("Resolved all real SQLite functions for recursion prevention");
+        }
+    }
+
     pg_config_init();
     pg_client_init();
     pg_statement_init();
     sql_translator_init();
+
+    // Start worker thread with 8MB stack for heavy queries
+    worker_init();
+
     shim_initialized = 1;
 
     fprintf(stderr, "[SHIM_INIT] All modules initialized\n");
@@ -2514,6 +3015,7 @@ static void shim_init(void) {
 __attribute__((destructor))
 static void shim_cleanup(void) {
     LOG_INFO("=== Plex PostgreSQL Interpose Shim unloading ===");
+    worker_cleanup();  // Stop worker thread first
     pg_statement_cleanup();
     pg_client_cleanup();
     sql_translator_cleanup();

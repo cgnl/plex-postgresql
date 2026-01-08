@@ -421,13 +421,20 @@ char* fix_duplicate_assignments(const char *sql) {
     const char *set_end = where_pos ? where_pos : (sql + strlen(sql));
 
     // Parse assignments in SET clause
+    // NOTE: Using heap allocation instead of stack to prevent stack overflow
+    // when called from deeply nested translation chain (38KB on stack was too much)
     #define MAX_ASSIGNMENTS 256
-    struct {
+    typedef struct {
         char column[128];
         const char *value_start;
         const char *value_end;
         int keep;
-    } assignments[MAX_ASSIGNMENTS];
+    } assignment_t;
+
+    assignment_t *assignments = calloc(MAX_ASSIGNMENTS, sizeof(assignment_t));
+    if (!assignments) {
+        return strdup(sql);
+    }
     int assign_count = 0;
 
     const char *p = set_pos + 5;  // Skip " SET "
@@ -510,13 +517,17 @@ char* fix_duplicate_assignments(const char *sql) {
 
     // If no duplicates, return original
     if (keep_count == assign_count) {
+        free(assignments);
         return strdup(sql);
     }
 
     // Rebuild SQL with deduplicated assignments
     size_t result_len = strlen(sql) + 1;
     char *result = malloc(result_len);
-    if (!result) return strdup(sql);
+    if (!result) {
+        free(assignments);
+        return strdup(sql);
+    }
 
     // Copy up to SET clause
     size_t prefix_len = (set_pos + 5) - sql;
@@ -568,5 +579,6 @@ char* fix_duplicate_assignments(const char *sql) {
         *out = '\0';
     }
 
+    free(assignments);
     return result;
 }

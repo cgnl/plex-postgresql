@@ -10,8 +10,27 @@
 // ============================================================================
 
 char* translate_iif(const char *sql) {
+    // Fast path: if no iif, return early
+    if (!strcasestr(sql, "iif(")) {
+        return strdup(sql);
+    }
+
     char *result = malloc(MAX_SQL_LEN);
     if (!result) return NULL;
+
+    // HEAP allocation to prevent stack overflow (Plex uses ~388KB of stack)
+    #define IIF_BUF_SIZE 1024
+    char *cond = calloc(IIF_BUF_SIZE, 1);
+    char *true_val = calloc(IIF_BUF_SIZE, 1);
+    char *false_val = calloc(IIF_BUF_SIZE, 1);
+
+    if (!cond || !true_val || !false_val) {
+        free(result);
+        free(cond);
+        free(true_val);
+        free(false_val);
+        return strdup(sql);
+    }
 
     char *out = result;
     const char *p = sql;
@@ -20,20 +39,22 @@ char* translate_iif(const char *sql) {
         // Find iif( case-insensitively
         if (strncasecmp(p, "iif(", 4) == 0) {
             const char *args_start = p + 4;
-            char cond[4096] = {0};
-            char true_val[4096] = {0};
-            char false_val[4096] = {0};
+
+            // Clear buffers for reuse
+            memset(cond, 0, IIF_BUF_SIZE);
+            memset(true_val, 0, IIF_BUF_SIZE);
+            memset(false_val, 0, IIF_BUF_SIZE);
 
             // Extract condition
-            const char *next = extract_arg(args_start, cond, sizeof(cond));
+            const char *next = extract_arg(args_start, cond, IIF_BUF_SIZE);
             if (*next == ',') next++;
 
             // Extract true value
-            next = extract_arg(next, true_val, sizeof(true_val));
+            next = extract_arg(next, true_val, IIF_BUF_SIZE);
             if (*next == ',') next++;
 
             // Extract false value
-            next = extract_arg(next, false_val, sizeof(false_val));
+            next = extract_arg(next, false_val, IIF_BUF_SIZE);
             if (*next == ')') next++;
 
             // Write CASE WHEN
@@ -45,6 +66,9 @@ char* translate_iif(const char *sql) {
     }
 
     *out = '\0';
+    free(cond);
+    free(true_val);
+    free(false_val);
     return result;
 }
 
@@ -116,8 +140,30 @@ char* translate_typeof(const char *sql) {
 // ============================================================================
 
 char* translate_strftime(const char *sql) {
+    // Fast path: if no strftime, return early
+    if (!strcasestr(sql, "strftime(")) {
+        return strdup(sql);
+    }
+
     char *result = malloc(MAX_SQL_LEN);
     if (!result) return NULL;
+
+    // HEAP allocation to prevent stack overflow (Plex uses ~388KB of stack)
+    #define STRFTIME_FORMAT_SIZE 256
+    #define STRFTIME_VALUE_SIZE 1024
+    char *format = calloc(STRFTIME_FORMAT_SIZE, 1);
+    char *value = calloc(STRFTIME_VALUE_SIZE, 1);
+    char *extra = calloc(STRFTIME_FORMAT_SIZE, 1);
+    char *interval = calloc(STRFTIME_FORMAT_SIZE, 1);
+
+    if (!format || !value || !extra || !interval) {
+        free(result);
+        free(format);
+        free(value);
+        free(extra);
+        free(interval);
+        return strdup(sql);
+    }
 
     char *out = result;
     const char *p = sql;
@@ -125,21 +171,24 @@ char* translate_strftime(const char *sql) {
     while (*p) {
         if (strncasecmp(p, "strftime(", 9) == 0) {
             const char *args_start = p + 9;
-            char format[256] = {0};
-            char value[4096] = {0};
-            char extra[256] = {0};
+
+            // Clear buffers for reuse
+            memset(format, 0, STRFTIME_FORMAT_SIZE);
+            memset(value, 0, STRFTIME_VALUE_SIZE);
+            memset(extra, 0, STRFTIME_FORMAT_SIZE);
+            memset(interval, 0, STRFTIME_FORMAT_SIZE);
 
             // Extract format string
-            const char *next = extract_arg(args_start, format, sizeof(format));
+            const char *next = extract_arg(args_start, format, STRFTIME_FORMAT_SIZE);
             if (*next == ',') next++;
 
             // Extract value
-            next = extract_arg(next, value, sizeof(value));
+            next = extract_arg(next, value, STRFTIME_VALUE_SIZE);
 
             // Check for extra argument (like 'utc')
             if (*next == ',') {
                 next++;
-                next = extract_arg(next, extra, sizeof(extra));
+                next = extract_arg(next, extra, STRFTIME_FORMAT_SIZE);
             }
             if (*next == ')') next++;
 
@@ -150,13 +199,12 @@ char* translate_strftime(const char *sql) {
                 if (strcasecmp(value, "'now'") == 0) {
                     if (extra[0]) {
                         // Parse interval modifier like '-1 day', '+7 hours'
-                        char interval[256] = {0};
                         if (extra[0] == '\'') {
-                            strncpy(interval, extra + 1, sizeof(interval) - 1);
+                            strncpy(interval, extra + 1, STRFTIME_FORMAT_SIZE - 1);
                             char *q = strrchr(interval, '\'');
                             if (q) *q = '\0';
                         } else {
-                            strncpy(interval, extra, sizeof(interval) - 1);
+                            strncpy(interval, extra, STRFTIME_FORMAT_SIZE - 1);
                         }
                         // Convert SQLite interval format to PostgreSQL
                         // '-1 day' -> '- INTERVAL '1 day''
@@ -190,6 +238,10 @@ char* translate_strftime(const char *sql) {
     }
 
     *out = '\0';
+    free(format);
+    free(value);
+    free(extra);
+    free(interval);
     return result;
 }
 
@@ -207,16 +259,25 @@ char* translate_unixepoch(const char *sql) {
     while (*p) {
         if (strncasecmp(p, "unixepoch(", 10) == 0) {
             const char *args_start = p + 10;
-            char arg1[256] = {0};
-            char arg2[256] = {0};
+
+            // HEAP allocation to prevent stack overflow (Plex uses ~388KB of stack)
+            char *arg1 = calloc(256, 1);
+            char *arg2 = calloc(256, 1);
+
+            if (!arg1 || !arg2) {
+                free(arg1);
+                free(arg2);
+                *out++ = *p++;
+                continue;
+            }
 
             // Extract first argument
-            const char *next = extract_arg(args_start, arg1, sizeof(arg1));
+            const char *next = extract_arg(args_start, arg1, 256);
 
             // Check for second argument
             if (*next == ',') {
                 next++;
-                next = extract_arg(next, arg2, sizeof(arg2));
+                next = extract_arg(next, arg2, 256);
             }
             if (*next == ')') next++;
 
@@ -224,16 +285,21 @@ char* translate_unixepoch(const char *sql) {
             if (strcasecmp(arg1, "'now'") == 0) {
                 if (arg2[0]) {
                     // Parse interval like '-7 day' or '+1 hour'
-                    char interval[256];
-                    if (arg2[0] == '\'') {
-                        strncpy(interval, arg2 + 1, sizeof(interval) - 1);
-                        char *q = strrchr(interval, '\'');
-                        if (q) *q = '\0';
-                    } else {
-                        strncpy(interval, arg2, sizeof(interval) - 1);
-                    }
+                    char *interval = malloc(256);
+                    if (interval) {
+                        if (arg2[0] == '\'') {
+                            strncpy(interval, arg2 + 1, 255);
+                            interval[255] = '\0';
+                            char *q = strrchr(interval, '\'');
+                            if (q) *q = '\0';
+                        } else {
+                            strncpy(interval, arg2, 255);
+                            interval[255] = '\0';
+                        }
 
-                    out += sprintf(out, "EXTRACT(EPOCH FROM NOW() + INTERVAL '%s')::bigint", interval);
+                        out += sprintf(out, "EXTRACT(EPOCH FROM NOW() + INTERVAL '%s')::bigint", interval);
+                        free(interval);
+                    }
                 } else {
                     out += sprintf(out, "EXTRACT(EPOCH FROM NOW())::bigint");
                 }
@@ -242,6 +308,8 @@ char* translate_unixepoch(const char *sql) {
                 out += sprintf(out, "EXTRACT(EPOCH FROM %s)::bigint", arg1);
             }
 
+            free(arg1);
+            free(arg2);
             p = next;
         } else {
             *out++ = *p++;
@@ -374,8 +442,14 @@ char* simplify_typeof_fixup(const char *sql) {
             const char *start = p;
             p += 11;
 
+            // HEAP allocation to prevent stack overflow (Plex uses ~388KB of stack)
+            char *col_name = malloc(256);
+            if (!col_name) {
+                *out++ = *p++;
+                continue;
+            }
+
             // Extract the column/expression name (X)
-            char col_name[256];
             int col_len = 0;
             int depth = 1;
             while (*p && depth > 0 && col_len < 255) {
@@ -403,12 +477,14 @@ char* simplify_typeof_fixup(const char *sql) {
                 if (iif_depth == 0) {
                     strcpy(out, col_name);
                     out += strlen(col_name);
+                    free(col_name);
                     p = scan;
                     continue;
                 }
             }
 
             // Not the pattern - copy original and continue
+            free(col_name);
             p = start;
         }
 

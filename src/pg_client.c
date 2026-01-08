@@ -120,7 +120,8 @@ static void do_client_init(void) {
     }
 
     client_initialized = 1;
-    LOG_INFO("pg_client initialized with pool size %d (max %d)", configured_pool_size, POOL_SIZE_MAX);
+    LOG_INFO("pg_client initialized with pool size %d (max %d)",
+             configured_pool_size, POOL_SIZE_MAX);
 }
 
 void pg_client_init(void) {
