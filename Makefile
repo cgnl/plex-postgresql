@@ -254,6 +254,36 @@ test-stack-macos: $(TARGET) $(TEST_BIN_DIR)/test_stack_macos
 	@./$(TEST_BIN_DIR)/test_stack_macos ./$(TARGET)
 	@echo ""
 
+# SQL translator unit tests (links against translator objects + logging)
+$(TEST_BIN_DIR)/test_sql_translator: $(TEST_DIR)/test_sql_translator.c $(SQL_TR_OBJS) src/pg_logging.o
+	@mkdir -p $(TEST_BIN_DIR)
+	$(CC) -o $@ $< $(SQL_TR_OBJS) src/pg_logging.o -Iinclude -Isrc -Wall -Wextra
+
+test-sql: $(TEST_BIN_DIR)/test_sql_translator
+	@echo ""
+	@./$(TEST_BIN_DIR)/test_sql_translator
+	@echo ""
+
+# Query cache unit tests (standalone - tests cache logic without libpq)
+$(TEST_BIN_DIR)/test_query_cache: $(TEST_DIR)/test_query_cache.c
+	@mkdir -p $(TEST_BIN_DIR)
+	$(CC) -o $@ $< -Wall -Wextra
+
+test-cache: $(TEST_BIN_DIR)/test_query_cache
+	@echo ""
+	@./$(TEST_BIN_DIR)/test_query_cache
+	@echo ""
+
+# TLS cache unit tests (thread-local storage caching)
+$(TEST_BIN_DIR)/test_tls_cache: $(TEST_DIR)/test_tls_cache.c
+	@mkdir -p $(TEST_BIN_DIR)
+	$(CC) -o $@ $< -lpthread -Wall -Wextra
+
+test-tls: $(TEST_BIN_DIR)/test_tls_cache
+	@echo ""
+	@./$(TEST_BIN_DIR)/test_tls_cache
+	@echo ""
+
 # Run all unit tests
-unit-test: test-recursion test-crash
+unit-test: test-recursion test-crash test-sql test-cache test-tls
 	@echo "All unit tests complete."
