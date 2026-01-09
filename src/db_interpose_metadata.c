@@ -335,3 +335,100 @@ int my_sqlite3_stmt_readonly(sqlite3_stmt *pStmt) {
     }
     return 1;  // Default to readonly
 }
+
+// ============================================================================
+// Expanded SQL - Returns SQL with parameters substituted
+// ============================================================================
+
+char* my_sqlite3_expanded_sql(sqlite3_stmt *pStmt) {
+    if (!pStmt) return NULL;
+
+    // Check if this is one of our PostgreSQL statements
+    pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        // For PostgreSQL statements, build expanded SQL from pg_sql + bound params
+        const char *base_sql = pg_stmt->pg_sql ? pg_stmt->pg_sql : pg_stmt->sql;
+        if (!base_sql) return NULL;
+
+        // Simple case: no parameters, just return a copy
+        if (pg_stmt->param_count == 0) {
+            size_t len = strlen(base_sql);
+            char *result = my_sqlite3_malloc((int)(len + 1));
+            if (result) {
+                memcpy(result, base_sql, len + 1);
+            }
+            return result;
+        }
+
+        // Complex case: substitute $1, $2, ... with actual values
+        // First, estimate the size needed
+        size_t estimated_size = strlen(base_sql) + 1;
+        for (int i = 0; i < pg_stmt->param_count && i < MAX_PARAMS; i++) {
+            if (pg_stmt->param_values[i]) {
+                estimated_size += strlen(pg_stmt->param_values[i]) + 3;  // quotes + safety
+            } else {
+                estimated_size += 4;  // "NULL"
+            }
+        }
+        estimated_size *= 2;  // Extra safety margin
+
+        char *result = my_sqlite3_malloc((int)estimated_size);
+        if (!result) return NULL;
+
+        // Simple substitution: replace $1, $2, etc with values
+        const char *src = base_sql;
+        char *dst = result;
+        char *end = result + estimated_size - 1;
+
+        while (*src && dst < end) {
+            if (*src == '$' && src[1] >= '1' && src[1] <= '9') {
+                // Parse parameter number
+                int param_num = 0;
+                const char *p = src + 1;
+                while (*p >= '0' && *p <= '9') {
+                    param_num = param_num * 10 + (*p - '0');
+                    p++;
+                }
+                // Substitute with value (1-indexed)
+                int idx = param_num - 1;
+                if (idx >= 0 && idx < pg_stmt->param_count && idx < MAX_PARAMS) {
+                    const char *val = pg_stmt->param_values[idx];
+                    if (val) {
+                        // Quote text values
+                        *dst++ = '\'';
+                        while (*val && dst < end - 1) {
+                            if (*val == '\'') {
+                                *dst++ = '\'';  // Escape quote
+                            }
+                            *dst++ = *val++;
+                        }
+                        *dst++ = '\'';
+                    } else {
+                        // NULL value
+                        if (dst + 4 < end) {
+                            memcpy(dst, "NULL", 4);
+                            dst += 4;
+                        }
+                    }
+                } else {
+                    // Unknown parameter, copy as-is
+                    while (src < p && dst < end) {
+                        *dst++ = *src++;
+                    }
+                    continue;
+                }
+                src = p;
+            } else {
+                *dst++ = *src++;
+            }
+        }
+        *dst = '\0';
+        return result;
+    }
+
+    // Pass through to real SQLite for non-PG statements
+    if (orig_sqlite3_expanded_sql) {
+        return orig_sqlite3_expanded_sql(pStmt);
+    }
+    return NULL;
+}

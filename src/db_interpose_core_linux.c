@@ -724,12 +724,9 @@ sqlite3* sqlite3_db_handle(sqlite3_stmt *pStmt) {
     return my_sqlite3_db_handle(pStmt);
 }
 
-// sqlite3_expanded_sql - pass through to real SQLite
+// sqlite3_expanded_sql - use my_ implementation for PG statement support
 char* sqlite3_expanded_sql(sqlite3_stmt *pStmt) {
-    if (orig_sqlite3_expanded_sql) {
-        return orig_sqlite3_expanded_sql(pStmt);
-    }
-    return NULL;
+    return my_sqlite3_expanded_sql(pStmt);
 }
 
 // sqlite3_sql - use my_ implementation for PG statement support

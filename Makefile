@@ -297,6 +297,28 @@ $(TEST_BIN_DIR)/test_sqlite_api: $(TEST_DIR)/test_sqlite_api.c
 	@mkdir -p $(TEST_BIN_DIR)
 	$(CC) -o $@ $< -lsqlite3 -Wall -Wextra
 
+# sqlite3_expanded_sql and boolean value conversion tests
+$(TEST_BIN_DIR)/test_expanded_sql: $(TEST_DIR)/test_expanded_sql.c
+	@mkdir -p $(TEST_BIN_DIR)
+	$(CC) -o $@ $< -lsqlite3 -Wall -Wextra
+
+test-expanded: $(TARGET) $(TEST_BIN_DIR)/test_expanded_sql
+	@echo ""
+ifeq ($(UNAME_S),Darwin)
+	@DYLD_INSERT_LIBRARIES=./$(TARGET) \
+		PLEX_PG_HOST=/tmp \
+		PLEX_PG_DATABASE=plex \
+		PLEX_PG_USER=plex \
+		./$(TEST_BIN_DIR)/test_expanded_sql
+else
+	@LD_PRELOAD=./$(TARGET) \
+		PLEX_PG_HOST=localhost \
+		PLEX_PG_DATABASE=plex \
+		PLEX_PG_USER=plex \
+		./$(TEST_BIN_DIR)/test_expanded_sql
+endif
+	@echo ""
+
 test-api: $(TARGET) $(TEST_BIN_DIR)/test_sqlite_api
 	@echo ""
 ifeq ($(UNAME_S),Darwin)
@@ -315,5 +337,5 @@ endif
 	@echo ""
 
 # Run all unit tests
-unit-test: test-recursion test-crash test-sql test-cache test-tls test-api
+unit-test: test-recursion test-crash test-sql test-cache test-tls test-api test-expanded
 	@echo "All unit tests complete."

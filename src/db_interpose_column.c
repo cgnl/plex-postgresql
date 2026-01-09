@@ -693,7 +693,11 @@ int my_sqlite3_value_int(sqlite3_value *pVal) {
                 return 0;
             }
             const char *val = PQgetvalue(pg_stmt->result, fake->row_idx, fake->col_idx);
-            return val ? atoi(val) : 0;
+            if (!val) return 0;
+            // Handle PostgreSQL boolean 't'/'f' format
+            if (val[0] == 't' && val[1] == '\0') return 1;
+            if (val[0] == 'f' && val[1] == '\0') return 0;
+            return atoi(val);
         }
         return 0;
     }
@@ -711,7 +715,11 @@ sqlite3_int64 my_sqlite3_value_int64(sqlite3_value *pVal) {
                 return 0;
             }
             const char *val = PQgetvalue(pg_stmt->result, fake->row_idx, fake->col_idx);
-            return val ? atoll(val) : 0;
+            if (!val) return 0;
+            // Handle PostgreSQL boolean 't'/'f' format
+            if (val[0] == 't' && val[1] == '\0') return 1;
+            if (val[0] == 'f' && val[1] == '\0') return 0;
+            return atoll(val);
         }
         return 0;
     }
@@ -729,7 +737,11 @@ double my_sqlite3_value_double(sqlite3_value *pVal) {
                 return 0.0;
             }
             const char *val = PQgetvalue(pg_stmt->result, fake->row_idx, fake->col_idx);
-            return val ? atof(val) : 0.0;
+            if (!val) return 0.0;
+            // Handle PostgreSQL boolean 't'/'f' format
+            if (val[0] == 't' && val[1] == '\0') return 1.0;
+            if (val[0] == 'f' && val[1] == '\0') return 0.0;
+            return atof(val);
         }
         return 0.0;
     }

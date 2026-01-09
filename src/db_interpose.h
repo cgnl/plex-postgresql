@@ -327,6 +327,7 @@ void my_sqlite3_free(void *ptr);
 void* my_sqlite3_malloc(int n);
 sqlite3* my_sqlite3_db_handle(sqlite3_stmt *pStmt);
 const char* my_sqlite3_sql(sqlite3_stmt *pStmt);
+char* my_sqlite3_expanded_sql(sqlite3_stmt *pStmt);
 int my_sqlite3_bind_parameter_count(sqlite3_stmt *pStmt);
 int my_sqlite3_stmt_readonly(sqlite3_stmt *pStmt);
 
@@ -335,6 +336,7 @@ extern void (*orig_sqlite3_free)(void*);
 extern void* (*orig_sqlite3_malloc)(int);
 extern sqlite3* (*orig_sqlite3_db_handle)(sqlite3_stmt*);
 extern const char* (*orig_sqlite3_sql)(sqlite3_stmt*);
+extern char* (*orig_sqlite3_expanded_sql)(sqlite3_stmt*);
 extern int (*orig_sqlite3_bind_parameter_count)(sqlite3_stmt*);
 extern int (*orig_sqlite3_stmt_readonly)(sqlite3_stmt*);
 

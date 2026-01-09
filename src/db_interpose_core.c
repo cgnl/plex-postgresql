@@ -130,6 +130,7 @@ void (*orig_sqlite3_free)(void*) = NULL;
 void* (*orig_sqlite3_malloc)(int) = NULL;
 sqlite3* (*orig_sqlite3_db_handle)(sqlite3_stmt*) = NULL;
 const char* (*orig_sqlite3_sql)(sqlite3_stmt*) = NULL;
+char* (*orig_sqlite3_expanded_sql)(sqlite3_stmt*) = NULL;
 int (*orig_sqlite3_bind_parameter_count)(sqlite3_stmt*) = NULL;
 int (*orig_sqlite3_stmt_readonly)(sqlite3_stmt*) = NULL;
 
@@ -453,6 +454,7 @@ static void setup_fishhook_rebindings(void) {
         {"sqlite3_malloc", my_sqlite3_malloc, (void**)&orig_sqlite3_malloc},
         {"sqlite3_db_handle", my_sqlite3_db_handle, (void**)&orig_sqlite3_db_handle},
         {"sqlite3_sql", my_sqlite3_sql, (void**)&orig_sqlite3_sql},
+        {"sqlite3_expanded_sql", my_sqlite3_expanded_sql, (void**)&orig_sqlite3_expanded_sql},
         {"sqlite3_bind_parameter_count", my_sqlite3_bind_parameter_count, (void**)&orig_sqlite3_bind_parameter_count},
         {"sqlite3_stmt_readonly", my_sqlite3_stmt_readonly, (void**)&orig_sqlite3_stmt_readonly},
     };
