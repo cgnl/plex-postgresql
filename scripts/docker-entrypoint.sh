@@ -8,12 +8,38 @@ set -e
 MIGRATE_LIB="/usr/local/lib/plex-postgresql/migrate_lib.sh"
 
 # Set up variables for migration library
-# Check for source database (mounted for migration) first, then container's own database
-if [[ -f "/source-db/com.plexapp.plugins.library.db" ]]; then
-    SQLITE_DB="/source-db/com.plexapp.plugins.library.db"
-    echo "Found source SQLite database for migration at /source-db"
-else
-    SQLITE_DB="/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+# Auto-detect source SQLite database from common locations
+detect_sqlite_db() {
+    local locations=(
+        # Explicit mount point
+        "/source-db/com.plexapp.plugins.library.db"
+        # Linux standard location (if host path mounted)
+        "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+        # macOS location (if host path mounted)
+        "/Users/*/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+        # Alternative Linux locations
+        "/opt/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+        # Container's own database (last resort)
+        "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+    )
+
+    for pattern in "${locations[@]}"; do
+        # Use glob expansion for wildcard patterns
+        for db in $pattern; do
+            if [[ -f "$db" ]]; then
+                echo "$db"
+                return 0
+            fi
+        done
+    done
+
+    # Default fallback
+    echo "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+}
+
+SQLITE_DB=$(detect_sqlite_db)
+if [[ "$SQLITE_DB" != "/config/"* ]]; then
+    echo "Found source SQLite database for migration: $SQLITE_DB"
 fi
 PG_HOST="${PLEX_PG_HOST:-postgres}"
 PG_PORT="${PLEX_PG_PORT:-5432}"
