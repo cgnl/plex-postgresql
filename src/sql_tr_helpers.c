@@ -79,7 +79,7 @@ char* str_replace(const char *str, const char *old, const char *new_str) {
 }
 
 // ============================================================================
-// String Replace (case-insensitive)
+// String Replace (case-insensitive) - Single-pass optimized
 // ============================================================================
 
 char* str_replace_nocase(const char *str, const char *old, const char *new_str) {
@@ -104,34 +104,58 @@ char* str_replace_nocase(const char *str, const char *old, const char *new_str) 
     if (!found_first) return strdup(str);
 
     size_t new_len = strlen(new_str);
-
-    // Count occurrences first (case insensitive)
-    int count = 0;
-    const char *p = str;
-    while ((p = strcasestr(p, old)) != NULL) {
-        count++;
-        p += old_len;
-    }
-
-    if (count == 0) return strdup(str);
-
-    // Allocate exact size needed
     size_t str_len = strlen(str);
-    size_t result_len = str_len + count * ((ssize_t)new_len - (ssize_t)old_len) + 1;
-    char *result = malloc(result_len);
+
+    // Estimate buffer size (assume max 8 replacements, expand if needed)
+    size_t diff = (new_len > old_len) ? (new_len - old_len) : 0;
+    size_t buf_size = str_len + 8 * diff + 64;
+    char *result = malloc(buf_size);
     if (!result) return NULL;
 
     char *out = result;
-    p = str;
+    const char *p = str;
+    const char *match;
 
-    while (*p) {
-        if (strncasecmp(p, old, old_len) == 0) {
-            memcpy(out, new_str, new_len);
-            out += new_len;
-            p += old_len;
-        } else {
-            *out++ = *p++;
+    // Single pass: find matches with strcasestr, copy segments with memcpy
+    while ((match = strcasestr(p, old)) != NULL) {
+        // Copy everything before the match
+        size_t prefix_len = match - p;
+        if (prefix_len > 0) {
+            // Check if we need to expand buffer
+            size_t used = out - result;
+            size_t needed = used + prefix_len + new_len + (str_len - (match - str)) + 1;
+            if (needed > buf_size) {
+                buf_size = needed + 64;
+                char *new_buf = realloc(result, buf_size);
+                if (!new_buf) { free(result); return NULL; }
+                out = new_buf + used;
+                result = new_buf;
+            }
+            memcpy(out, p, prefix_len);
+            out += prefix_len;
         }
+
+        // Copy replacement
+        memcpy(out, new_str, new_len);
+        out += new_len;
+
+        // Move past the match
+        p = match + old_len;
+    }
+
+    // Copy remainder (after last match)
+    size_t remainder = strlen(p);
+    if (remainder > 0) {
+        size_t used = out - result;
+        if (used + remainder + 1 > buf_size) {
+            buf_size = used + remainder + 1;
+            char *new_buf = realloc(result, buf_size);
+            if (!new_buf) { free(result); return NULL; }
+            out = new_buf + used;
+            result = new_buf;
+        }
+        memcpy(out, p, remainder);
+        out += remainder;
     }
     *out = '\0';
 
