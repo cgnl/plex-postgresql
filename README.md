@@ -26,20 +26,25 @@ SQLite is great for most Plex installations, but has one major limitation: **dat
 
 Real-world test: **Plex + Kometa + PMM + 4 concurrent streams** (7 separate processes, 15 seconds):
 
-| Metric | SQLite | PostgreSQL |
-|--------|--------|------------|
-| **Write Errors** | **281,095** | **0** |
-| Playback write success rate | 0% | 100% |
-| Kometa errors | 140,817 | 0 |
-| PMM errors | 135,080 | 0 |
+| Metric | SQLite | PostgreSQL (TCP) | PostgreSQL (Socket) |
+|--------|--------|------------------|---------------------|
+| Total Writes | 727,330 | 25,851 | 27,543 |
+| **Write Errors** | **592,664 (81%)** | **0** | **0** |
+| Total Reads | 5,173 | 1,115 | 1,121 |
+| Read Errors | 0 | 0 | 0 |
 
 **What this means:**
-- SQLite: Watch progress not saved during scans (100% failure)
-- SQLite: ~1.1 million errors per minute under load
+- SQLite: 81% of writes fail due to database locking
+- SQLite: ~2.4 million errors per minute under load
 - PostgreSQL: Zero errors, everything works simultaneously
+- Unix socket: ~6% faster than TCP (negligible for most setups)
 
 Run the benchmark yourself:
 ```bash
+# Test with Unix socket (recommended for local PostgreSQL)
+PLEX_PG_SOCKET=/tmp python3 scripts/benchmark_multiprocess.py
+
+# Test with TCP only
 python3 scripts/benchmark_multiprocess.py
 ```
 
@@ -198,7 +203,7 @@ docker exec plex-postgresql bash -c '
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PLEX_PG_HOST` | localhost | PostgreSQL host |
+| `PLEX_PG_HOST` | localhost | PostgreSQL host (or socket directory like `/tmp`) |
 | `PLEX_PG_PORT` | 5432 | PostgreSQL port |
 | `PLEX_PG_DATABASE` | plex | Database name |
 | `PLEX_PG_USER` | plex | Database user |
@@ -206,6 +211,20 @@ docker exec plex-postgresql bash -c '
 | `PLEX_PG_SCHEMA` | plex | Schema name |
 | `PLEX_PG_POOL_SIZE` | 50 | Connection pool size (max 100) |
 | `PLEX_PG_LOG_LEVEL` | 1 | 0=ERROR, 1=INFO, 2=DEBUG |
+
+### Unix Socket vs TCP
+
+For local PostgreSQL, Unix sockets are ~5-6% faster than TCP:
+
+```bash
+# Use Unix socket (recommended for local PostgreSQL)
+export PLEX_PG_HOST=/tmp  # or /var/run/postgresql on Linux
+
+# Use TCP (required for remote PostgreSQL)
+export PLEX_PG_HOST=localhost
+```
+
+The performance difference is minimal - the real benefit of PostgreSQL is zero locking, not connection speed.
 
 ## How It Works
 
@@ -291,20 +310,24 @@ make benchmark           # Shim component micro-benchmarks
 
 ### Benchmarks
 
-Compare SQLite vs PostgreSQL performance:
+Compare SQLite vs PostgreSQL (TCP and Unix socket) performance:
 
 ```bash
 # Multi-process stress test (the definitive proof)
-python3 scripts/benchmark_multiprocess.py
+PLEX_PG_SOCKET=/tmp python3 scripts/benchmark_multiprocess.py
 
-# Library scan + playback simulation
-python3 scripts/benchmark_plex_stress.py
+# Library scan + playback simulation  
+PLEX_PG_SOCKET=/tmp python3 scripts/benchmark_plex_stress.py
 
 # Concurrent writers test
-python3 scripts/benchmark_locking.py
+PLEX_PG_SOCKET=/tmp python3 scripts/benchmark_locking.py
 
 # Query performance comparison
 python3 scripts/benchmark_compare.py
+
+# Bash benchmark (use --socket for Unix socket mode)
+./scripts/benchmark.sh           # TCP mode
+./scripts/benchmark.sh --socket  # Unix socket mode
 ```
 
 The stack protection test validates all protection layers by simulating low-stack conditions without running Plex.

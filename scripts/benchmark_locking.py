@@ -44,14 +44,24 @@ def find_plex_db():
             return str(p)
     return None
 
-PG_CONFIG = {
-    "host": os.environ.get("PLEX_PG_HOST", "localhost"),
-    "port": int(os.environ.get("PLEX_PG_PORT", 5432)),
-    "database": os.environ.get("PLEX_PG_DATABASE", "plex"),
-    "user": os.environ.get("PLEX_PG_USER", "plex"),
-    "password": os.environ.get("PLEX_PG_PASSWORD", "plex"),
-}
+# PostgreSQL connection config
+PG_HOST = os.environ.get("PLEX_PG_HOST", "localhost")
+PG_PORT = int(os.environ.get("PLEX_PG_PORT", 5432))
+PG_SOCKET = os.environ.get("PLEX_PG_SOCKET", "/var/run/postgresql")
+PG_DATABASE = os.environ.get("PLEX_PG_DATABASE", "plex")
+PG_USER = os.environ.get("PLEX_PG_USER", "plex")
+PG_PASSWORD = os.environ.get("PLEX_PG_PASSWORD", "plex")
 PG_SCHEMA = os.environ.get("PLEX_PG_SCHEMA", "plex")
+
+def get_pg_config(use_socket: bool = False) -> dict:
+    """Get PostgreSQL connection config for TCP or Unix socket."""
+    if use_socket:
+        return {"host": PG_SOCKET, "database": PG_DATABASE, "user": PG_USER, "password": PG_PASSWORD}
+    return {"host": PG_HOST, "port": PG_PORT, "database": PG_DATABASE, "user": PG_USER, "password": PG_PASSWORD}
+
+def check_socket_available() -> bool:
+    """Check if Unix socket is available."""
+    return (Path(PG_SOCKET) / f".s.PGSQL.{PG_PORT}").exists()
 
 def test_sqlite_locking(db_path, write_duration=3):
     """Test SQLite behavior during long write transaction"""
@@ -133,7 +143,7 @@ def test_postgresql_locking(write_duration=3):
     read_errors = []
     writer_done = threading.Event()
 
-    pg_pool = pool.ThreadedConnectionPool(1, 10, **PG_CONFIG)
+    pg_pool = pool.ThreadedConnectionPool(1, 10, **get_pg_config())
 
     def writer():
         """Simulate library scan - long write transaction"""
@@ -255,7 +265,7 @@ def test_pg_concurrent_writers(write_duration=3, num_writers=3):
     print(f"\n{YELLOW}[PostgreSQL: {num_writers} Concurrent Writers]{NC}")
     print(f"  PostgreSQL handles multiple writers with row-level locking...")
 
-    pg_pool = pool.ThreadedConnectionPool(1, num_writers + 5, **PG_CONFIG)
+    pg_pool = pool.ThreadedConnectionPool(1, num_writers + 5, **get_pg_config())
 
     # Setup
     conn = pg_pool.getconn()

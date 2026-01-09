@@ -21,20 +21,41 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # Config
-PG_HOST="${1:-localhost}"
+PG_HOST="${PLEX_PG_HOST:-localhost}"
 PG_PORT="${PLEX_PG_PORT:-5432}"
+PG_SOCKET="${PLEX_PG_SOCKET:-/var/run/postgresql}"
 PG_USER="${PLEX_PG_USER:-plex}"
 PG_DB="${PLEX_PG_DATABASE:-plex}"
 PG_SCHEMA="${PLEX_PG_SCHEMA:-plex}"
 export PGPASSWORD="${PLEX_PG_PASSWORD:-plex}"
 
+# Check for socket or TCP mode
+USE_SOCKET=0
+if [[ "$1" == "--socket" ]] || [[ "$1" == "-s" ]]; then
+    USE_SOCKET=1
+    shift
+fi
+
+# Override host if provided as argument
+if [[ -n "$1" ]]; then
+    PG_HOST="$1"
+fi
+
 echo -e "${BLUE}=== plex-postgresql Benchmark ===${NC}"
 echo ""
-echo "Target: $PG_HOST:$PG_PORT/$PG_DB (schema: $PG_SCHEMA)"
+
+if [[ $USE_SOCKET -eq 1 ]]; then
+    echo "Mode: Unix Socket ($PG_SOCKET)"
+    PSQL_HOST_ARGS="-h $PG_SOCKET"
+else
+    echo "Mode: TCP/IP ($PG_HOST:$PG_PORT)"
+    PSQL_HOST_ARGS="-h $PG_HOST -p $PG_PORT"
+fi
+echo "Database: $PG_DB (schema: $PG_SCHEMA)"
 echo ""
 
 # Check PostgreSQL connection
-if ! pg_isready -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
+if ! pg_isready $PSQL_HOST_ARGS -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; then
     echo -e "${RED}ERROR: Cannot connect to PostgreSQL${NC}"
     echo "Make sure PostgreSQL is running and accessible."
     exit 1
@@ -44,7 +65,7 @@ echo -e "${GREEN}✓ PostgreSQL connection OK${NC}"
 echo ""
 
 # Create benchmark table if not exists
-psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -q <<EOF
+psql $PSQL_HOST_ARGS -U "$PG_USER" -d "$PG_DB" -q <<EOF
 CREATE SCHEMA IF NOT EXISTS $PG_SCHEMA;
 CREATE TABLE IF NOT EXISTS $PG_SCHEMA.benchmark_test (
     id SERIAL PRIMARY KEY,
@@ -72,7 +93,7 @@ ITERATIONS=1000
 
 START=$(python3 -c "import time; print(int(time.time() * 1000))")
 for i in $(seq 1 $ITERATIONS); do
-    psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -t -c "$QUERY" >/dev/null
+    psql $PSQL_HOST_ARGS -U "$PG_USER" -d "$PG_DB" -t -c "$QUERY" >/dev/null
 done
 END=$(python3 -c "import time; print(int(time.time() * 1000))")
 
@@ -100,7 +121,7 @@ ITERATIONS=100
 
 START=$(python3 -c "import time; print(int(time.time() * 1000))")
 for i in $(seq 1 $ITERATIONS); do
-    psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -t -c "$QUERY" >/dev/null
+    psql $PSQL_HOST_ARGS -U "$PG_USER" -d "$PG_DB" -t -c "$QUERY" >/dev/null
 done
 END=$(python3 -c "import time; print(int(time.time() * 1000))")
 
@@ -122,7 +143,7 @@ QUERIES_PER=100
 
 run_queries() {
     for i in $(seq 1 $QUERIES_PER); do
-        psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -t -c \
+        psql $PSQL_HOST_ARGS -U "$PG_USER" -d "$PG_DB" -t -c \
             "SELECT * FROM $PG_SCHEMA.benchmark_test WHERE id = $((RANDOM % 10000 + 1))" >/dev/null
     done
 }
@@ -152,7 +173,7 @@ ITERATIONS=1000
 
 START=$(python3 -c "import time; print(int(time.time() * 1000))")
 for i in $(seq 1 $ITERATIONS); do
-    psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -t -c \
+    psql $PSQL_HOST_ARGS -U "$PG_USER" -d "$PG_DB" -t -c \
         "INSERT INTO $PG_SCHEMA.benchmark_test (title, rating) VALUES ('Bench $i', $((RANDOM % 100)) / 10.0)" >/dev/null
 done
 END=$(python3 -c "import time; print(int(time.time() * 1000))")
@@ -176,7 +197,7 @@ ITERATIONS=500
 
 START=$(python3 -c "import time; print(int(time.time() * 1000))")
 for i in $(seq 1 $ITERATIONS); do
-    psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -t -c "$QUERY" >/dev/null
+    psql $PSQL_HOST_ARGS -U "$PG_USER" -d "$PG_DB" -t -c "$QUERY" >/dev/null
 done
 END=$(python3 -c "import time; print(int(time.time() * 1000))")
 
@@ -191,7 +212,7 @@ echo ""
 # ============================================================================
 # Cleanup
 # ============================================================================
-psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -q -c \
+psql $PSQL_HOST_ARGS -U "$PG_USER" -d "$PG_DB" -q -c \
     "DROP TABLE IF EXISTS $PG_SCHEMA.benchmark_test;"
 
 echo -e "${BLUE}=== Summary ===${NC}"

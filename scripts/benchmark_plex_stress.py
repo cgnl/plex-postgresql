@@ -50,14 +50,39 @@ def find_plex_db():
             return str(p)
     return None
 
-PG_CONFIG = {
-    "host": os.environ.get("PLEX_PG_HOST", "localhost"),
-    "port": int(os.environ.get("PLEX_PG_PORT", 5432)),
-    "database": os.environ.get("PLEX_PG_DATABASE", "plex"),
-    "user": os.environ.get("PLEX_PG_USER", "plex"),
-    "password": os.environ.get("PLEX_PG_PASSWORD", "plex"),
-}
+# PostgreSQL connection config
+# TCP/IP: set PLEX_PG_HOST to hostname (e.g., localhost or 127.0.0.1)
+# Unix socket: set PLEX_PG_SOCKET to socket directory (e.g., /var/run/postgresql or /tmp)
+PG_HOST = os.environ.get("PLEX_PG_HOST", "localhost")
+PG_PORT = int(os.environ.get("PLEX_PG_PORT", 5432))
+PG_SOCKET = os.environ.get("PLEX_PG_SOCKET", "/var/run/postgresql")
+PG_DATABASE = os.environ.get("PLEX_PG_DATABASE", "plex")
+PG_USER = os.environ.get("PLEX_PG_USER", "plex")
+PG_PASSWORD = os.environ.get("PLEX_PG_PASSWORD", "plex")
 PG_SCHEMA = os.environ.get("PLEX_PG_SCHEMA", "plex")
+
+def get_pg_config(use_socket: bool = False) -> dict:
+    """Get PostgreSQL connection config for TCP or Unix socket."""
+    if use_socket:
+        return {
+            "host": PG_SOCKET,  # Socket directory
+            "database": PG_DATABASE,
+            "user": PG_USER,
+            "password": PG_PASSWORD,
+        }
+    else:
+        return {
+            "host": PG_HOST,
+            "port": PG_PORT,
+            "database": PG_DATABASE,
+            "user": PG_USER,
+            "password": PG_PASSWORD,
+        }
+
+def check_socket_available() -> bool:
+    """Check if Unix socket is available."""
+    socket_file = Path(PG_SOCKET) / f".s.PGSQL.{PG_PORT}"
+    return socket_file.exists()
 
 @dataclass
 class StressResults:
@@ -259,11 +284,21 @@ def run_sqlite_stress(db_path: str, duration: int = 10, num_streams: int = 4) ->
     return results
 
 
-def run_postgresql_stress(duration: int = 10, num_streams: int = 4) -> StressResults:
+def run_postgresql_stress(duration: int = 10, num_streams: int = 4, use_socket: bool = False) -> StressResults:
     """
     Simulate heavy library scan + concurrent playback on PostgreSQL.
+    
+    Args:
+        duration: Test duration in seconds
+        num_streams: Number of concurrent playback streams
+        use_socket: Use Unix socket instead of TCP/IP
     """
-    print(f"\n{YELLOW}[PostgreSQL Stress Test]{NC}")
+    pg_config = get_pg_config(use_socket=use_socket)
+    conn_type = "Unix socket" if use_socket else "TCP/IP"
+    conn_detail = PG_SOCKET if use_socket else f"{PG_HOST}:{PG_PORT}"
+    
+    print(f"\n{YELLOW}[PostgreSQL Stress Test - {conn_type}]{NC}")
+    print(f"  Connection: {conn_type} ({conn_detail})")
     print(f"  Simulating: 2 scanners + {num_streams} streams + Kometa writes")
     print(f"  Duration: {duration}s")
     print(f"  PostgreSQL uses MVCC - no blocking between readers/writers...\n")
@@ -272,7 +307,7 @@ def run_postgresql_stress(duration: int = 10, num_streams: int = 4) -> StressRes
     stop_flag = threading.Event()
     lock = threading.Lock()
 
-    pg_pool = pool.ThreadedConnectionPool(1, num_streams + 10, **PG_CONFIG)  # 2 scanners + kometa + streams + margin
+    pg_pool = pool.ThreadedConnectionPool(1, num_streams + 10, **pg_config)  # 2 scanners + kometa + streams + margin
 
     # Create test tables
     conn = pg_pool.getconn()
@@ -475,37 +510,72 @@ def main():
     duration = 10  # seconds
     num_streams = 4  # concurrent streams
 
+    # Check if Unix socket is available
+    socket_available = check_socket_available()
+    
     print(f"\n{BLUE}{'─' * 70}{NC}")
     sqlite_results = run_sqlite_stress(db_path, duration, num_streams)
     print_results("SQLite", sqlite_results, YELLOW)
 
+    # Run PostgreSQL TCP test
     print(f"{BLUE}{'─' * 70}{NC}")
-    pg_results = run_postgresql_stress(duration, num_streams)
-    print_results("PostgreSQL", pg_results, CYAN)
+    pg_tcp_results = run_postgresql_stress(duration, num_streams, use_socket=False)
+    print_results("PostgreSQL (TCP)", pg_tcp_results, CYAN)
+
+    # Run PostgreSQL Unix socket test if available
+    pg_socket_results = None
+    if socket_available:
+        print(f"{BLUE}{'─' * 70}{NC}")
+        pg_socket_results = run_postgresql_stress(duration, num_streams, use_socket=True)
+        print_results("PostgreSQL (Socket)", pg_socket_results, GREEN)
+    else:
+        print(f"\n  {YELLOW}Unix socket not available at {PG_SOCKET}{NC}")
+        print(f"  {YELLOW}Skipping socket test. Set PLEX_PG_SOCKET to test.{NC}\n")
 
     # Summary
     print(f"{BLUE}{'═' * 70}{NC}")
     print(f"{BOLD}Summary:{NC}\n")
 
     sqlite_total = sqlite_results.scan_writes + sqlite_results.playback_reads + sqlite_results.playback_writes
-    pg_total = pg_results.scan_writes + pg_results.playback_reads + pg_results.playback_writes
+    pg_tcp_total = pg_tcp_results.scan_writes + pg_tcp_results.playback_reads + pg_tcp_results.playback_writes
     sqlite_errors = sqlite_results.scan_errors + sqlite_results.playback_read_errors + sqlite_results.playback_write_errors
-    pg_errors = pg_results.scan_errors + pg_results.playback_read_errors + pg_results.playback_write_errors
+    pg_tcp_errors = pg_tcp_results.scan_errors + pg_tcp_results.playback_read_errors + pg_tcp_results.playback_write_errors
 
-    print(f"  {'Database':<15} {'Total Ops':<15} {'Errors':<15} {'Error Rate':<15}")
-    print(f"  {'-'*55}")
+    print(f"  {'Database':<20} {'Total Ops':<12} {'Errors':<10} {'Error Rate':<12} {'Ops/sec':<10}")
+    print(f"  {'-'*65}")
+    
     sqlite_error_rate = 100 * sqlite_errors / max(sqlite_total + sqlite_errors, 1)
-    pg_error_rate = 100 * pg_errors / max(pg_total + pg_errors, 1)
-    print(f"  {'SQLite':<15} {sqlite_total:<15} {RED}{sqlite_errors:<15}{NC} {sqlite_error_rate:.1f}%")
-    print(f"  {'PostgreSQL':<15} {pg_total:<15} {GREEN}{pg_errors:<15}{NC} {pg_error_rate:.1f}%")
+    sqlite_ops_sec = sqlite_total / duration
+    print(f"  {'SQLite':<20} {sqlite_total:<12} {RED}{sqlite_errors:<10}{NC} {sqlite_error_rate:.1f}%{'':8} {sqlite_ops_sec:.0f}")
+    
+    pg_tcp_error_rate = 100 * pg_tcp_errors / max(pg_tcp_total + pg_tcp_errors, 1)
+    pg_tcp_ops_sec = pg_tcp_total / duration
+    print(f"  {'PostgreSQL (TCP)':<20} {pg_tcp_total:<12} {GREEN}{pg_tcp_errors:<10}{NC} {pg_tcp_error_rate:.1f}%{'':8} {pg_tcp_ops_sec:.0f}")
+    
+    if pg_socket_results:
+        pg_socket_total = pg_socket_results.scan_writes + pg_socket_results.playback_reads + pg_socket_results.playback_writes
+        pg_socket_errors = pg_socket_results.scan_errors + pg_socket_results.playback_read_errors + pg_socket_results.playback_write_errors
+        pg_socket_error_rate = 100 * pg_socket_errors / max(pg_socket_total + pg_socket_errors, 1)
+        pg_socket_ops_sec = pg_socket_total / duration
+        print(f"  {'PostgreSQL (Socket)':<20} {pg_socket_total:<12} {GREEN}{pg_socket_errors:<10}{NC} {pg_socket_error_rate:.1f}%{'':8} {pg_socket_ops_sec:.0f}")
+    
     print()
 
-    if pg_total > sqlite_total:
-        speedup = pg_total / sqlite_total if sqlite_total > 0 else float('inf')
-        print(f"  {GREEN}PostgreSQL: {speedup:.1f}x more operations completed!{NC}")
+    # Comparison
+    if pg_tcp_total > sqlite_total:
+        speedup = pg_tcp_total / sqlite_total if sqlite_total > 0 else float('inf')
+        print(f"  {GREEN}PostgreSQL TCP: {speedup:.1f}x more operations than SQLite{NC}")
 
-    if sqlite_errors > pg_errors:
-        print(f"  {GREEN}PostgreSQL: {sqlite_errors - pg_errors} fewer errors (no database locking){NC}")
+    if pg_socket_results:
+        pg_socket_total = pg_socket_results.scan_writes + pg_socket_results.playback_reads + pg_socket_results.playback_writes
+        if pg_socket_total > pg_tcp_total:
+            socket_speedup = pg_socket_total / pg_tcp_total if pg_tcp_total > 0 else float('inf')
+            print(f"  {GREEN}Unix Socket: {socket_speedup:.2f}x faster than TCP{NC}")
+        else:
+            print(f"  {YELLOW}Unix Socket: similar performance to TCP (network not bottleneck){NC}")
+
+    if sqlite_errors > pg_tcp_errors:
+        print(f"  {GREEN}PostgreSQL: {sqlite_errors - pg_tcp_errors} fewer errors (no database locking){NC}")
 
     print()
     print(f"  {CYAN}What this means for rclone/Real-Debrid users:{NC}")

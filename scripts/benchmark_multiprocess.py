@@ -49,14 +49,37 @@ def find_plex_db():
             return str(p)
     return None
 
-PG_CONFIG = {
-    "host": os.environ.get("PLEX_PG_HOST", "localhost"),
-    "port": int(os.environ.get("PLEX_PG_PORT", 5432)),
-    "database": os.environ.get("PLEX_PG_DATABASE", "plex"),
-    "user": os.environ.get("PLEX_PG_USER", "plex"),
-    "password": os.environ.get("PLEX_PG_PASSWORD", "plex"),
-}
+# PostgreSQL connection config
+PG_HOST = os.environ.get("PLEX_PG_HOST", "localhost")
+PG_PORT = int(os.environ.get("PLEX_PG_PORT", 5432))
+PG_SOCKET = os.environ.get("PLEX_PG_SOCKET", "/var/run/postgresql")
+PG_DATABASE = os.environ.get("PLEX_PG_DATABASE", "plex")
+PG_USER = os.environ.get("PLEX_PG_USER", "plex")
+PG_PASSWORD = os.environ.get("PLEX_PG_PASSWORD", "plex")
 PG_SCHEMA = os.environ.get("PLEX_PG_SCHEMA", "plex")
+
+def get_pg_config(use_socket: bool = False) -> dict:
+    """Get PostgreSQL connection config for TCP or Unix socket."""
+    if use_socket:
+        return {
+            "host": PG_SOCKET,
+            "database": PG_DATABASE,
+            "user": PG_USER,
+            "password": PG_PASSWORD,
+        }
+    else:
+        return {
+            "host": PG_HOST,
+            "port": PG_PORT,
+            "database": PG_DATABASE,
+            "user": PG_USER,
+            "password": PG_PASSWORD,
+        }
+
+def check_socket_available() -> bool:
+    """Check if Unix socket is available."""
+    socket_file = Path(PG_SOCKET) / f".s.PGSQL.{PG_PORT}"
+    return socket_file.exists()
 
 
 # ============================================================================
@@ -223,13 +246,13 @@ def sqlite_playback_worker(db_path: str, duration: int, stream_id: int, result_q
 # PostgreSQL Multi-Process Workers
 # ============================================================================
 
-def pg_plex_scanner(duration: int, result_queue: mp.Queue):
+def pg_plex_scanner(duration: int, result_queue: mp.Queue, pg_config: dict):
     """Simulate Plex scanner on PostgreSQL - SEPARATE PROCESS"""
     import random
     writes = 0
     errors = 0
 
-    conn = psycopg2.connect(**PG_CONFIG)
+    conn = psycopg2.connect(**pg_config)
     cur = conn.cursor()
     # Table created in setup phase
 
@@ -252,13 +275,13 @@ def pg_plex_scanner(duration: int, result_queue: mp.Queue):
     result_queue.put(("plex_scanner", writes, errors))
 
 
-def pg_kometa_worker(duration: int, result_queue: mp.Queue):
+def pg_kometa_worker(duration: int, result_queue: mp.Queue, pg_config: dict):
     """Simulate Kometa on PostgreSQL - SEPARATE PROCESS"""
     import random
     writes = 0
     errors = 0
 
-    conn = psycopg2.connect(**PG_CONFIG)
+    conn = psycopg2.connect(**pg_config)
     cur = conn.cursor()
 
     end_time = time.time() + duration
@@ -280,13 +303,13 @@ def pg_kometa_worker(duration: int, result_queue: mp.Queue):
     result_queue.put(("kometa", writes, errors))
 
 
-def pg_pmm_worker(duration: int, result_queue: mp.Queue):
+def pg_pmm_worker(duration: int, result_queue: mp.Queue, pg_config: dict):
     """Simulate PMM on PostgreSQL - SEPARATE PROCESS"""
     import random
     writes = 0
     errors = 0
 
-    conn = psycopg2.connect(**PG_CONFIG)
+    conn = psycopg2.connect(**pg_config)
     cur = conn.cursor()
 
     end_time = time.time() + duration
@@ -308,7 +331,7 @@ def pg_pmm_worker(duration: int, result_queue: mp.Queue):
     result_queue.put(("pmm", writes, errors))
 
 
-def pg_playback_worker(duration: int, stream_id: int, result_queue: mp.Queue):
+def pg_playback_worker(duration: int, stream_id: int, result_queue: mp.Queue, pg_config: dict):
     """Simulate playback on PostgreSQL - SEPARATE PROCESS"""
     import random
     reads = 0
@@ -316,7 +339,7 @@ def pg_playback_worker(duration: int, stream_id: int, result_queue: mp.Queue):
     writes = 0
     write_errors = 0
 
-    conn = psycopg2.connect(**PG_CONFIG)
+    conn = psycopg2.connect(**pg_config)
     cur = conn.cursor()
     # Table created in setup phase, just start working
 
@@ -407,15 +430,20 @@ def run_sqlite_multiprocess_test(db_path: str, duration: int = 15) -> dict:
     return results
 
 
-def run_postgresql_multiprocess_test(duration: int = 15) -> dict:
+def run_postgresql_multiprocess_test(duration: int = 15, use_socket: bool = False) -> dict:
     """Run PostgreSQL test with multiple separate processes"""
-    print(f"\n{YELLOW}[PostgreSQL Multi-Process Test]{NC}")
+    pg_config = get_pg_config(use_socket=use_socket)
+    conn_type = "Unix socket" if use_socket else "TCP/IP"
+    conn_detail = PG_SOCKET if use_socket else f"{PG_HOST}:{PG_PORT}"
+    
+    print(f"\n{YELLOW}[PostgreSQL Multi-Process Test - {conn_type}]{NC}")
+    print(f"  Connection: {conn_type} ({conn_detail})")
     print(f"  Spawning separate processes for: Plex Scanner, Kometa, PMM, 4 Streams")
     print(f"  Duration: {duration}s")
     print(f"  {GREEN}PostgreSQL: All processes can write simultaneously (MVCC){NC}\n")
 
     # Setup tables before spawning processes (avoid race condition)
-    conn = psycopg2.connect(**PG_CONFIG)
+    conn = psycopg2.connect(**pg_config)
     cur = conn.cursor()
     cur.execute(f"DROP TABLE IF EXISTS {PG_SCHEMA}.mp_stress_scan CASCADE")
     cur.execute(f"DROP TABLE IF EXISTS {PG_SCHEMA}.mp_stress_progress CASCADE")
@@ -437,12 +465,12 @@ def run_postgresql_multiprocess_test(duration: int = 15) -> dict:
     result_queue = mp.Queue()
 
     processes = [
-        mp.Process(target=pg_plex_scanner, args=(duration, result_queue)),
-        mp.Process(target=pg_kometa_worker, args=(duration, result_queue)),
-        mp.Process(target=pg_pmm_worker, args=(duration, result_queue)),
+        mp.Process(target=pg_plex_scanner, args=(duration, result_queue, pg_config)),
+        mp.Process(target=pg_kometa_worker, args=(duration, result_queue, pg_config)),
+        mp.Process(target=pg_pmm_worker, args=(duration, result_queue, pg_config)),
     ]
     for i in range(4):
-        processes.append(mp.Process(target=pg_playback_worker, args=(duration, i, result_queue)))
+        processes.append(mp.Process(target=pg_playback_worker, args=(duration, i, result_queue, pg_config)))
 
     start = time.time()
     for p in processes:
@@ -470,7 +498,7 @@ def run_postgresql_multiprocess_test(duration: int = 15) -> dict:
     results["elapsed"] = elapsed
 
     # Cleanup
-    conn = psycopg2.connect(**PG_CONFIG)
+    conn = psycopg2.connect(**pg_config)
     cur = conn.cursor()
     cur.execute(f"DROP TABLE IF EXISTS {PG_SCHEMA}.mp_stress_scan")
     cur.execute(f"DROP TABLE IF EXISTS {PG_SCHEMA}.mp_stress_progress")
@@ -500,40 +528,64 @@ def main():
     duration = 15  # seconds
 
     sqlite_results = run_sqlite_multiprocess_test(db_path, duration)
-    pg_results = run_postgresql_multiprocess_test(duration)
+    
+    # Check socket availability
+    socket_available = check_socket_available()
+    
+    pg_tcp_results = run_postgresql_multiprocess_test(duration, use_socket=False)
+    pg_socket_results = None
+    if socket_available:
+        pg_socket_results = run_postgresql_multiprocess_test(duration, use_socket=True)
+    else:
+        print(f"\n  {YELLOW}Unix socket not available at {PG_SOCKET}, skipping socket test{NC}")
 
     # Summary
     print(f"\n{BLUE}{'═' * 72}{NC}")
     print(f"{BOLD}RESULTS SUMMARY{NC}\n")
 
-    print(f"  {'Metric':<25} {'SQLite':<20} {'PostgreSQL':<20}")
-    print(f"  {'-'*65}")
-    print(f"  {'Total Writes':<25} {sqlite_results['writes']:<20} {pg_results['writes']:<20}")
-    print(f"  {'Write Errors':<25} {RED}{sqlite_results['write_errors']:<20}{NC} {GREEN}{pg_results['write_errors']:<20}{NC}")
-    print(f"  {'Total Reads':<25} {sqlite_results['reads']:<20} {pg_results['reads']:<20}")
-    print(f"  {'Read Errors':<25} {RED}{sqlite_results['read_errors']:<20}{NC} {GREEN}{pg_results['read_errors']:<20}{NC}")
+    print(f"  {'Metric':<25} {'SQLite':<15} {'PG (TCP)':<15} {'PG (Socket)':<15}")
+    print(f"  {'-'*70}")
+    pg_socket_writes = pg_socket_results['writes'] if pg_socket_results else '-'
+    pg_socket_write_err = pg_socket_results['write_errors'] if pg_socket_results else '-'
+    pg_socket_reads = pg_socket_results['reads'] if pg_socket_results else '-'
+    pg_socket_read_err = pg_socket_results['read_errors'] if pg_socket_results else '-'
+    print(f"  {'Total Writes':<25} {sqlite_results['writes']:<15} {pg_tcp_results['writes']:<15} {pg_socket_writes:<15}")
+    print(f"  {'Write Errors':<25} {RED}{sqlite_results['write_errors']:<15}{NC} {GREEN}{pg_tcp_results['write_errors']:<15}{NC} {GREEN}{pg_socket_write_err}{NC}")
+    print(f"  {'Total Reads':<25} {sqlite_results['reads']:<15} {pg_tcp_results['reads']:<15} {pg_socket_reads:<15}")
+    print(f"  {'Read Errors':<25} {RED}{sqlite_results['read_errors']:<15}{NC} {GREEN}{pg_tcp_results['read_errors']:<15}{NC} {GREEN}{pg_socket_read_err}{NC}")
 
     total_sqlite_errors = sqlite_results['write_errors'] + sqlite_results['read_errors']
-    total_pg_errors = pg_results['write_errors'] + pg_results['read_errors']
+    total_pg_tcp_errors = pg_tcp_results['write_errors'] + pg_tcp_results['read_errors']
+    total_pg_socket_errors = (pg_socket_results['write_errors'] + pg_socket_results['read_errors']) if pg_socket_results else 0
 
     print()
     print(f"  {BOLD}Total Errors:{NC}")
-    print(f"    SQLite:     {RED}{total_sqlite_errors}{NC}")
-    print(f"    PostgreSQL: {GREEN}{total_pg_errors}{NC}")
+    print(f"    SQLite:            {RED}{total_sqlite_errors}{NC}")
+    print(f"    PostgreSQL (TCP):  {GREEN}{total_pg_tcp_errors}{NC}")
+    if pg_socket_results:
+        print(f"    PostgreSQL (Socket): {GREEN}{total_pg_socket_errors}{NC}")
 
-    if total_sqlite_errors > total_pg_errors:
-        error_reduction = total_sqlite_errors - total_pg_errors
+    if total_sqlite_errors > total_pg_tcp_errors:
+        error_reduction = total_sqlite_errors - total_pg_tcp_errors
         if total_sqlite_errors > 0:
             pct = 100 * error_reduction / total_sqlite_errors
             print(f"\n  {GREEN}PostgreSQL: {pct:.0f}% fewer errors ({error_reduction} fewer failures){NC}")
 
+    # Compare TCP vs Socket throughput
+    if pg_socket_results:
+        tcp_ops = pg_tcp_results['writes'] + pg_tcp_results['reads']
+        socket_ops = pg_socket_results['writes'] + pg_socket_results['reads']
+        if socket_ops > tcp_ops:
+            speedup = socket_ops / tcp_ops
+            print(f"  {GREEN}Unix Socket: {speedup:.2f}x faster than TCP{NC}")
+
     # Error rate per minute (extrapolated)
     sqlite_errors_per_min = total_sqlite_errors * 60 / duration
-    pg_errors_per_min = total_pg_errors * 60 / duration
+    pg_tcp_errors_per_min = total_pg_tcp_errors * 60 / duration
 
     print(f"\n  {CYAN}Projected error rate:{NC}")
-    print(f"    SQLite:     {RED}{sqlite_errors_per_min:.0f} errors/minute{NC}")
-    print(f"    PostgreSQL: {GREEN}{pg_errors_per_min:.0f} errors/minute{NC}")
+    print(f"    SQLite:           {RED}{sqlite_errors_per_min:.0f} errors/minute{NC}")
+    print(f"    PostgreSQL (TCP): {GREEN}{pg_tcp_errors_per_min:.0f} errors/minute{NC}")
 
     if sqlite_errors_per_min > 0:
         hourly = sqlite_errors_per_min * 60
