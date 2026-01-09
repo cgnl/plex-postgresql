@@ -369,11 +369,14 @@ void pg_stmt_ref(pg_stmt_t *stmt) {
 void pg_stmt_unref(pg_stmt_t *stmt) {
     if (!stmt) return;
     int old = atomic_fetch_sub(&stmt->ref_count, 1);
+    LOG_DEBUG("pg_stmt_unref: stmt=%p old_ref=%d sql=%.40s", 
+              (void*)stmt, old, stmt->sql ? stmt->sql : "NULL");
     if (old == 1) {
         // Last reference - actually free
         pg_stmt_free(stmt);
     } else if (old <= 0) {
-        LOG_ERROR("pg_stmt_unref: ref_count was %d, possible double-free!", old);
+        LOG_ERROR("pg_stmt_unref: ref_count was %d, possible double-free! stmt=%p sql=%.40s", 
+                  old, (void*)stmt, stmt->sql ? stmt->sql : "NULL");
     }
 }
 
@@ -390,19 +393,29 @@ void pg_stmt_free(pg_stmt_t *stmt) {
     if (stmt->pg_sql && stmt->pg_sql != stmt->sql) free(stmt->pg_sql);
     if (stmt->result) PQclear(stmt->result);
 
-    for (int i = 0; i < stmt->param_count; i++) {
+    // Validate param_count to prevent out-of-bounds access
+    int safe_param_count = stmt->param_count;
+    if (safe_param_count < 0) safe_param_count = 0;
+    if (safe_param_count > MAX_PARAMS) safe_param_count = MAX_PARAMS;
+
+    for (int i = 0; i < safe_param_count; i++) {
         // Only free if not pointing to pre-allocated buffer
         if (stmt->param_values[i] && !is_preallocated_buffer(stmt, i)) {
             free(stmt->param_values[i]);
+            stmt->param_values[i] = NULL;  // Prevent double-free
         }
     }
 
     // Free parameter names (for named parameter mapping)
     if (stmt->param_names) {
-        for (int i = 0; i < stmt->param_count; i++) {
-            if (stmt->param_names[i]) free(stmt->param_names[i]);
+        for (int i = 0; i < safe_param_count; i++) {
+            if (stmt->param_names[i]) {
+                free(stmt->param_names[i]);
+                stmt->param_names[i] = NULL;  // Prevent double-free
+            }
         }
         free(stmt->param_names);
+        stmt->param_names = NULL;
     }
 
     // Free decoded blob cache
@@ -435,6 +448,8 @@ void pg_stmt_clear_result(pg_stmt_t *stmt) {
         PQclear(stmt->result);
         stmt->result = NULL;
     }
+    // Clear cached result pointer (cache entry lives in TLS, not freed here)
+    stmt->cached_result = NULL;
     stmt->current_row = -1;
     stmt->num_rows = 0;
     stmt->num_cols = 0;

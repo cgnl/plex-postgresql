@@ -5,6 +5,91 @@
  */
 
 #include "db_interpose.h"
+#include <time.h>
+
+// ============================================================================
+// Query Loop Detection
+// ============================================================================
+// Plex can get into infinite query loops (e.g., OnDeck with many views).
+// We detect this by tracking recent query hashes and breaking the loop.
+
+#define LOOP_DETECT_WINDOW_MS 1000   // 1 second window
+#define LOOP_DETECT_THRESHOLD 100    // Max same query in window before breaking
+
+typedef struct {
+    uint32_t hash;
+    uint64_t first_seen_ms;
+    int count;
+} query_loop_entry_t;
+
+#define LOOP_DETECT_SLOTS 16
+static __thread query_loop_entry_t loop_detect[LOOP_DETECT_SLOTS];
+static __thread int loop_detect_initialized = 0;
+
+static uint32_t simple_hash(const char *str, int max_len) {
+    uint32_t hash = 5381;
+    int len = 0;
+    while (*str && len < max_len) {
+        hash = ((hash << 5) + hash) + (unsigned char)*str++;
+        len++;
+    }
+    return hash;
+}
+
+static uint64_t get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Returns 1 if query loop detected and should be broken
+static int detect_query_loop(const char *sql) {
+    if (!sql) return 0;
+    
+    if (!loop_detect_initialized) {
+        memset(loop_detect, 0, sizeof(loop_detect));
+        loop_detect_initialized = 1;
+    }
+    
+    uint32_t hash = simple_hash(sql, 200);  // Hash first 200 chars
+    uint64_t now = get_time_ms();
+    int slot = hash % LOOP_DETECT_SLOTS;
+    
+    query_loop_entry_t *entry = &loop_detect[slot];
+    
+    // Check if same query hash
+    if (entry->hash == hash) {
+        // Check if within time window
+        if (now - entry->first_seen_ms < LOOP_DETECT_WINDOW_MS) {
+            entry->count++;
+            if (entry->count >= LOOP_DETECT_THRESHOLD) {
+                // Only log every 10th detection to reduce spam
+                static __thread int log_counter = 0;
+                if (log_counter++ % 10 == 0) {
+                    LOG_ERROR("LOOP DETECTED: query called %d times in %llu ms (logged 1/10)",
+                             entry->count, (unsigned long long)(now - entry->first_seen_ms));
+                }
+                // Reset for next detection
+                entry->count = 0;
+                entry->first_seen_ms = now;
+                // Don't break - Plex crashes on empty results
+                // The prepared statement caching makes the queries fast anyway
+                return 0;
+            }
+        } else {
+            // Window expired, reset
+            entry->first_seen_ms = now;
+            entry->count = 1;
+        }
+    } else {
+        // Different query, reset slot
+        entry->hash = hash;
+        entry->first_seen_ms = now;
+        entry->count = 1;
+    }
+    
+    return 0;
+}
 
 // ============================================================================
 // Helper Functions
@@ -89,6 +174,18 @@ char* simplify_fts_for_sqlite(const char *sql) {
 int my_sqlite3_prepare_v2_internal(sqlite3 *db, const char *zSql, int nByte,
                                    sqlite3_stmt **ppStmt, const char **pzTail,
                                    int from_worker) {
+    // LOOP DETECTION: Break infinite query loops (e.g., OnDeck with many views)
+    if (zSql && detect_query_loop(zSql)) {
+        // Return empty result to break the loop
+        if (real_sqlite3_prepare_v2) {
+            int rc = real_sqlite3_prepare_v2(db, "SELECT 1 WHERE 0", -1, ppStmt, pzTail);
+            return rc;
+        }
+        if (ppStmt) *ppStmt = NULL;
+        if (pzTail) *pzTail = NULL;
+        return SQLITE_OK;
+    }
+
     // CRITICAL: Track recursion depth to prevent infinite loops
     // SQLite can internally call prepare_v2 again, creating deep recursion
     prepare_v2_depth++;
@@ -150,14 +247,44 @@ int my_sqlite3_prepare_v2_internal(sqlite3 *db, const char *zSql, int nByte,
         strcasestr(zSql, "grandparentsSettings")
     );
 
+    // For OnDeck queries with low stack, use PostgreSQL path with minimal stack
+    // This avoids the "return empty" workaround that breaks functionality
     if (is_ondeck_query && stack_remaining < 100000) {
-        LOG_ERROR("STACK CRITICAL: OnDeck-pattern query with %ld bytes remaining - returning empty",
+        LOG_INFO("STACK LOW OnDeck: %ld bytes remaining - using PG fast path",
                  (long)stack_remaining);
-        LOG_ERROR("  This prevents dyld crash during Metal framework loading after query");
-        LOG_ERROR("  Query: %.200s", zSql);
-
-        // Return empty result set instead of executing query
-        // Plex will show empty "On Deck" instead of crashing the server
+        
+        pg_connection_t *pg_conn = pg_find_connection(db);
+        if (pg_conn && pg_conn->is_pg_active && pg_conn->conn) {
+            // Prepare minimal SQLite statement, route to PostgreSQL
+            int rc;
+            if (real_sqlite3_prepare_v2) {
+                rc = real_sqlite3_prepare_v2(db, "SELECT 1", -1, ppStmt, pzTail);
+            } else {
+                rc = SQLITE_ERROR;
+                if (ppStmt) *ppStmt = NULL;
+            }
+            
+            if (rc == SQLITE_OK && *ppStmt) {
+                pg_stmt_t *pg_stmt = pg_stmt_create(pg_conn, zSql, *ppStmt);
+                if (pg_stmt) {
+                    pg_stmt->is_pg = 2;  // read operation
+                    
+                    // Translate query for PostgreSQL
+                    sql_translation_t trans = sql_translate(zSql);
+                    if (trans.success && trans.sql) {
+                        pg_stmt->pg_sql = strdup(trans.sql);
+                        pg_stmt->param_count = trans.param_count;
+                        LOG_INFO("STACK LOW OnDeck: routed to PG: %.100s", trans.sql);
+                    }
+                    sql_translation_free(&trans);
+                }
+            }
+            prepare_v2_depth--;
+            return rc;
+        }
+        
+        // No PG connection - fall back to empty result
+        LOG_ERROR("STACK CRITICAL OnDeck: no PG connection, returning empty");
         int rc;
         if (real_sqlite3_prepare_v2) {
             rc = real_sqlite3_prepare_v2(db, "SELECT 1 WHERE 0", -1, ppStmt, pzTail);
@@ -302,7 +429,8 @@ int my_sqlite3_prepare_v2_internal(sqlite3 *db, const char *zSql, int nByte,
         cleaned_sql = simplify_fts_for_sqlite(zSql);
         if (cleaned_sql) {
             sql_for_sqlite = cleaned_sql;
-            LOG_INFO("FTS query simplified for SQLite: %.1000s", zSql);
+            LOG_INFO("FTS query ORIGINAL: %.500s", zSql);
+            LOG_INFO("FTS query SIMPLIFIED: %.500s", cleaned_sql);
         }
     }
 
@@ -324,6 +452,19 @@ int my_sqlite3_prepare_v2_internal(sqlite3 *db, const char *zSql, int nByte,
             if (cleaned_sql) free(cleaned_sql);
             cleaned_sql = temp;
             sql_for_sqlite = cleaned_sql;
+        }
+    }
+
+    // CRITICAL FIX: If query still contains FTS after simplification, use empty result
+    // SQLite's FTS virtual tables use ICU tokenizer which isn't available
+    // This causes "unknown tokenizer: collating" error
+    if (strcasestr(sql_for_sqlite, "fts4_") || strcasestr(sql_for_sqlite, " match ")) {
+        LOG_INFO("FTS query blocked from SQLite (tokenizer not available): %.100s", sql_for_sqlite);
+        if (real_sqlite3_prepare_v2) {
+            int rc = real_sqlite3_prepare_v2(db, "SELECT 1 WHERE 0", -1, ppStmt, pzTail);
+            if (cleaned_sql) free(cleaned_sql);
+            prepare_v2_depth--;
+            return rc;
         }
     }
 

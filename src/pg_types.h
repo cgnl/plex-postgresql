@@ -117,6 +117,29 @@ typedef struct pg_connection {
 // Statement Structure
 // ============================================================================
 
+// ============================================================================
+// Query Result Cache Types (for OnDeck optimization)
+// ============================================================================
+
+// Cached row data
+typedef struct {
+    char **values;          // Array of string values (NULL for NULL values)
+    int *lengths;           // Length of each value
+    int *is_null;           // 1 if value is NULL
+} cached_row_t;
+
+// Cached query result
+typedef struct cached_result {
+    uint64_t cache_key;     // Hash of SQL + params
+    uint64_t created_ms;    // Timestamp when cached
+    int num_rows;
+    int num_cols;
+    Oid *col_types;         // PostgreSQL type OIDs per column
+    char **col_names;       // Column names
+    cached_row_t *rows;     // Array of cached rows
+    int hit_count;          // Number of cache hits (for stats)
+} cached_result_t;
+
 typedef struct pg_stmt {
     pthread_mutex_t mutex;           // Protect against concurrent access from multiple threads
     atomic_int ref_count;            // CRITICAL FIX: Reference count to prevent double-free
@@ -125,6 +148,7 @@ typedef struct pg_stmt {
     char *sql;                       // Original SQL
     char *pg_sql;                    // Translated PostgreSQL SQL
     PGresult *result;
+    cached_result_t *cached_result;  // Pointer to cached result (when using query cache)
 
     // Prepared statement support
     uint64_t sql_hash;               // FNV-1a hash of pg_sql for cache lookup

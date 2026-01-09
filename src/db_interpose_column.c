@@ -6,6 +6,7 @@
  */
 
 #include "db_interpose.h"
+#include "pg_query_cache.h"
 
 // ============================================================================
 // Helper: Decode PostgreSQL hex-encoded BYTEA to binary
@@ -105,6 +106,12 @@ int my_sqlite3_column_count(sqlite3_stmt *pStmt) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+        // QUERY CACHE: Check for cached result first
+        if (pg_stmt->cached_result) {
+            int count = pg_stmt->cached_result->num_cols;
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return count;
+        }
         if (!pg_stmt->result) {
             pthread_mutex_unlock(&pg_stmt->mutex);
             return orig_sqlite3_column_count ? orig_sqlite3_column_count(pStmt) : 0;
@@ -120,6 +127,26 @@ int my_sqlite3_column_type(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+
+        // QUERY CACHE: Check for cached result first
+        if (pg_stmt->cached_result) {
+            cached_result_t *cached = pg_stmt->cached_result;
+            int row = pg_stmt->current_row;
+            if (idx >= 0 && idx < cached->num_cols && row >= 0 && row < cached->num_rows) {
+                cached_row_t *crow = &cached->rows[row];
+                if (crow->is_null[idx]) {
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return SQLITE_NULL;
+                }
+                // Use cached column type OID to determine SQLite type
+                int result = pg_oid_to_sqlite_type(cached->col_types[idx]);
+                pthread_mutex_unlock(&pg_stmt->mutex);
+                return result;
+            }
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return SQLITE_NULL;
+        }
+
         if (!pg_stmt->result) {
             pthread_mutex_unlock(&pg_stmt->mutex);
             return SQLITE_NULL;
@@ -148,6 +175,27 @@ int my_sqlite3_column_int(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+
+        // QUERY CACHE: Check for cached result first
+        if (pg_stmt->cached_result) {
+            cached_result_t *cached = pg_stmt->cached_result;
+            int row = pg_stmt->current_row;
+            if (idx >= 0 && idx < cached->num_cols && row >= 0 && row < cached->num_rows) {
+                cached_row_t *crow = &cached->rows[row];
+                if (!crow->is_null[idx] && crow->values[idx]) {
+                    const char *val = crow->values[idx];
+                    int result_val = 0;
+                    if (val[0] == 't' && val[1] == '\0') result_val = 1;
+                    else if (val[0] == 'f' && val[1] == '\0') result_val = 0;
+                    else result_val = atoi(val);
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return result_val;
+                }
+            }
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0;
+        }
+
         if (!pg_stmt->result) {
             pthread_mutex_unlock(&pg_stmt->mutex);
             return 0;
@@ -181,6 +229,27 @@ sqlite3_int64 my_sqlite3_column_int64(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+
+        // QUERY CACHE: Check for cached result first
+        if (pg_stmt->cached_result) {
+            cached_result_t *cached = pg_stmt->cached_result;
+            int row = pg_stmt->current_row;
+            if (idx >= 0 && idx < cached->num_cols && row >= 0 && row < cached->num_rows) {
+                cached_row_t *crow = &cached->rows[row];
+                if (!crow->is_null[idx] && crow->values[idx]) {
+                    const char *val = crow->values[idx];
+                    sqlite3_int64 result_val = 0;
+                    if (val[0] == 't' && val[1] == '\0') result_val = 1;
+                    else if (val[0] == 'f' && val[1] == '\0') result_val = 0;
+                    else result_val = atoll(val);
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return result_val;
+                }
+            }
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0;
+        }
+
         if (!pg_stmt->result) {
             pthread_mutex_unlock(&pg_stmt->mutex);
             return 0;
@@ -214,6 +283,27 @@ double my_sqlite3_column_double(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+
+        // QUERY CACHE: Check for cached result first
+        if (pg_stmt->cached_result) {
+            cached_result_t *cached = pg_stmt->cached_result;
+            int row = pg_stmt->current_row;
+            if (idx >= 0 && idx < cached->num_cols && row >= 0 && row < cached->num_rows) {
+                cached_row_t *crow = &cached->rows[row];
+                if (!crow->is_null[idx] && crow->values[idx]) {
+                    const char *val = crow->values[idx];
+                    double result_val = 0.0;
+                    if (val[0] == 't' && val[1] == '\0') result_val = 1.0;
+                    else if (val[0] == 'f' && val[1] == '\0') result_val = 0.0;
+                    else result_val = atof(val);
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return result_val;
+                }
+            }
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0.0;
+        }
+
         if (!pg_stmt->result) {
             pthread_mutex_unlock(&pg_stmt->mutex);
             return 0.0;
@@ -244,6 +334,22 @@ const unsigned char* my_sqlite3_column_text(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+
+        // QUERY CACHE: Check for cached result first
+        if (pg_stmt->cached_result) {
+            cached_result_t *cached = pg_stmt->cached_result;
+            int row = pg_stmt->current_row;
+            if (idx >= 0 && idx < cached->num_cols && row >= 0 && row < cached->num_rows) {
+                cached_row_t *crow = &cached->rows[row];
+                if (!crow->is_null[idx] && crow->values[idx]) {
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return (const unsigned char*)crow->values[idx];
+                }
+            }
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return NULL;
+        }
+
         // CRITICAL FIX: Check result AFTER lock to prevent use-after-free
         if (!pg_stmt->result) {
             pthread_mutex_unlock(&pg_stmt->mutex);
@@ -311,6 +417,24 @@ const void* my_sqlite3_column_blob(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+
+        // QUERY CACHE: Check for cached result first
+        if (pg_stmt->cached_result) {
+            cached_result_t *cached = pg_stmt->cached_result;
+            int row = pg_stmt->current_row;
+            if (idx >= 0 && idx < cached->num_cols && row >= 0 && row < cached->num_rows) {
+                cached_row_t *crow = &cached->rows[row];
+                if (!crow->is_null[idx] && crow->values[idx]) {
+                    // Return cached blob data directly
+                    // Note: For BYTEA, the cached value is already decoded
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return crow->values[idx];
+                }
+            }
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return NULL;
+        }
+
         if (!pg_stmt->result) {
             pthread_mutex_unlock(&pg_stmt->mutex);
             return NULL;
@@ -389,6 +513,23 @@ int my_sqlite3_column_bytes(sqlite3_stmt *pStmt, int idx) {
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
     if (pg_stmt && pg_stmt->is_pg == 2) {
         pthread_mutex_lock(&pg_stmt->mutex);
+
+        // QUERY CACHE: Check for cached result first
+        if (pg_stmt->cached_result) {
+            cached_result_t *cached = pg_stmt->cached_result;
+            int row = pg_stmt->current_row;
+            if (idx >= 0 && idx < cached->num_cols && row >= 0 && row < cached->num_rows) {
+                cached_row_t *crow = &cached->rows[row];
+                if (!crow->is_null[idx]) {
+                    int len = crow->lengths[idx];
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return len;
+                }
+            }
+            pthread_mutex_unlock(&pg_stmt->mutex);
+            return 0;
+        }
+
         if (!pg_stmt->result) {
             pthread_mutex_unlock(&pg_stmt->mutex);
             return 0;

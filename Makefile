@@ -35,7 +35,7 @@ SQL_TR_OBJS = src/sql_translator.o src/sql_tr_helpers.o src/sql_tr_placeholders.
               src/sql_tr_quotes.o src/sql_tr_keywords.o src/sql_tr_upsert.o
 
 # PG modules
-PG_MODULES = src/pg_config.o src/pg_logging.o src/pg_client.o src/pg_statement.o
+PG_MODULES = src/pg_config.o src/pg_logging.o src/pg_client.o src/pg_statement.o src/pg_query_cache.o
 
 # DB Interpose modules (split from db_interpose_pg.c for maintainability)
 DB_INTERPOSE_OBJS = src/db_interpose_core.o src/db_interpose_open.o src/db_interpose_exec.o \
@@ -108,6 +108,9 @@ src/pg_client.o: src/pg_client.c src/pg_client.h src/pg_types.h src/pg_logging.h
 	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
 
 src/pg_statement.o: src/pg_statement.c src/pg_statement.h src/pg_types.h src/pg_logging.h src/pg_client.h
+	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
+
+src/pg_query_cache.o: src/pg_query_cache.c src/pg_query_cache.h src/pg_types.h src/pg_logging.h
 	$(CC) -c -fPIC -o $@ $< $(CFLAGS)
 
 src/fishhook.o: src/fishhook.c include/fishhook.h

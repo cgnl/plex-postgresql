@@ -9,7 +9,51 @@
  */
 
 #include "db_interpose.h"
+#include "pg_query_cache.h"
 #include "fishhook.h"
+#include <execinfo.h>
+#include <signal.h>
+
+// ============================================================================
+// Crash/Exit Handler for Debugging
+// ============================================================================
+static void print_backtrace(const char *reason) {
+    void *callstack[128];
+    int frames = backtrace(callstack, 128);
+    char **symbols = backtrace_symbols(callstack, frames);
+    
+    fprintf(stderr, "\n=== BACKTRACE (%s) ===\n", reason);
+    LOG_ERROR("=== BACKTRACE (%s) ===", reason);
+    
+    for (int i = 0; i < frames; i++) {
+        fprintf(stderr, "  [%d] %s\n", i, symbols[i]);
+        LOG_ERROR("  [%d] %s", i, symbols[i]);
+    }
+    fprintf(stderr, "=== END BACKTRACE ===\n\n");
+    fflush(stderr);
+    
+    free(symbols);
+}
+
+static void signal_handler(int sig) {
+    const char *sig_name = "UNKNOWN";
+    switch(sig) {
+        case SIGSEGV: sig_name = "SIGSEGV"; break;
+        case SIGABRT: sig_name = "SIGABRT"; break;
+        case SIGBUS: sig_name = "SIGBUS"; break;
+        case SIGFPE: sig_name = "SIGFPE"; break;
+        case SIGILL: sig_name = "SIGILL"; break;
+    }
+    print_backtrace(sig_name);
+    
+    // Re-raise to get default behavior
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void exit_handler(void) {
+    print_backtrace("EXIT/ATEXIT");
+}
 
 // ============================================================================
 // Global State Definitions (exported via db_interpose.h)
@@ -434,6 +478,14 @@ static void shim_init(void) {
     fprintf(stderr, "[SHIM_INIT] Constructor starting...\n");
     fflush(stderr);
 
+    // Install signal handlers for crash debugging
+    signal(SIGSEGV, signal_handler);
+    signal(SIGABRT, signal_handler);
+    signal(SIGBUS, signal_handler);
+    signal(SIGFPE, signal_handler);
+    signal(SIGILL, signal_handler);
+    atexit(exit_handler);
+
     pg_logging_init();
     LOG_INFO("=== Plex PostgreSQL Interpose Shim loaded ===");
     LOG_ERROR("SHIM_CONSTRUCTOR: Initialization complete");
@@ -475,6 +527,7 @@ static void shim_init(void) {
     pg_config_init();
     pg_client_init();
     pg_statement_init();
+    pg_query_cache_init();  // Initialize query result cache
     sql_translator_init();
 
     // Start worker thread with 8MB stack for heavy queries

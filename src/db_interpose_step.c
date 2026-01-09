@@ -6,6 +6,7 @@
  */
 
 #include "db_interpose.h"
+#include "pg_query_cache.h"
 
 // ============================================================================
 // Step Function - Main Query Execution
@@ -272,6 +273,25 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 return SQLITE_DONE;
             }
 
+            // CRITICAL FIX: Handle cached results FIRST, before checking pg_stmt->result
+            // When using cache, result is NULL but cached_result is set.
+            // The cache hit (below) sets current_row=0 and returns immediately.
+            // On subsequent step() calls, we advance current_row here.
+            if (pg_stmt->cached_result) {
+                // Advance to next row
+                // Cache hit set current_row=0, so second step increments to 1, etc.
+                pg_stmt->current_row++;
+                if (pg_stmt->current_row >= pg_stmt->num_rows) {
+                    // Done with cached result
+                    pg_stmt->cached_result = NULL;
+                    pg_stmt->read_done = 1;
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return SQLITE_DONE;
+                }
+                pthread_mutex_unlock(&pg_stmt->mutex);
+                return SQLITE_ROW;
+            }
+
             // Only log when result is NULL (new query) to reduce log spam
             if (!pg_stmt->result) {
                 LOG_DEBUG("STEP READ: thread=%p stmt=%p exec_conn=%p",
@@ -291,6 +311,31 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
             }
 
             if (!pg_stmt->result) {
+                // ============================================================
+                // QUERY RESULT CACHE: Check if we have cached results
+                // This is critical for Plex's OnDeck which runs 2000+ identical queries
+                // ============================================================
+                #if 0  // DISABLED - cache causes crashes
+                LOG_DEBUG("CACHE_LOOKUP: checking cache for sql=%.60s", pg_stmt->pg_sql ? pg_stmt->pg_sql : "NULL");
+                cached_result_t *cached = pg_query_cache_lookup(pg_stmt);
+                LOG_DEBUG("CACHE_LOOKUP: result=%p", (void*)cached);
+                if (cached) {
+                    // Cache hit! Use cached result instead of hitting PostgreSQL
+                    // Store cache metadata in pg_stmt for column access
+                    pg_stmt->num_rows = cached->num_rows;
+                    pg_stmt->num_cols = cached->num_cols;
+                    pg_stmt->current_row = 0;
+                    pg_stmt->result_conn = NULL;  // No real PGresult
+
+                    // Store pointer to cached result for column_* functions
+                    // We'll use a special marker to indicate cached result
+                    pg_stmt->cached_result = cached;
+
+                    pthread_mutex_unlock(&pg_stmt->mutex);
+                    return (cached->num_rows > 0) ? SQLITE_ROW : SQLITE_DONE;
+                }
+                #endif
+
                 // Track which thread is executing this statement
                 pthread_t current = pthread_self();
                 pg_stmt->executing_thread = current;
@@ -407,7 +452,8 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     pg_stmt->current_row = 0;
                     pg_stmt->result_conn = exec_conn;  // Track which connection owns this result
 
-                    // Verbose query logging disabled for performance
+                    // QUERY RESULT CACHE: Store result for potential reuse
+                    // pg_query_cache_store(pg_stmt, pg_stmt->result);  // DISABLED
                 } else {
                     const char *err = (exec_conn && exec_conn->conn) ? PQerrorMessage(exec_conn->conn) : "NULL connection";
                     log_sql_fallback(pg_stmt->sql, pg_stmt->pg_sql,
@@ -419,9 +465,14 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     pg_pool_check_connection_health(exec_conn);
                 }
             } else {
+                // Subsequent step() call - advance to next row
                 pg_stmt->current_row++;
             }
 
+            // NOTE: cached_result handling moved to top of is_pg==2 block
+            // to prevent re-entering cache lookup on subsequent step() calls
+
+            // Handle real PGresult
             if (pg_stmt->result) {
                 if (pg_stmt->current_row >= pg_stmt->num_rows) {
                     // CRITICAL FIX: Free PGresult immediately when done

@@ -46,6 +46,24 @@ char* sql_translate_placeholders(const char *sql, char ***param_names_out, int *
 
         // Handle ? placeholder
         if (*p == '?') {
+            // CRITICAL FIX: Ensure param_names array is allocated and initialized
+            // even for ? placeholders, to prevent uninitialized memory access
+            // when mixed with :name placeholders
+            if (param_count >= param_capacity) {
+                param_capacity = param_capacity ? param_capacity * 2 : 16;
+                char **new_names = realloc(param_names, param_capacity * sizeof(char*));
+                if (new_names) {
+                    // Initialize new slots to NULL
+                    for (int i = param_names ? (param_capacity / 2) : 0; i < param_capacity; i++) {
+                        new_names[i] = NULL;
+                    }
+                    param_names = new_names;
+                }
+            }
+            // Set this slot to NULL explicitly (? placeholder has no name)
+            if (param_names) {
+                param_names[param_count] = NULL;
+            }
             param_count++;
             out += sprintf(out, "$%d", param_count);
             p++;
@@ -82,13 +100,25 @@ char* sql_translate_placeholders(const char *sql, char ***param_names_out, int *
                 } else {
                     // New parameter
                     if (param_count >= param_capacity) {
+                        int old_capacity = param_capacity;
                         param_capacity = param_capacity ? param_capacity * 2 : 16;
-                        param_names = realloc(param_names, param_capacity * sizeof(char*));
+                        char **new_names = realloc(param_names, param_capacity * sizeof(char*));
+                        if (new_names) {
+                            // Initialize new slots to NULL
+                            for (int i = old_capacity; i < param_capacity; i++) {
+                                new_names[i] = NULL;
+                            }
+                            param_names = new_names;
+                        }
                     }
 
-                    param_names[param_count] = malloc(name_len + 1);
-                    memcpy(param_names[param_count], name_start, name_len);
-                    param_names[param_count][name_len] = '\0';
+                    if (param_names) {
+                        param_names[param_count] = malloc(name_len + 1);
+                        if (param_names[param_count]) {
+                            memcpy(param_names[param_count], name_start, name_len);
+                            param_names[param_count][name_len] = '\0';
+                        }
+                    }
 
                     param_count++;
                     out += sprintf(out, "$%d", param_count);
