@@ -244,6 +244,16 @@ test-crash: $(TEST_BIN_DIR)/test_crash_scenarios
 	@./$(TEST_BIN_DIR)/test_crash_scenarios
 	@echo ""
 
+# macOS stack protection integration test (requires shim to be built)
+$(TEST_BIN_DIR)/test_stack_macos: $(TEST_DIR)/test_stack_macos.c
+	@mkdir -p $(TEST_BIN_DIR)
+	$(CC) -o $@ $< -lpthread -Wall -Wextra
+
+test-stack-macos: $(TARGET) $(TEST_BIN_DIR)/test_stack_macos
+	@echo ""
+	@./$(TEST_BIN_DIR)/test_stack_macos ./$(TARGET)
+	@echo ""
+
 # Run all unit tests
 unit-test: test-recursion test-crash
 	@echo "All unit tests complete."

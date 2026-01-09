@@ -215,6 +215,37 @@ src/
 - **Prepared statements** - Query caching for performance
 - **Schema initialization** - Auto-creates PostgreSQL schema on first run
 - **Circular reference protection** - Trigger prevents self-referential parent_id crashes
+- **Stack overflow protection** - Multi-layer defense against crashes (see below)
+
+### Stack Protection
+
+Plex uses small thread stacks (544KB) which can overflow during complex queries. The shim provides multi-layer protection:
+
+| Layer | Threshold | Action |
+|-------|-----------|--------|
+| Worker delegation | < 400KB remaining | Delegate to 8MB worker thread |
+| Hard protection (normal) | < 64KB remaining | Return SQLITE_NOMEM |
+| Hard protection (worker) | < 32KB remaining | Return SQLITE_NOMEM |
+
+This prevents stack overflow crashes that occurred with deep recursive queries (e.g., OnDeck with 218 recursive frames).
+
+## Testing
+
+Run unit tests to validate the shim:
+
+```bash
+# All unit tests (recursion, crash scenarios)
+make unit-test
+
+# Stack protection test (macOS only, doesn't require Plex running)
+make test-stack-macos
+
+# Individual tests
+make test-recursion      # Hash functions, loop detection, recursion guards
+make test-crash          # Tests based on production crash history
+```
+
+The stack protection test validates all protection layers by simulating low-stack conditions without running Plex.
 
 ## Troubleshooting
 
