@@ -43,7 +43,31 @@ int my_sqlite3_exec(sqlite3 *db, const char *sql,
 
                 // CRITICAL FIX: Lock connection mutex to prevent concurrent libpq access
                 pthread_mutex_lock(&pg_conn->mutex);
-                PGresult *res = PQexec(pg_conn->conn, exec_sql);
+                
+                // Use prepared statement for better performance (skip parse/plan)
+                uint64_t sql_hash = pg_hash_sql(exec_sql);
+                char stmt_name[32];
+                snprintf(stmt_name, sizeof(stmt_name), "ex_%llx", (unsigned long long)sql_hash);
+                
+                const char *cached_stmt_name = NULL;
+                PGresult *res;
+                if (pg_stmt_cache_lookup(pg_conn, sql_hash, &cached_stmt_name)) {
+                    // Cached - execute prepared
+                    res = PQexecPrepared(pg_conn->conn, cached_stmt_name, 0, NULL, NULL, NULL, 0);
+                } else {
+                    // Not cached - prepare and execute
+                    PGresult *prep_res = PQprepare(pg_conn->conn, stmt_name, exec_sql, 0, NULL);
+                    if (PQresultStatus(prep_res) == PGRES_COMMAND_OK) {
+                        pg_stmt_cache_add(pg_conn, sql_hash, stmt_name, 0);
+                        PQclear(prep_res);
+                        res = PQexecPrepared(pg_conn->conn, stmt_name, 0, NULL, NULL, NULL, 0);
+                    } else {
+                        // Prepare failed - fall back to PQexec
+                        LOG_DEBUG("EXEC prepare failed, using PQexec: %s", PQerrorMessage(pg_conn->conn));
+                        PQclear(prep_res);
+                        res = PQexec(pg_conn->conn, exec_sql);
+                    }
+                }
                 ExecStatusType status = PQresultStatus(res);
 
                 if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {

@@ -95,7 +95,30 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                         PQclear(pending);
                     }
 
-                    PGresult *res = PQexec(cached_exec_conn->conn, exec_sql);
+                    // Use prepared statement for better performance (skip parse/plan)
+                    uint64_t sql_hash = pg_hash_sql(exec_sql);
+                    char stmt_name[32];
+                    snprintf(stmt_name, sizeof(stmt_name), "ce_%llx", (unsigned long long)sql_hash);
+                    
+                    const char *cached_stmt_name = NULL;
+                    PGresult *res;
+                    if (pg_stmt_cache_lookup(cached_exec_conn, sql_hash, &cached_stmt_name)) {
+                        // Cached - execute prepared
+                        res = PQexecPrepared(cached_exec_conn->conn, cached_stmt_name, 0, NULL, NULL, NULL, 0);
+                    } else {
+                        // Not cached - prepare and execute
+                        PGresult *prep_res = PQprepare(cached_exec_conn->conn, stmt_name, exec_sql, 0, NULL);
+                        if (PQresultStatus(prep_res) == PGRES_COMMAND_OK) {
+                            pg_stmt_cache_add(cached_exec_conn, sql_hash, stmt_name, 0);
+                            PQclear(prep_res);
+                            res = PQexecPrepared(cached_exec_conn->conn, stmt_name, 0, NULL, NULL, NULL, 0);
+                        } else {
+                            // Prepare failed - fall back to PQexec
+                            LOG_DEBUG("CACHED EXEC prepare failed, using PQexec: %s", PQerrorMessage(cached_exec_conn->conn));
+                            PQclear(prep_res);
+                            res = PQexec(cached_exec_conn->conn, exec_sql);
+                        }
+                    }
                     pthread_mutex_unlock(&cached_exec_conn->mutex);
                     ExecStatusType status = PQresultStatus(res);
 
@@ -203,11 +226,31 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                                 PQclear(pending_read);
                             }
 
-                            LOG_INFO("PQEXEC CACHED READ: conn=%p sql_len=%zu sql=%.60s",
-                                     (void*)cached_read_conn, strlen(trans.sql), trans.sql);
-                            new_stmt->result = PQexec(cached_read_conn->conn, trans.sql);
-                            LOG_INFO("PQEXEC CACHED READ DONE: conn=%p result=%p",
-                                     (void*)cached_read_conn, (void*)new_stmt->result);
+                            // Use prepared statement for better performance (skip parse/plan)
+                            uint64_t read_sql_hash = pg_hash_sql(trans.sql);
+                            char read_stmt_name[32];
+                            snprintf(read_stmt_name, sizeof(read_stmt_name), "cr_%llx", (unsigned long long)read_sql_hash);
+                            
+                            const char *cached_read_stmt_name = NULL;
+                            if (pg_stmt_cache_lookup(cached_read_conn, read_sql_hash, &cached_read_stmt_name)) {
+                                // Cached - execute prepared
+                                LOG_DEBUG("CACHED READ (prepared): stmt=%s sql=%.60s", cached_read_stmt_name, trans.sql);
+                                new_stmt->result = PQexecPrepared(cached_read_conn->conn, cached_read_stmt_name, 0, NULL, NULL, NULL, 0);
+                            } else {
+                                // Not cached - prepare and execute
+                                PGresult *prep_res = PQprepare(cached_read_conn->conn, read_stmt_name, trans.sql, 0, NULL);
+                                if (PQresultStatus(prep_res) == PGRES_COMMAND_OK) {
+                                    pg_stmt_cache_add(cached_read_conn, read_sql_hash, read_stmt_name, 0);
+                                    PQclear(prep_res);
+                                    LOG_DEBUG("CACHED READ (new prepared): stmt=%s sql=%.60s", read_stmt_name, trans.sql);
+                                    new_stmt->result = PQexecPrepared(cached_read_conn->conn, read_stmt_name, 0, NULL, NULL, NULL, 0);
+                                } else {
+                                    // Prepare failed - fall back to PQexec
+                                    LOG_DEBUG("CACHED READ prepare failed, using PQexec: %s", PQerrorMessage(cached_read_conn->conn));
+                                    PQclear(prep_res);
+                                    new_stmt->result = PQexec(cached_read_conn->conn, trans.sql);
+                                }
+                            }
                             pthread_mutex_unlock(&cached_read_conn->mutex);
                             if (PQresultStatus(new_stmt->result) == PGRES_TUPLES_OK) {
                                 new_stmt->num_rows = PQntuples(new_stmt->result);
@@ -420,8 +463,15 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
 
                     if (is_cached && cached_name) {
                         // Execute prepared statement
+                        LOG_DEBUG("EXEC_PREPARED: stmt=%s params=%d p0=%s p1=%s",
+                                 cached_name, pg_stmt->param_count,
+                                 (pg_stmt->param_count > 0 && paramValues[0]) ? paramValues[0] : "NULL",
+                                 (pg_stmt->param_count > 1 && paramValues[1]) ? paramValues[1] : "NULL");
                         pg_stmt->result = PQexecPrepared(exec_conn->conn, cached_name,
                             pg_stmt->param_count, paramValues, NULL, NULL, 0);
+                        LOG_DEBUG("EXEC_PREPARED DONE: result=%p status=%d",
+                                 (void*)pg_stmt->result,
+                                 pg_stmt->result ? (int)PQresultStatus(pg_stmt->result) : -1);
                     } else {
                         // Fallback to PQexecParams
                         pg_stmt->result = PQexecParams(exec_conn->conn, pg_stmt->pg_sql,
@@ -438,18 +488,22 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 }
 
                 pthread_mutex_unlock(&exec_conn->mutex);
+                LOG_DEBUG("MUTEX_UNLOCKED: checking result status");
 
                 // Check for query errors
                 ExecStatusType status = PQresultStatus(pg_stmt->result);
+                LOG_DEBUG("RESULT_STATUS: status=%d tuples=%d", (int)status, pg_stmt->result ? PQntuples(pg_stmt->result) : -1);
                 if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
                     const char *err = (exec_conn && exec_conn->conn) ? PQerrorMessage(exec_conn->conn) : "NULL connection";
                     LOG_ERROR("PostgreSQL query failed: %s", err);
                     LOG_ERROR("Failed query: %.500s", pg_stmt->pg_sql);
                 }
+                LOG_DEBUG("RESULT_CHECK DONE");
 
                 if (PQresultStatus(pg_stmt->result) == PGRES_TUPLES_OK) {
                     pg_stmt->num_rows = PQntuples(pg_stmt->result);
                     pg_stmt->num_cols = PQnfields(pg_stmt->result);
+                    LOG_DEBUG("TUPLES_OK: rows=%d cols=%d", pg_stmt->num_rows, pg_stmt->num_cols);
                     pg_stmt->current_row = 0;
                     pg_stmt->result_conn = exec_conn;  // Track which connection owns this result
 
@@ -475,6 +529,7 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
 
             // Handle real PGresult
             if (pg_stmt->result) {
+                LOG_DEBUG("PG_RESULT: current_row=%d num_rows=%d", pg_stmt->current_row, pg_stmt->num_rows);
                 if (pg_stmt->current_row >= pg_stmt->num_rows) {
                     // CRITICAL FIX: Free PGresult immediately when done
                     // Prevents memory accumulation when Plex doesn't call reset()
@@ -483,9 +538,14 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     pg_stmt->result_conn = NULL;
                     pg_stmt->read_done = 1;  // Prevent re-execution on next step() call
                     pthread_mutex_unlock(&pg_stmt->mutex);
+                    LOG_DEBUG("RETURNING SQLITE_DONE");
                     return SQLITE_DONE;
                 }
                 pthread_mutex_unlock(&pg_stmt->mutex);
+                LOG_DEBUG("RETURNING SQLITE_ROW for stmt=%p pg_stmt=%p sql=%.50s",
+                          (void*)pStmt, (void*)pg_stmt, pg_stmt->sql ? pg_stmt->sql : "NULL");
+                // Flush log to ensure it's written before potential crash
+                fflush(NULL);
                 return SQLITE_ROW;
             }
         } else if (pg_stmt->is_pg == 1) {  // WRITE
@@ -662,12 +722,23 @@ int my_sqlite3_reset(sqlite3_stmt *pStmt) {
             }
         }
         pg_stmt_clear_result(pg_stmt);  // This also resets write_executed
+
+        // If this is a PostgreSQL-only statement (is_pg == 2), don't call real SQLite
+        // as the statement handle is not a valid SQLite statement
+        if (pg_stmt->is_pg == 2) {
+            return SQLITE_OK;
+        }
     }
 
     // Also clear cached statements - these use a separate registry
     pg_stmt_t *cached = pg_find_cached_stmt(pStmt);
     if (cached) {
         pg_stmt_clear_result(cached);  // This also resets write_executed
+
+        // If this is a PostgreSQL-only statement, don't call real SQLite
+        if (cached->is_pg == 2) {
+            return SQLITE_OK;
+        }
     }
 
     return orig_sqlite3_reset ? orig_sqlite3_reset(pStmt) : SQLITE_ERROR;
@@ -675,7 +746,12 @@ int my_sqlite3_reset(sqlite3_stmt *pStmt) {
 
 int my_sqlite3_finalize(sqlite3_stmt *pStmt) {
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
+    int is_pg_only = 0;
+
     if (pg_stmt) {
+        // Check if this is a PostgreSQL-only statement before cleaning up
+        is_pg_only = (pg_stmt->is_pg == 2);
+
         // Statement is in global registry
         // CRITICAL FIX: Use weak clear for TLS (in case same stmt is also cached there)
         // This prevents double-free: global registry owns the reference
@@ -683,9 +759,20 @@ int my_sqlite3_finalize(sqlite3_stmt *pStmt) {
         pg_unregister_stmt(pStmt);
         pg_stmt_unref(pg_stmt);
     } else {
-        // Statement might only be in TLS cache - use normal clear which unrefs
+        // Statement might only be in TLS cache - check it too
+        pg_stmt_t *cached = pg_find_cached_stmt(pStmt);
+        if (cached) {
+            is_pg_only = (cached->is_pg == 2);
+        }
+        // Use normal clear which unrefs
         pg_clear_cached_stmt(pStmt);
     }
+
+    // If this was a PostgreSQL-only statement, don't call real SQLite
+    if (is_pg_only) {
+        return SQLITE_OK;
+    }
+
     return orig_sqlite3_finalize ? orig_sqlite3_finalize(pStmt) : SQLITE_ERROR;
 }
 

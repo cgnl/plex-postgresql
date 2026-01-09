@@ -133,6 +133,9 @@ const char* (*orig_sqlite3_sql)(sqlite3_stmt*) = NULL;
 char* (*orig_sqlite3_expanded_sql)(sqlite3_stmt*) = NULL;
 int (*orig_sqlite3_bind_parameter_count)(sqlite3_stmt*) = NULL;
 int (*orig_sqlite3_stmt_readonly)(sqlite3_stmt*) = NULL;
+int (*orig_sqlite3_stmt_busy)(sqlite3_stmt*) = NULL;
+int (*orig_sqlite3_stmt_status)(sqlite3_stmt*, int, int) = NULL;
+const char* (*orig_sqlite3_bind_parameter_name)(sqlite3_stmt*, int) = NULL;
 
 // Aliases for backward compatibility (used by prepare module)
 int (*real_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
@@ -457,6 +460,9 @@ static void setup_fishhook_rebindings(void) {
         {"sqlite3_expanded_sql", my_sqlite3_expanded_sql, (void**)&orig_sqlite3_expanded_sql},
         {"sqlite3_bind_parameter_count", my_sqlite3_bind_parameter_count, (void**)&orig_sqlite3_bind_parameter_count},
         {"sqlite3_stmt_readonly", my_sqlite3_stmt_readonly, (void**)&orig_sqlite3_stmt_readonly},
+        {"sqlite3_stmt_busy", my_sqlite3_stmt_busy, (void**)&orig_sqlite3_stmt_busy},
+        {"sqlite3_stmt_status", my_sqlite3_stmt_status, (void**)&orig_sqlite3_stmt_status},
+        {"sqlite3_bind_parameter_name", my_sqlite3_bind_parameter_name, (void**)&orig_sqlite3_bind_parameter_name},
     };
 
     int count = sizeof(rebindings) / sizeof(rebindings[0]);
