@@ -284,6 +284,14 @@ test-tls: $(TEST_BIN_DIR)/test_tls_cache
 	@./$(TEST_BIN_DIR)/test_tls_cache
 	@echo ""
 
+# Micro-benchmarks (shim component performance)
+$(TEST_BIN_DIR)/test_benchmark: $(TEST_DIR)/test_benchmark.c $(SQL_TR_OBJS) src/pg_logging.o
+	@mkdir -p $(TEST_BIN_DIR)
+	$(CC) -O3 -o $@ $< $(SQL_TR_OBJS) src/pg_logging.o -Iinclude -Isrc -Wall -Wextra
+
+benchmark: $(TEST_BIN_DIR)/test_benchmark
+	@./$(TEST_BIN_DIR)/test_benchmark
+
 # Run all unit tests
 unit-test: test-recursion test-crash test-sql test-cache test-tls
 	@echo "All unit tests complete."
