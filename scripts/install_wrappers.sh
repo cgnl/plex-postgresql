@@ -78,8 +78,15 @@ export PLEX_PG_PASSWORD="${PLEX_PG_PASSWORD:-plex}"
 export PLEX_PG_SCHEMA="${PLEX_PG_SCHEMA:-plex}"
 export PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR="${PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR:-/Users/sander/Library/Application Support}"
 
-# PostgreSQL shim
-export DYLD_INSERT_LIBRARIES="$SHIM_DIR/db_interpose_pg.dylib"
+# PostgreSQL shim - validate existence before loading
+SHIM_FILE="$SHIM_DIR/db_interpose_pg.dylib"
+if [ ! -f "$SHIM_FILE" ]; then
+    echo "[plex-pg] ERROR: Shim not found: $SHIM_FILE"
+    echo "[plex-pg] Run 'make' in $SHIM_DIR to build it"
+    echo "[plex-pg] Aborting to prevent transcoder crashes"
+    exit 1
+fi
+export DYLD_INSERT_LIBRARIES="$SHIM_FILE"
 
 # === Initialization Functions ===
 
@@ -213,8 +220,15 @@ if [[ -f "$PLEX_APP/Plex Media Scanner.original" ]]; then
 SCRIPT_DIR="$(dirname "$0")"
 SCANNER_ORIGINAL="$SCRIPT_DIR/Plex Media Scanner.original"
 
-# Ensure PostgreSQL shim is loaded
-export DYLD_INSERT_LIBRARIES="${DYLD_INSERT_LIBRARIES:-/Users/sander/plex-postgresql/db_interpose_pg.dylib}"
+# PostgreSQL shim - validate existence before loading
+SHIM_DIR="/Users/sander/plex-postgresql"
+SHIM_FILE="$SHIM_DIR/db_interpose_pg.dylib"
+if [ ! -f "$SHIM_FILE" ]; then
+    echo "[plex-pg] ERROR: Shim not found: $SHIM_FILE"
+    echo "[plex-pg] Run 'make' in $SHIM_DIR to build it"
+    exit 1
+fi
+export DYLD_INSERT_LIBRARIES="${DYLD_INSERT_LIBRARIES:-$SHIM_FILE}"
 
 # Disable shadow database logic
 export PLEX_NO_SHADOW_SCAN=1

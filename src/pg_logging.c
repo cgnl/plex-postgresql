@@ -66,10 +66,12 @@ static int should_log_message(void) {
             long suppressed = atomic_exchange(&suppressed_count, 0);
             // Log exit from throttle mode (will be logged since throttle is now off)
             if (log_file) {
+                struct tm tm_buf;
+                struct tm *tm = localtime_r(&now, &tm_buf);
                 pthread_mutex_lock(&log_mutex);
                 fprintf(log_file, "[%04d-%02d-%02d %02d:%02d:%02d] [INFO] THROTTLE OFF: %ld queries, %ld suppressed\n",
-                        (int)(1900 + (now / 31536000) % 200), (int)((now / 2592000) % 12 + 1), (int)((now / 86400) % 31 + 1),
-                        (int)((now % 86400) / 3600), (int)((now % 3600) / 60), (int)(now % 60),
+                        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                        tm->tm_hour, tm->tm_min, tm->tm_sec,
                         total, suppressed);
                 fflush(log_file);
                 pthread_mutex_unlock(&log_mutex);
