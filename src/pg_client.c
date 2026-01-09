@@ -555,6 +555,10 @@ static pg_connection_t* do_slot_reconnect(int slot_idx) {
     }
 }
 
+// Thread-local pool slot cache (avoids O(n) scan in Phase 1)
+static __thread int tls_pool_slot = -1;
+static __thread uint32_t tls_pool_generation = 0;
+
 static pg_connection_t* pool_get_connection(const char *db_path) {
     if (!is_library_db(db_path)) {
         return NULL;
@@ -569,6 +573,27 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
         strncpy(library_db_path, db_path, sizeof(library_db_path) - 1);
     }
     pthread_mutex_unlock(&pool_mutex);
+
+    // =========================================================================
+    // FAST PATH: Check cached slot first (O(1) instead of O(n) scan)
+    // =========================================================================
+    if (tls_pool_slot >= 0 && tls_pool_slot < configured_pool_size) {
+        pool_slot_t *slot = &library_pool[tls_pool_slot];
+
+        // Verify slot is still ours (state, owner, generation all match)
+        if (atomic_load(&slot->state) == SLOT_READY &&
+            pthread_equal(slot->owner_thread, current_thread) &&
+            atomic_load(&slot->generation) == tls_pool_generation) {
+
+            pg_connection_t *conn = slot->conn;
+            if (conn && conn->conn && PQstatus(conn->conn) == CONNECTION_OK) {
+                slot->last_used = now;
+                return conn;  // Fast path: ~10 instructions
+            }
+        }
+        // Cached slot invalid - clear and fall through to slow path
+        tls_pool_slot = -1;
+    }
 
     // =========================================================================
     // PHASE 0: Cleanup stale READY connections (idle > POOL_IDLE_TIMEOUT)
@@ -608,6 +633,9 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
                 // 1. Query errors triggering pg_pool_check_connection_health()
                 // 2. Connection reset when slot is released to another thread (PHASE 2)
                 library_pool[i].last_used = now;
+                // Cache for next call
+                tls_pool_slot = i;
+                tls_pool_generation = atomic_load(&library_pool[i].generation);
                 return conn;
             }
 
@@ -616,7 +644,12 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
             if (atomic_compare_exchange_strong(&library_pool[i].state,
                                                &expected, SLOT_RECONNECTING)) {
                 // We own the reconnect
-                return do_slot_reconnect(i);
+                pg_connection_t *reconn = do_slot_reconnect(i);
+                if (reconn) {
+                    tls_pool_slot = i;
+                    tls_pool_generation = atomic_load(&library_pool[i].generation);
+                }
+                return reconn;
             }
             // Another thread beat us - continue searching
         }
@@ -658,13 +691,20 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
 
                     LOG_DEBUG("Pool: reusing reset connection in slot %d", i);
                     atomic_store(&library_pool[i].state, SLOT_READY);
+                    tls_pool_slot = i;
+                    tls_pool_generation = atomic_load(&library_pool[i].generation);
                     return conn;
                 }
             }
 
             // Connection reset failed - do full reconnect
             atomic_store(&library_pool[i].state, SLOT_RECONNECTING);
-            return do_slot_reconnect(i);
+            pg_connection_t *reconn = do_slot_reconnect(i);
+            if (reconn) {
+                tls_pool_slot = i;
+                tls_pool_generation = atomic_load(&library_pool[i].generation);
+            }
+            return reconn;
         }
     }
 
@@ -693,6 +733,8 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
                 library_pool[i].conn = new_conn;
                 LOG_INFO("Pool: created new connection in slot %d", i);
                 atomic_store(&library_pool[i].state, SLOT_READY);
+                tls_pool_slot = i;
+                tls_pool_generation = atomic_load(&library_pool[i].generation);
                 return new_conn;
             } else {
                 // Creation failed - release slot
@@ -739,6 +781,8 @@ static pg_connection_t* pool_get_connection(const char *db_path) {
                 library_pool[i].conn = new_conn;
                 LOG_INFO("Pool: recovered slot %d with new connection", i);
                 atomic_store(&library_pool[i].state, SLOT_READY);
+                tls_pool_slot = i;
+                tls_pool_generation = atomic_load(&library_pool[i].generation);
                 return new_conn;
             } else {
                 library_pool[i].conn = NULL;

@@ -4,6 +4,9 @@
  * Handles sqlite3_prepare*, including recursion prevention and stack protection.
  */
 
+// Must be defined before any includes for pthread_getattr_np on Linux/musl
+#define _GNU_SOURCE
+
 #include "db_interpose.h"
 #include <time.h>
 
