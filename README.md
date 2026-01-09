@@ -239,6 +239,24 @@ src/
 - **Schema initialization** - Auto-creates PostgreSQL schema on first run
 - **Circular reference protection** - Trigger prevents self-referential parent_id crashes
 - **Stack overflow protection** - Multi-layer defense against crashes (see below)
+- **Auto-build** - Wrapper automatically rebuilds shim if dylib is missing
+
+### SQL Translation Features
+
+The translator handles SQLite-specific syntax automatically:
+
+| SQLite | PostgreSQL |
+|--------|------------|
+| `COLLATE NOCASE` | `LOWER()` comparisons |
+| `WHERE column LIKE '%x%' COLLATE NOCASE` | `WHERE column ILIKE '%x%'` |
+| `WHERE 0` / `WHERE 1` | `WHERE FALSE` / `WHERE TRUE` |
+| `iif(cond, a, b)` | `CASE WHEN cond THEN a ELSE b END` |
+| `strftime('%s', x)` | `EXTRACT(EPOCH FROM x)::bigint` |
+| `IFNULL(a, b)` | `COALESCE(a, b)` |
+| `title MATCH 'action -comedy'` | FTS with `!` negation |
+| `title MATCH 'term1 AND term2'` | FTS with `&` operator |
+| `title MATCH '"exact phrase"'` | FTS with `<->` adjacency |
+| `?` placeholders | `$1, $2, ...` numbered params |
 
 ### Stack Protection
 
@@ -257,13 +275,13 @@ This prevents stack overflow crashes that occurred with deep recursive queries (
 Run unit tests to validate the shim:
 
 ```bash
-# All unit tests (77 tests total)
+# All unit tests (87 tests total)
 make unit-test
 
 # Individual test suites
 make test-recursion      # Recursion guards, loop detection (11 tests)
 make test-crash          # Production crash scenarios (21 tests)
-make test-sql            # SQL translation (22 tests)
+make test-sql            # SQL translation (32 tests)
 make test-cache          # Query cache logic (16 tests)
 make test-tls            # Thread-local storage (7 tests)
 

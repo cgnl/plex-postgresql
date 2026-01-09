@@ -76,6 +76,7 @@ char* translate_null_sorting(const char *sql);
 char* fix_integer_text_mismatch(const char *sql);
 char* fix_duplicate_assignments(const char *sql);
 char* strip_icu_collation(const char *sql);
+char* translate_collate_nocase(const char *sql);
 char* fix_json_operator_on_text(const char *sql);
 char* fix_collections_query(const char *sql);
 

@@ -193,6 +193,7 @@ migrate_sqlite_to_pg() {
 
             # Find common columns and build quoted lists
             # For BLOB columns, use hex() to convert binary to hex string
+            # For timestamp columns (*_at), cast float to integer (SQLite stores as float)
             local sqlite_select=""
             local pg_cols_list=""
             for col in $sqlite_cols_raw; do
@@ -203,6 +204,9 @@ migrate_sqlite_to_pg() {
                     if [[ "$col_type" == "BLOB" ]]; then
                         # Use hex() for BLOB columns, prefix with \x for PostgreSQL bytea
                         select_expr="CASE WHEN \"$col\" IS NOT NULL THEN '\\x' || hex(\"$col\") ELSE NULL END AS \"$col\""
+                    elif [[ "$col" == *_at ]]; then
+                        # Timestamp columns: cast to integer (SQLite stores as float, PG expects bigint)
+                        select_expr="CAST(\"$col\" AS INTEGER) AS \"$col\""
                     else
                         select_expr="\"$col\""
                     fi

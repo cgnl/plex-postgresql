@@ -78,13 +78,18 @@ export PLEX_PG_PASSWORD="${PLEX_PG_PASSWORD:-plex}"
 export PLEX_PG_SCHEMA="${PLEX_PG_SCHEMA:-plex}"
 export PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR="${PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR:-/Users/sander/Library/Application Support}"
 
-# PostgreSQL shim - validate existence before loading
+# PostgreSQL shim - auto-build if missing
 SHIM_FILE="$SHIM_DIR/db_interpose_pg.dylib"
 if [ ! -f "$SHIM_FILE" ]; then
-    echo "[plex-pg] ERROR: Shim not found: $SHIM_FILE"
-    echo "[plex-pg] Run 'make' in $SHIM_DIR to build it"
-    echo "[plex-pg] Aborting to prevent transcoder crashes"
-    exit 1
+    echo "[plex-pg] Shim not found, building..."
+    if [ -f "$SHIM_DIR/Makefile" ]; then
+        (cd "$SHIM_DIR" && make -j4 2>/dev/null)
+    fi
+    if [ ! -f "$SHIM_FILE" ]; then
+        echo "[plex-pg] ERROR: Build failed. Run 'make' in $SHIM_DIR"
+        exit 1
+    fi
+    echo "[plex-pg] Shim built successfully"
 fi
 export DYLD_INSERT_LIBRARIES="$SHIM_FILE"
 
@@ -220,13 +225,18 @@ if [[ -f "$PLEX_APP/Plex Media Scanner.original" ]]; then
 SCRIPT_DIR="$(dirname "$0")"
 SCANNER_ORIGINAL="$SCRIPT_DIR/Plex Media Scanner.original"
 
-# PostgreSQL shim - validate existence before loading
+# PostgreSQL shim - auto-build if missing
 SHIM_DIR="/Users/sander/plex-postgresql"
 SHIM_FILE="$SHIM_DIR/db_interpose_pg.dylib"
 if [ ! -f "$SHIM_FILE" ]; then
-    echo "[plex-pg] ERROR: Shim not found: $SHIM_FILE"
-    echo "[plex-pg] Run 'make' in $SHIM_DIR to build it"
-    exit 1
+    echo "[plex-pg] Shim not found, building..."
+    if [ -f "$SHIM_DIR/Makefile" ]; then
+        (cd "$SHIM_DIR" && make -j4 2>/dev/null)
+    fi
+    if [ ! -f "$SHIM_FILE" ]; then
+        echo "[plex-pg] ERROR: Build failed. Run 'make' in $SHIM_DIR"
+        exit 1
+    fi
 fi
 export DYLD_INSERT_LIBRARIES="${DYLD_INSERT_LIBRARIES:-$SHIM_FILE}"
 

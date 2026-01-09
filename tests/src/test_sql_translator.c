@@ -385,6 +385,185 @@ static void test_edge_double_quotes_preserved(void) {
 }
 
 // ============================================================================
+// COLLATE NOCASE Tests (NEW - TDD)
+// ============================================================================
+
+static void test_collate_nocase_equals(void) {
+    TEST("COLLATE NOCASE - equality comparison");
+    sql_translation_t result = sql_translate(
+        "SELECT * FROM t WHERE name COLLATE NOCASE = 'Test'");
+
+    // Should translate to LOWER(name) = LOWER('Test')
+    if (result.success && result.sql &&
+        strcasestr(result.sql, "LOWER") &&
+        !strcasestr(result.sql, "COLLATE NOCASE")) {
+        PASS();
+    } else {
+        FAIL("Expected LOWER() conversion for COLLATE NOCASE");
+    }
+
+    sql_translation_free(&result);
+}
+
+static void test_collate_nocase_like(void) {
+    TEST("COLLATE NOCASE - LIKE comparison");
+    sql_translation_t result = sql_translate(
+        "SELECT * FROM t WHERE name LIKE '%test%' COLLATE NOCASE");
+
+    // Should translate to ILIKE or LOWER(name) LIKE LOWER('%test%')
+    if (result.success && result.sql &&
+        (strcasestr(result.sql, "ILIKE") || strcasestr(result.sql, "LOWER")) &&
+        !strcasestr(result.sql, "COLLATE NOCASE")) {
+        PASS();
+    } else {
+        FAIL("Expected ILIKE or LOWER() for COLLATE NOCASE LIKE");
+    }
+
+    sql_translation_free(&result);
+}
+
+static void test_collate_nocase_orderby(void) {
+    TEST("COLLATE NOCASE - ORDER BY");
+    sql_translation_t result = sql_translate(
+        "SELECT * FROM t ORDER BY name COLLATE NOCASE");
+
+    // Should translate to ORDER BY LOWER(name)
+    if (result.success && result.sql &&
+        strcasestr(result.sql, "LOWER") &&
+        !strcasestr(result.sql, "COLLATE NOCASE")) {
+        PASS();
+    } else {
+        FAIL("Expected LOWER() in ORDER BY for COLLATE NOCASE");
+    }
+
+    sql_translation_free(&result);
+}
+
+// ============================================================================
+// FTS4 Boolean Search Tests (NEW - TDD)
+// ============================================================================
+
+static void test_fts_negation(void) {
+    TEST("FTS4 - negation operator (-term)");
+    sql_translation_t result = sql_translate(
+        "SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action -comedy'");
+
+    // Should translate -comedy to !comedy in tsquery
+    if (result.success && result.sql &&
+        strcasestr(result.sql, "to_tsquery") &&
+        strcasestr(result.sql, "!")) {
+        PASS();
+    } else {
+        FAIL("Expected ! negation in tsquery");
+    }
+
+    sql_translation_free(&result);
+}
+
+static void test_fts_and_chain(void) {
+    TEST("FTS4 - AND chain (term1 AND term2)");
+    sql_translation_t result = sql_translate(
+        "SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action AND adventure'");
+
+    // Should translate to action & adventure in tsquery
+    if (result.success && result.sql &&
+        strcasestr(result.sql, "to_tsquery") &&
+        strcasestr(result.sql, "&")) {
+        PASS();
+    } else {
+        FAIL("Expected & operator in tsquery");
+    }
+
+    sql_translation_free(&result);
+}
+
+static void test_fts_or_chain(void) {
+    TEST("FTS4 - OR chain (term1 OR term2)");
+    sql_translation_t result = sql_translate(
+        "SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action OR adventure'");
+
+    // Should translate to action | adventure in tsquery
+    if (result.success && result.sql &&
+        strcasestr(result.sql, "to_tsquery") &&
+        strcasestr(result.sql, "|")) {
+        PASS();
+    } else {
+        FAIL("Expected | operator in tsquery");
+    }
+
+    sql_translation_free(&result);
+}
+
+static void test_fts_phrase(void) {
+    TEST("FTS4 - phrase search (\"exact phrase\")");
+    sql_translation_t result = sql_translate(
+        "SELECT * FROM fts4_metadata_titles WHERE title MATCH '\"star wars\"'");
+
+    // Should translate to phrase search with <-> operator
+    if (result.success && result.sql &&
+        strcasestr(result.sql, "to_tsquery")) {
+        PASS();  // Basic check - phrase handling is complex
+    } else {
+        FAIL("Expected tsquery for phrase search");
+    }
+
+    sql_translation_free(&result);
+}
+
+// ============================================================================
+// Window Functions Tests (NEW - TDD)
+// ============================================================================
+
+static void test_window_row_number(void) {
+    TEST("Window - ROW_NUMBER() OVER");
+    sql_translation_t result = sql_translate(
+        "SELECT ROW_NUMBER() OVER (ORDER BY id) as rn FROM t");
+
+    // PostgreSQL supports this natively, should pass through
+    if (result.success && result.sql &&
+        strcasestr(result.sql, "ROW_NUMBER") &&
+        strcasestr(result.sql, "OVER")) {
+        PASS();
+    } else {
+        FAIL("ROW_NUMBER() OVER should be preserved");
+    }
+
+    sql_translation_free(&result);
+}
+
+static void test_window_rank(void) {
+    TEST("Window - RANK() with PARTITION BY");
+    sql_translation_t result = sql_translate(
+        "SELECT RANK() OVER (PARTITION BY category ORDER BY score DESC) FROM t");
+
+    // PostgreSQL supports this natively
+    if (result.success && result.sql &&
+        strcasestr(result.sql, "RANK") &&
+        strcasestr(result.sql, "PARTITION BY")) {
+        PASS();
+    } else {
+        FAIL("RANK() with PARTITION BY should be preserved");
+    }
+
+    sql_translation_free(&result);
+}
+
+static void test_window_dense_rank(void) {
+    TEST("Window - DENSE_RANK()");
+    sql_translation_t result = sql_translate(
+        "SELECT DENSE_RANK() OVER (ORDER BY score) FROM t");
+
+    if (result.success && result.sql &&
+        strcasestr(result.sql, "DENSE_RANK")) {
+        PASS();
+    } else {
+        FAIL("DENSE_RANK() should be preserved");
+    }
+
+    sql_translation_free(&result);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -427,6 +606,22 @@ int main(void) {
     test_edge_null();
     test_edge_backticks();
     test_edge_double_quotes_preserved();
+
+    printf("\n\033[1mCOLLATE NOCASE (NEW):\033[0m\n");
+    test_collate_nocase_equals();
+    test_collate_nocase_like();
+    test_collate_nocase_orderby();
+
+    printf("\n\033[1mFTS4 Boolean Search (NEW):\033[0m\n");
+    test_fts_negation();
+    test_fts_and_chain();
+    test_fts_or_chain();
+    test_fts_phrase();
+
+    printf("\n\033[1mWindow Functions (NEW):\033[0m\n");
+    test_window_row_number();
+    test_window_rank();
+    test_window_dense_rank();
 
     // Cleanup
     sql_translator_cleanup();

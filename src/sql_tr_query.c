@@ -141,8 +141,9 @@ char* add_subquery_alias(const char *sql) {
 char* translate_case_booleans(const char *sql) {
     if (!sql) return NULL;
 
-    // Fast path: if no "end)" in query, no CASE/boolean translations needed
-    if (!strcasestr(sql, "end)") && !strcasestr(sql, "(0 ") && !strcasestr(sql, "(1 ")) {
+    // Fast path: if no patterns that need boolean translation
+    if (!strcasestr(sql, "end)") && !strcasestr(sql, "(0 ") && !strcasestr(sql, "(1 ") &&
+        !strcasestr(sql, "where 0") && !strcasestr(sql, "where 1")) {
         return strdup(sql);
     }
 
@@ -201,6 +202,18 @@ char* translate_case_booleans(const char *sql) {
     current = temp;
 
     temp = str_replace_nocase(current, " or 1)", " or TRUE)");
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    // WHERE 0 -> WHERE FALSE, WHERE 1 -> WHERE TRUE
+    // SQLite treats integers as booleans, PostgreSQL doesn't
+    temp = str_replace_nocase(current, " WHERE 0", " WHERE FALSE");
+    free(current);
+    if (!temp) return NULL;
+    current = temp;
+
+    temp = str_replace_nocase(current, " WHERE 1", " WHERE TRUE");
     free(current);
     if (!temp) return NULL;
     current = temp;
@@ -339,32 +352,109 @@ char* translate_min_to_least(const char *sql) {
 // ============================================================================
 
 // Helper to convert SQLite FTS MATCH term to PostgreSQL tsquery
-// 'term*' -> 'term:*'
-// 'term1 term2' -> 'term1 & term2' (AND logic)
+// Supports:
+//   'term*'        -> 'term:*'           (prefix wildcard)
+//   'term1 term2'  -> 'term1 & term2'    (implicit AND)
+//   '-term'        -> '!term'            (negation)
+//   'term1 AND term2' -> 'term1 & term2' (explicit AND)
+//   'term1 OR term2'  -> 'term1 | term2' (OR)
+//   '"exact phrase"'  -> 'exact <-> phrase' (phrase search)
 static void convert_fts_term(const char *sqlite_term, char *pg_term, size_t pg_term_size) {
     if (!sqlite_term || !pg_term || pg_term_size == 0) return;
 
     size_t len = strlen(sqlite_term);
     size_t out_idx = 0;
+    int in_phrase = 0;  // Track if we're inside a quoted phrase
 
-    for (size_t i = 0; i < len && out_idx < pg_term_size - 2; i++) {
+    for (size_t i = 0; i < len && out_idx < pg_term_size - 4; i++) {
         char c = sqlite_term[i];
+
+        // Handle phrase quotes
+        if (c == '"') {
+            in_phrase = !in_phrase;
+            // Skip the quote character itself
+            continue;
+        }
+
+        // Handle negation: -term -> !term
+        if (c == '-' && (i == 0 || sqlite_term[i-1] == ' ')) {
+            pg_term[out_idx++] = '!';
+            continue;
+        }
+
+        // Handle wildcard: term* -> term:*
         if (c == '*') {
-            // Wildcard: term* -> term:*
             pg_term[out_idx++] = ':';
             pg_term[out_idx++] = '*';
-        } else if (c == ' ') {
-            // Space -> AND operator
-            pg_term[out_idx++] = ' ';
-            pg_term[out_idx++] = '&';
-            pg_term[out_idx++] = ' ';
-        } else if (c == '\'' || c == '\\') {
-            // Escape special characters
+            continue;
+        }
+
+        // Handle explicit AND/OR keywords (case insensitive)
+        if (!in_phrase && i + 3 < len) {
+            // Check for " AND " pattern
+            if ((c == 'A' || c == 'a') &&
+                (sqlite_term[i+1] == 'N' || sqlite_term[i+1] == 'n') &&
+                (sqlite_term[i+2] == 'D' || sqlite_term[i+2] == 'd') &&
+                (i == 0 || sqlite_term[i-1] == ' ') &&
+                sqlite_term[i+3] == ' ') {
+                // Already have space before, add & and skip "AND "
+                pg_term[out_idx++] = '&';
+                pg_term[out_idx++] = ' ';
+                i += 3;  // Skip "AND" (loop will skip the space)
+                continue;
+            }
+            // Check for " OR " pattern
+            if ((c == 'O' || c == 'o') &&
+                (sqlite_term[i+1] == 'R' || sqlite_term[i+1] == 'r') &&
+                (i == 0 || sqlite_term[i-1] == ' ') &&
+                sqlite_term[i+2] == ' ') {
+                // Replace with |
+                pg_term[out_idx++] = '|';
+                pg_term[out_idx++] = ' ';
+                i += 2;  // Skip "OR" (loop will skip the space)
+                continue;
+            }
+        }
+
+        // Handle space
+        if (c == ' ') {
+            if (in_phrase) {
+                // Inside phrase: use <-> for adjacent word matching
+                pg_term[out_idx++] = ' ';
+                pg_term[out_idx++] = '<';
+                pg_term[out_idx++] = '-';
+                pg_term[out_idx++] = '>';
+                pg_term[out_idx++] = ' ';
+            } else {
+                // Skip space if next char starts an operator we handle
+                if (i + 1 < len) {
+                    char next = sqlite_term[i+1];
+                    if (next == '-' ||
+                        ((next == 'A' || next == 'a') && i + 4 < len &&
+                         (sqlite_term[i+2] == 'N' || sqlite_term[i+2] == 'n')) ||
+                        ((next == 'O' || next == 'o') && i + 3 < len &&
+                         (sqlite_term[i+2] == 'R' || sqlite_term[i+2] == 'r'))) {
+                        pg_term[out_idx++] = ' ';
+                        continue;
+                    }
+                }
+                // Regular space -> implicit AND
+                pg_term[out_idx++] = ' ';
+                pg_term[out_idx++] = '&';
+                pg_term[out_idx++] = ' ';
+            }
+            continue;
+        }
+
+        // Escape special tsquery characters
+        if (c == '\'' || c == '\\') {
             pg_term[out_idx++] = '\\';
             pg_term[out_idx++] = c;
-        } else {
-            pg_term[out_idx++] = c;
+            continue;
         }
+
+        // Regular character
+        pg_term[out_idx++] = c;
     }
     pg_term[out_idx] = '\0';
 }
@@ -386,32 +476,62 @@ char* translate_fts(const char *sql) {
     struct fts_map {
         const char *search;      // e.g. "fts4_metadata_titles_icu.title"
         const char *replacement; // e.g. "fts4_metadata_titles_icu.title_fts"
+        const char *table;       // table name for unqualified column matching
     } maps[] = {
-        { "fts4_metadata_titles_icu.title_sort", "fts4_metadata_titles_icu.title_fts" },
-        { "fts4_metadata_titles.title_sort", "fts4_metadata_titles.title_fts" },
-        { "fts4_metadata_titles_icu.title", "fts4_metadata_titles_icu.title_fts" },
-        { "fts4_metadata_titles.title", "fts4_metadata_titles.title_fts" },
-        { "fts4_tag_titles_icu.title", "fts4_tag_titles_icu.title_fts" },
-        { "fts4_tag_titles.title", "fts4_tag_titles.title_fts" },
-        { "fts4_tag_titles_icu.tag", "fts4_tag_titles_icu.title_fts" },
-        { "fts4_tag_titles.tag", "fts4_tag_titles.title_fts" },
+        { "fts4_metadata_titles_icu.title_sort", "fts4_metadata_titles_icu.title_fts", "fts4_metadata_titles_icu" },
+        { "fts4_metadata_titles.title_sort", "fts4_metadata_titles.title_fts", "fts4_metadata_titles" },
+        { "fts4_metadata_titles_icu.title", "fts4_metadata_titles_icu.title_fts", "fts4_metadata_titles_icu" },
+        { "fts4_metadata_titles.title", "fts4_metadata_titles.title_fts", "fts4_metadata_titles" },
+        { "fts4_tag_titles_icu.title", "fts4_tag_titles_icu.title_fts", "fts4_tag_titles_icu" },
+        { "fts4_tag_titles.title", "fts4_tag_titles.title_fts", "fts4_tag_titles" },
+        { "fts4_tag_titles_icu.tag", "fts4_tag_titles_icu.title_fts", "fts4_tag_titles_icu" },
+        { "fts4_tag_titles.tag", "fts4_tag_titles.title_fts", "fts4_tag_titles" },
+        // Unqualified column names (just "title" or "tag")
+        { "title", "fts4_metadata_titles.title_fts", "fts4_metadata_titles" },
+        { "tag", "fts4_tag_titles.title_fts", "fts4_tag_titles" },
         // Fallback for table match (implicit column)
-        { "fts4_metadata_titles_icu", "fts4_metadata_titles_icu.title_fts" },
-        { "fts4_metadata_titles", "fts4_metadata_titles.title_fts" },
-        { "fts4_tag_titles_icu", "fts4_tag_titles_icu.title_fts" },
-        { "fts4_tag_titles", "fts4_tag_titles.title_fts" },
-        { NULL, NULL }
+        { "fts4_metadata_titles_icu", "fts4_metadata_titles_icu.title_fts", "fts4_metadata_titles_icu" },
+        { "fts4_metadata_titles", "fts4_metadata_titles.title_fts", "fts4_metadata_titles" },
+        { "fts4_tag_titles_icu", "fts4_tag_titles_icu.title_fts", "fts4_tag_titles_icu" },
+        { "fts4_tag_titles", "fts4_tag_titles.title_fts", "fts4_tag_titles" },
+        { NULL, NULL, NULL }
     };
 
     int changed = 0;
 
     for (int i = 0; maps[i].search; i++) {
+        // For unqualified column names (no "."), verify the FTS table is in FROM clause
+        int is_unqualified = (strchr(maps[i].search, '.') == NULL);
+        if (is_unqualified && maps[i].table) {
+            if (!strcasestr(result, maps[i].table)) {
+                continue;  // Skip - table not in query
+            }
+        }
+
         char *pos = result;
         while ((pos = strcasestr(pos, maps[i].search)) != NULL) {
+            // For unqualified names, ensure we're matching a standalone word
+            if (is_unqualified) {
+                // Check char before - must not be alphanumeric or '.'
+                if (pos > result) {
+                    char before = *(pos - 1);
+                    if (is_ident_char(before) || before == '.') {
+                        pos++;
+                        continue;
+                    }
+                }
+                // Check char after - must not be alphanumeric
+                char after = *(pos + strlen(maps[i].search));
+                if (is_ident_char(after)) {
+                    pos++;
+                    continue;
+                }
+            }
+
             // Check what follows: must be whitespace then "match"
             char *scan = pos + strlen(maps[i].search);
             while (*scan && isspace(*scan)) scan++;
-            
+
             LOG_INFO("FTS Scan for %s found: '%.10s'", maps[i].search, scan);
 
             if (strncasecmp(scan, "match", 5) == 0) {
@@ -833,6 +953,175 @@ char* strip_icu_collation(const char *sql) {
         return result;
     }
     return strdup(sql); // Return copy if no change
+}
+
+// ============================================================================
+// Translate COLLATE NOCASE to PostgreSQL LOWER() or ILIKE
+// SQLite: col COLLATE NOCASE = 'val'  -> LOWER(col) = LOWER('val')
+// SQLite: col LIKE '%x%' COLLATE NOCASE -> col ILIKE '%x%'
+// SQLite: ORDER BY col COLLATE NOCASE -> ORDER BY LOWER(col)
+// ============================================================================
+
+char* translate_collate_nocase(const char *sql) {
+    if (!sql) return NULL;
+
+    // Fast path: no COLLATE NOCASE
+    if (!strcasestr(sql, "collate nocase")) {
+        return strdup(sql);
+    }
+
+    char *result = malloc(strlen(sql) * 2 + 256);
+    if (!result) return NULL;
+
+    char *out = result;
+    const char *p = sql;
+
+    while (*p) {
+        // Look for "COLLATE NOCASE" pattern
+        const char *collate_pos = strcasestr(p, "collate nocase");
+        if (!collate_pos) {
+            // No more occurrences, copy rest
+            strcpy(out, p);
+            out += strlen(p);
+            break;
+        }
+
+        // Find what precedes COLLATE NOCASE
+        // Could be: col COLLATE NOCASE, 'val' COLLATE NOCASE, or LIKE 'x' COLLATE NOCASE
+
+        // Check if this is a LIKE ... COLLATE NOCASE pattern
+        // Search backwards for LIKE
+        const char *scan_back = collate_pos - 1;
+        while (scan_back > p && isspace(*scan_back)) scan_back--;
+
+        // Check if there's a quoted string before COLLATE
+        int is_like_pattern = 0;
+        const char *like_pos = NULL;
+
+        if (*scan_back == '\'') {
+            // There's a string literal before COLLATE NOCASE
+            // Look further back for LIKE keyword
+            const char *before_str = scan_back - 1;
+            while (before_str > p && *before_str != '\'') before_str--;
+            if (*before_str == '\'') {
+                before_str--;
+                while (before_str > p && isspace(*before_str)) before_str--;
+                // Check for LIKE/GLOB keyword
+                if (before_str - 3 >= p && strncasecmp(before_str - 3, "like", 4) == 0) {
+                    is_like_pattern = 1;
+                    like_pos = before_str - 3;
+                } else if (before_str - 3 >= p && strncasecmp(before_str - 3, "glob", 4) == 0) {
+                    is_like_pattern = 1;
+                    like_pos = before_str - 3;
+                }
+            }
+        }
+
+        if (is_like_pattern && like_pos) {
+            // Pattern: col LIKE 'x' COLLATE NOCASE -> col ILIKE 'x'
+            // Copy up to LIKE
+            size_t prefix_len = like_pos - p;
+            memcpy(out, p, prefix_len);
+            out += prefix_len;
+
+            // Write ILIKE instead
+            memcpy(out, "ILIKE", 5);
+            out += 5;
+
+            // Skip "LIKE" or "GLOB"
+            p = like_pos + 4;
+
+            // Copy until COLLATE NOCASE
+            while (p < collate_pos) {
+                *out++ = *p++;
+            }
+
+            // Skip "COLLATE NOCASE"
+            p = collate_pos + 14;
+        } else {
+            // Pattern: col COLLATE NOCASE = 'val' or ORDER BY col COLLATE NOCASE
+            // Need to wrap the preceding identifier in LOWER()
+
+            // Find the start of the identifier before COLLATE
+            const char *id_end = collate_pos - 1;
+            while (id_end > p && isspace(*id_end)) id_end--;
+
+            const char *id_start = id_end;
+            // Handle quoted identifiers and table.column patterns
+            while (id_start > p) {
+                char c = *(id_start - 1);
+                if (is_ident_char(c) || c == '.' || c == '"' || c == '`') {
+                    id_start--;
+                } else {
+                    break;
+                }
+            }
+
+            // Copy everything before the identifier
+            size_t prefix_len = id_start - p;
+            memcpy(out, p, prefix_len);
+            out += prefix_len;
+
+            // Write LOWER( identifier )
+            memcpy(out, "LOWER(", 6);
+            out += 6;
+
+            size_t id_len = (id_end + 1) - id_start;
+            memcpy(out, id_start, id_len);
+            out += id_len;
+
+            *out++ = ')';
+
+            // Skip past "COLLATE NOCASE"
+            p = collate_pos + 14;
+
+            // Check if there's a comparison operator and value after
+            const char *after = skip_ws(p);
+            if (*after == '=' || *after == '!' || strncasecmp(after, "like", 4) == 0) {
+                // Copy the operator
+                if (*after == '=') {
+                    *out++ = ' ';
+                    *out++ = '=';
+                    *out++ = ' ';
+                    p = after + 1;
+                } else if (*after == '!' && *(after+1) == '=') {
+                    *out++ = ' ';
+                    *out++ = '!';
+                    *out++ = '=';
+                    *out++ = ' ';
+                    p = after + 2;
+                } else if (strncasecmp(after, "like", 4) == 0) {
+                    // Convert to ILIKE
+                    memcpy(out, " ILIKE ", 7);
+                    out += 7;
+                    p = after + 4;
+                }
+
+                // Skip whitespace
+                while (*p && isspace(*p)) p++;
+
+                // Check if next is a string literal - wrap in LOWER()
+                if (*p == '\'') {
+                    // Find end of string
+                    const char *str_start = p;
+                    p++;
+                    while (*p && (*p != '\'' || *(p-1) == '\\')) p++;
+                    if (*p == '\'') p++;
+
+                    // Write LOWER('value')
+                    memcpy(out, "LOWER(", 6);
+                    out += 6;
+                    size_t str_len = p - str_start;
+                    memcpy(out, str_start, str_len);
+                    out += str_len;
+                    *out++ = ')';
+                }
+            }
+        }
+    }
+
+    *out = '\0';
+    return result;
 }
 
 char* fix_integer_text_mismatch(const char *sql) {

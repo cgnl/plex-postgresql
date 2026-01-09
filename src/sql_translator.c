@@ -132,6 +132,9 @@ char* sql_translate_functions(const char *sql) {
     // 15c. Strip "collate icu_root"
     TRANSLATE(strip_icu_collation);
 
+    // 15c2. Translate COLLATE NOCASE to LOWER()
+    TRANSLATE(translate_collate_nocase);
+
     // 15d. Fix JSON operator ->> on TEXT columns
     TRANSLATE(fix_json_operator_on_text);
 
