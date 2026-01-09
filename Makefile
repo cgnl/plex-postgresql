@@ -55,7 +55,7 @@ DB_INTERPOSE_OBJS = $(DB_INTERPOSE_CORE) $(DB_INTERPOSE_SHARED)
 OBJECTS = $(SQL_TR_OBJS) $(PG_MODULES) $(DB_INTERPOSE_OBJS) src/fishhook.o
 LINUX_OBJECTS = $(SQL_TR_OBJS) $(PG_MODULES) $(DB_INTERPOSE_SHARED) src/db_interpose_core_linux.o
 
-.PHONY: all clean install test macos linux run stop unit-test test-recursion
+.PHONY: all clean install test macos linux run stop unit-test test-recursion test-crash
 
 all: $(TARGET)
 
@@ -234,6 +234,16 @@ test-recursion: $(TEST_BIN_DIR)/test_recursion
 	@./$(TEST_BIN_DIR)/test_recursion
 	@echo ""
 
+# Test for crash scenarios from production history
+$(TEST_BIN_DIR)/test_crash_scenarios: $(TEST_DIR)/test_crash_scenarios.c
+	@mkdir -p $(TEST_BIN_DIR)
+	$(CC) -o $@ $< -lpthread -Wall -Wextra
+
+test-crash: $(TEST_BIN_DIR)/test_crash_scenarios
+	@echo ""
+	@./$(TEST_BIN_DIR)/test_crash_scenarios
+	@echo ""
+
 # Run all unit tests
-unit-test: test-recursion
+unit-test: test-recursion test-crash
 	@echo "All unit tests complete."
