@@ -196,6 +196,10 @@ void pg_client_cleanup(void) {
 // Connection Registry
 // ============================================================================
 
+// Thread-local cache for repeated lookups (same db handle used thousands of times)
+static __thread sqlite3 *tls_cached_db = NULL;
+static __thread pg_connection_t *tls_cached_conn = NULL;
+
 void pg_register_connection(pg_connection_t *conn) {
     if (!conn) return;
 
@@ -237,6 +241,12 @@ void pg_register_connection(pg_connection_t *conn) {
 void pg_unregister_connection(pg_connection_t *conn) {
     if (!conn) return;
 
+    // Invalidate TLS cache for this thread (other threads protected by is_pg_active check)
+    if (tls_cached_conn == conn) {
+        tls_cached_db = NULL;
+        tls_cached_conn = NULL;
+    }
+
     pthread_mutex_lock(&connections_mutex);
 
     // Remove from array
@@ -269,7 +279,19 @@ void pg_unregister_connection(pg_connection_t *conn) {
 pg_connection_t* pg_find_connection(sqlite3 *db) {
     if (!db) return NULL;
 
-    // O(1) hash table lookup instead of O(n) linear scan
+    // Fast path: thread-local cache hit (>99% of calls)
+    // Plex reuses the same sqlite3* handle for thousands of queries
+    if (db == tls_cached_db && tls_cached_conn != NULL) {
+        // Verify connection is still valid (not closed/recycled)
+        if (tls_cached_conn->is_pg_active) {
+            return tls_cached_conn;
+        }
+        // Cache stale, clear it
+        tls_cached_db = NULL;
+        tls_cached_conn = NULL;
+    }
+
+    // Slow path: hash table lookup with lock
     pthread_mutex_lock(&connections_mutex);
 
     uint32_t bucket = hash_ptr(db);
@@ -321,6 +343,9 @@ pg_connection_t* pg_find_connection(sqlite3 *db) {
                 }
             }
             pthread_mutex_unlock(&pool_mutex);
+            // Cache for next lookup
+            tls_cached_db = db;
+            tls_cached_conn = pool_conn;
             return pool_conn;
         }
         // Pool is full - return NULL to fall back to SQLite
@@ -328,6 +353,9 @@ pg_connection_t* pg_find_connection(sqlite3 *db) {
         LOG_DEBUG("Pool full for library.db, falling back to SQLite");
         return NULL;
     }
+    // Cache for next lookup
+    tls_cached_db = db;
+    tls_cached_conn = handle_conn;
     return handle_conn;
 }
 
