@@ -20,7 +20,8 @@ int pg_ensure_connection(pg_connection_t *conn);
 // Connection registry (maps sqlite3* -> pg_connection_t*)
 void pg_register_connection(pg_connection_t *conn);
 void pg_unregister_connection(pg_connection_t *conn);
-pg_connection_t* pg_find_connection(sqlite3 *db);
+pg_connection_t* pg_find_connection(sqlite3 *db);          // Returns pool conn for library.db
+pg_connection_t* pg_find_handle_connection(sqlite3 *db);   // Returns registered handle (never pool)
 pg_connection_t* pg_find_any_library_connection(void);
 
 // Thread-local connection (one PG connection per thread for library.db)

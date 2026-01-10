@@ -51,9 +51,7 @@ static void signal_handler(int sig) {
     raise(sig);
 }
 
-static void exit_handler(void) {
-    print_backtrace("EXIT/ATEXIT");
-}
+// Note: exit_handler removed - was used for debugging crash, but now fixed
 
 // ============================================================================
 // Global State Definitions (exported via db_interpose.h)
@@ -508,7 +506,7 @@ static void shim_init(void) {
     signal(SIGBUS, signal_handler);
     signal(SIGFPE, signal_handler);
     signal(SIGILL, signal_handler);
-    atexit(exit_handler);
+    // Note: atexit handler removed - was used for debugging
 
     pg_logging_init();
     LOG_INFO("=== Plex PostgreSQL Interpose Shim loaded ===");

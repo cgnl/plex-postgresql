@@ -276,6 +276,30 @@ void pg_unregister_connection(pg_connection_t *conn) {
     pthread_mutex_unlock(&connections_mutex);
 }
 
+// Find the handle connection (registered connection) for a sqlite3* handle
+// This returns the connection registered in connections[] array, NOT a pool connection
+// Used for close operations to clean up the right object
+pg_connection_t* pg_find_handle_connection(sqlite3 *db) {
+    if (!db) return NULL;
+
+    pthread_mutex_lock(&connections_mutex);
+
+    uint32_t bucket = hash_ptr(db);
+    conn_hash_entry_t *entry = conn_hash_table[bucket];
+    pg_connection_t *handle_conn = NULL;
+
+    while (entry) {
+        if (entry->db == db) {
+            handle_conn = entry->conn;
+            break;
+        }
+        entry = entry->next;
+    }
+
+    pthread_mutex_unlock(&connections_mutex);
+    return handle_conn;
+}
+
 pg_connection_t* pg_find_connection(sqlite3 *db) {
     if (!db) return NULL;
 

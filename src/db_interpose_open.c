@@ -130,31 +130,35 @@ int my_sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, const ch
 // ============================================================================
 
 int my_sqlite3_close(sqlite3 *db) {
-    pg_connection_t *pg_conn = pg_find_connection(db);
-    if (pg_conn) {
-        LOG_INFO("CLOSE: PostgreSQL connection for %s", pg_conn->db_path);
+    // Get the handle connection (NOT pool connection) for this db
+    pg_connection_t *handle_conn = pg_find_handle_connection(db);
+    if (handle_conn) {
+        LOG_INFO("CLOSE: PostgreSQL connection for %s", handle_conn->db_path);
 
-        // If this is a library.db, release pool connection
-        if (strstr(pg_conn->db_path, "com.plexapp.plugins.library.db")) {
+        // If this is a library.db, release pool connection back to pool (don't free it!)
+        if (strstr(handle_conn->db_path, "com.plexapp.plugins.library.db")) {
             pg_close_pool_for_db(db);
         }
 
-        pg_unregister_connection(pg_conn);
-        pg_close(pg_conn);
+        // Unregister and close the handle connection (not the pool connection)
+        pg_unregister_connection(handle_conn);
+        pg_close(handle_conn);
     }
     return orig_sqlite3_close ? orig_sqlite3_close(db) : SQLITE_ERROR;
 }
 
 int my_sqlite3_close_v2(sqlite3 *db) {
-    pg_connection_t *pg_conn = pg_find_connection(db);
-    if (pg_conn) {
-        // If this is a library.db, release pool connection
-        if (strstr(pg_conn->db_path, "com.plexapp.plugins.library.db")) {
+    // Get the handle connection (NOT pool connection) for this db
+    pg_connection_t *handle_conn = pg_find_handle_connection(db);
+    if (handle_conn) {
+        // If this is a library.db, release pool connection back to pool (don't free it!)
+        if (strstr(handle_conn->db_path, "com.plexapp.plugins.library.db")) {
             pg_close_pool_for_db(db);
         }
 
-        pg_unregister_connection(pg_conn);
-        pg_close(pg_conn);
+        // Unregister and close the handle connection (not the pool connection)
+        pg_unregister_connection(handle_conn);
+        pg_close(handle_conn);
     }
     return orig_sqlite3_close_v2 ? orig_sqlite3_close_v2(db) : SQLITE_ERROR;
 }
