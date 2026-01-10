@@ -36,10 +36,12 @@ RUN cd postgresql-15.10 && \
 COPY src/ src/
 COPY include/ include/
 
-# Build shim with musl 1.2.2 (same as Plex) - include debug symbols
-# Use rpath to find libpq in our lib directory
-# Now using modular build (same structure as Mac)
-RUN gcc -shared -fPIC -g -o db_interpose_pg.so \
+# Build shim with musl 1.2.2 (same as Plex)
+# Compiler flags match build_shim_musl.sh for consistency and performance
+# Note: Can't use -nodefaultlibs here because Plex's musl isn't available during build
+RUN gcc -shared -fPIC -O2 -fno-stack-protector \
+    -std=c11 -D_XOPEN_SOURCE=700 -mno-outline-atomics \
+    -o db_interpose_pg.so \
     src/db_interpose_core_linux.c \
     src/db_interpose_open.c src/db_interpose_exec.c \
     src/db_interpose_prepare.c src/db_interpose_bind.c \
@@ -53,7 +55,8 @@ RUN gcc -shared -fPIC -g -o db_interpose_pg.so \
     -I/usr/local/pgsql/include -I/usr/include -Iinclude -Isrc \
     -L/usr/local/pgsql/lib -lpq \
     -ldl -lpthread \
-    -Wl,-rpath,/usr/local/lib/plex-postgresql
+    -Wl,-rpath,/usr/local/lib/plex-postgresql \
+    -Wl,-rpath,/usr/lib/plexmediaserver/lib
 
 # Check dependencies
 RUN echo "=== Shim dependencies ===" && (LD_LIBRARY_PATH=/usr/local/pgsql/lib ldd db_interpose_pg.so || true)
