@@ -39,3 +39,28 @@ tests/bin/
 *.backup
 *.bak
 postgresql-15.3/
+
+# Debug scripts and output
+debug_*.sh
+debug_*.lldb
+lldb_*.txt
+run_plex_debug.sh
+verify_function_pointers.sh
+*.lldb
+
+# Temporary benchmark binaries (root level)
+/bench_*
+/test_stack_calc
+/test_stack_calc.c
+/test_old.dylib
+/test_fork_fix.sh
+/test_stack_protection.sh
+
+# Temporary fix scripts
+/fix_*.py
+/direct_poster_download.py
+/turbo_poster_fix.py
+/fast_poster_fix.py
+
+# Release builds
+/release/

@@ -12,11 +12,12 @@ ifeq ($(UNAME_S),Darwin)
     PG_INCLUDE = /opt/homebrew/opt/postgresql@15/include
     PG_LIB = /opt/homebrew/opt/postgresql@15/lib
     # Added -Isrc to find new headers
-    CFLAGS = -Wall -Wextra -O2 -I$(PG_INCLUDE) -Iinclude -Isrc
+    # -fvisibility=hidden: hide internal symbols, only export sqlite3 interception functions
+    CFLAGS = -Wall -Wextra -O2 -I$(PG_INCLUDE) -Iinclude -Isrc -fvisibility=hidden
     LDFLAGS = -L$(PG_LIB) -lpq
     TARGET = db_interpose_pg.dylib
     SOURCE = src/db_interpose_pg.c
-    SHARED_FLAGS = -dynamiclib -flat_namespace -undefined dynamic_lookup
+    SHARED_FLAGS = -dynamiclib -undefined dynamic_lookup
 else
     # Linux
     CC = gcc
@@ -65,7 +66,7 @@ $(TARGET): $(OBJECTS)
 
 # Explicit macOS build - use dynamic_lookup instead of linking sqlite3
 macos: $(OBJECTS)
-	clang -dynamiclib -flat_namespace -undefined dynamic_lookup -o db_interpose_pg.dylib $(OBJECTS) \
+	clang -dynamiclib -undefined dynamic_lookup -o db_interpose_pg.dylib $(OBJECTS) \
 		-I/opt/homebrew/opt/postgresql@15/include -Iinclude -Isrc \
 		-L/opt/homebrew/opt/postgresql@15/lib -lpq
 
@@ -339,3 +340,120 @@ endif
 # Run all unit tests
 unit-test: test-recursion test-crash test-sql test-cache test-tls test-api test-expanded
 	@echo "All unit tests complete."
+
+# ============================================================================
+# Release builds
+# ============================================================================
+
+RELEASE_DIR = release
+VERSION = $(shell cat VERSION 2>/dev/null || echo "dev")
+
+# Architecture-specific builds (macOS only)
+release-arm64: clean
+	@echo "Building arm64..."
+	@for src in $(SQL_TR_OBJS:.o=.c) $(PG_MODULES:.o=.c) $(DB_INTERPOSE_SHARED:.o=.c) src/db_interpose_core.c src/fishhook.c; do \
+		obj=$$(echo $$src | sed 's/\.c$$/.o/'); \
+		$(CC) -c -fPIC -arch arm64 -o $$obj $$src $(CFLAGS); \
+	done
+	$(CC) -dynamiclib -undefined dynamic_lookup -arch arm64 -o db_interpose_pg-arm64.dylib $(OBJECTS) $(CFLAGS) $(LDFLAGS)
+	@echo "Built db_interpose_pg-arm64.dylib"
+
+release-x86_64: clean
+	@echo "Building x86_64..."
+	@for src in $(SQL_TR_OBJS:.o=.c) $(PG_MODULES:.o=.c) $(DB_INTERPOSE_SHARED:.o=.c) src/db_interpose_core.c src/fishhook.c; do \
+		obj=$$(echo $$src | sed 's/\.c$$/.o/'); \
+		$(CC) -c -fPIC -arch x86_64 -o $$obj $$src $(CFLAGS); \
+	done
+	$(CC) -dynamiclib -undefined dynamic_lookup -arch x86_64 -o db_interpose_pg-x86_64.dylib $(OBJECTS) $(CFLAGS) $(LDFLAGS)
+	@echo "Built db_interpose_pg-x86_64.dylib"
+
+# Universal binary (both architectures)
+release-universal:
+	@echo "Building universal binary for v$(VERSION)..."
+	@mkdir -p $(RELEASE_DIR)/v$(VERSION)
+	@# Build arm64
+	@$(MAKE) clean >/dev/null
+	@for src in $(SQL_TR_OBJS:.o=.c) $(PG_MODULES:.o=.c) $(DB_INTERPOSE_SHARED:.o=.c) src/db_interpose_core.c src/fishhook.c; do \
+		obj=$$(echo $$src | sed 's/\.c$$/.o/'); \
+		$(CC) -c -fPIC -arch arm64 -o $$obj $$src $(CFLAGS) 2>/dev/null; \
+	done
+	@$(CC) -dynamiclib -undefined dynamic_lookup -arch arm64 -o $(RELEASE_DIR)/v$(VERSION)/db_interpose_pg-arm64.dylib $(OBJECTS) $(CFLAGS) $(LDFLAGS)
+	@echo "  ✓ arm64"
+	@# Build x86_64
+	@$(MAKE) clean >/dev/null
+	@for src in $(SQL_TR_OBJS:.o=.c) $(PG_MODULES:.o=.c) $(DB_INTERPOSE_SHARED:.o=.c) src/db_interpose_core.c src/fishhook.c; do \
+		obj=$$(echo $$src | sed 's/\.c$$/.o/'); \
+		$(CC) -c -fPIC -arch x86_64 -o $$obj $$src $(CFLAGS) 2>/dev/null; \
+	done
+	@$(CC) -dynamiclib -undefined dynamic_lookup -arch x86_64 -o $(RELEASE_DIR)/v$(VERSION)/db_interpose_pg-x86_64.dylib $(OBJECTS) $(CFLAGS) $(LDFLAGS)
+	@echo "  ✓ x86_64"
+	@# Create universal binary
+	@lipo -create \
+		$(RELEASE_DIR)/v$(VERSION)/db_interpose_pg-arm64.dylib \
+		$(RELEASE_DIR)/v$(VERSION)/db_interpose_pg-x86_64.dylib \
+		-output $(RELEASE_DIR)/v$(VERSION)/db_interpose_pg.dylib
+	@echo "  ✓ universal"
+	@# Show result
+	@echo ""
+	@echo "Release v$(VERSION) built:"
+	@ls -lh $(RELEASE_DIR)/v$(VERSION)/*.dylib
+	@echo ""
+	@file $(RELEASE_DIR)/v$(VERSION)/db_interpose_pg.dylib
+
+# Create macOS release tarball
+release: release-universal
+	@echo "Packaging macOS release..."
+	@cd $(RELEASE_DIR)/v$(VERSION) && \
+		mkdir -p scripts && \
+		cp ../../README.md ../../LICENSE ../../CHANGELOG.md ../../RELEASE_NOTES.md ../../INSTALL.md . 2>/dev/null || true && \
+		cp ../../scripts/install_wrappers.sh scripts/ && \
+		cp ../../scripts/install_wrappers_linux.sh scripts/ && \
+		cp ../../scripts/uninstall_wrappers.sh scripts/ && \
+		cp ../../scripts/uninstall_wrappers_linux.sh scripts/ && \
+		cp ../../scripts/migrate_sqlite_to_pg.sh scripts/ && \
+		cp ../../scripts/docker-entrypoint.sh scripts/ && \
+		tar -czf ../plex-postgresql-v$(VERSION)-macos.tar.gz \
+			*.dylib README.md LICENSE CHANGELOG.md RELEASE_NOTES.md INSTALL.md scripts/
+	@echo "  ✓ $(RELEASE_DIR)/plex-postgresql-v$(VERSION)-macos.tar.gz"
+	@ls -lh $(RELEASE_DIR)/plex-postgresql-v$(VERSION)-macos.tar.gz
+
+# Build Linux release (requires Docker)
+release-linux:
+	@echo "Building Linux binaries via Docker..."
+	@mkdir -p $(RELEASE_DIR)/v$(VERSION)
+	@# Build aarch64
+	docker buildx build --platform linux/arm64 --target builder -t plex-pg-builder-arm64 --load . 2>&1 | tail -3
+	docker rm -f plex-pg-extract 2>/dev/null || true
+	docker create --name plex-pg-extract plex-pg-builder-arm64
+	docker cp plex-pg-extract:/libs/db_interpose_pg.so $(RELEASE_DIR)/v$(VERSION)/db_interpose_pg-linux-aarch64.so
+	docker cp plex-pg-extract:/libs/libpq.so.5 $(RELEASE_DIR)/v$(VERSION)/
+	docker rm plex-pg-extract
+	@echo "  ✓ linux-aarch64"
+	@# Build x86_64
+	docker buildx build --platform linux/amd64 --target builder -t plex-pg-builder-amd64 --load . 2>&1 | tail -3
+	docker rm -f plex-pg-extract 2>/dev/null || true
+	docker create --name plex-pg-extract plex-pg-builder-amd64
+	docker cp plex-pg-extract:/libs/db_interpose_pg.so $(RELEASE_DIR)/v$(VERSION)/db_interpose_pg-linux-x86_64.so
+	docker rm plex-pg-extract
+	@echo "  ✓ linux-x86_64"
+	@# Package
+	@cd $(RELEASE_DIR)/v$(VERSION) && \
+		mkdir -p scripts && \
+		cp ../../README.md ../../LICENSE ../../CHANGELOG.md ../../RELEASE_NOTES.md ../../INSTALL.md . 2>/dev/null || true && \
+		cp ../../scripts/install_wrappers.sh scripts/ && \
+		cp ../../scripts/install_wrappers_linux.sh scripts/ && \
+		cp ../../scripts/uninstall_wrappers.sh scripts/ && \
+		cp ../../scripts/uninstall_wrappers_linux.sh scripts/ && \
+		cp ../../scripts/migrate_sqlite_to_pg.sh scripts/ && \
+		cp ../../scripts/docker-entrypoint.sh scripts/ && \
+		tar -czf ../plex-postgresql-v$(VERSION)-linux.tar.gz \
+			db_interpose_pg-linux-*.so libpq.so.5 \
+			README.md LICENSE CHANGELOG.md RELEASE_NOTES.md INSTALL.md scripts/
+	@echo "  ✓ $(RELEASE_DIR)/plex-postgresql-v$(VERSION)-linux.tar.gz"
+	@ls -lh $(RELEASE_DIR)/plex-postgresql-v$(VERSION)-linux.tar.gz
+
+# Full release (macOS + Linux)
+release-all: release release-linux
+	@echo ""
+	@echo "=== Release v$(VERSION) Complete ==="
+	@ls -lh $(RELEASE_DIR)/plex-postgresql-v$(VERSION)-*.tar.gz

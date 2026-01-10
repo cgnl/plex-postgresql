@@ -14,6 +14,7 @@
 #include <stdatomic.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 // Socket timeout for PostgreSQL connections (prevents infinite poll() waits)
 #define PG_SOCKET_TIMEOUT_SEC 60
@@ -65,6 +66,9 @@ static inline uint32_t hash_ptr(const void *ptr) {
 }
 static volatile int client_initialized = 0;
 static pthread_once_t client_init_once = PTHREAD_ONCE_INIT;
+
+// PID tracking for fork detection (posix_spawn doesn't trigger pthread_atfork)
+static pid_t init_pid = 0;
 
 // Connection pool for library.db
 static pool_slot_t library_pool[POOL_SIZE_MAX];
@@ -128,9 +132,56 @@ static void pg_set_socket_timeout(PGconn *pg_conn) {
 // Initialization
 // ============================================================================
 
+// Reset pool state for child process (without closing parent's connections)
+static void reset_pool_for_child(void) {
+    LOG_INFO("[FORK_CHILD] Detected fork (PID %d -> %d), clearing inherited pool",
+             (int)init_pid, (int)getpid());
+
+    // Clear connection array (don't close - parent owns these!)
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        connections[i] = NULL;
+    }
+
+    // Clear pool slots (don't close connections!)
+    for (int i = 0; i < POOL_SIZE_MAX; i++) {
+        library_pool[i].conn = NULL;
+        library_pool[i].owner_thread = 0;
+        atomic_store(&library_pool[i].state, SLOT_FREE);
+    }
+
+    // Clear hash table
+    for (int i = 0; i < CONN_HASH_BUCKETS; i++) {
+        conn_hash_entry_t *entry = conn_hash_table[i];
+        while (entry) {
+            conn_hash_entry_t *next = entry->next;
+            free(entry);
+            entry = next;
+        }
+        conn_hash_table[i] = NULL;
+    }
+
+    // Clear db_to_pool mapping
+    db_to_pool_count = 0;
+    memset(db_to_pool, 0, sizeof(db_to_pool));
+
+    // Update PID to current
+    init_pid = getpid();
+}
+
+// Check if we're in a forked child and reset pool if needed
+static void check_fork_status(void) {
+    pid_t current_pid = getpid();
+    if (init_pid != 0 && init_pid != current_pid) {
+        reset_pool_for_child();
+    }
+}
+
 static void do_client_init(void) {
     memset(connections, 0, sizeof(connections));
     memset(library_pool, 0, sizeof(library_pool));
+
+    // Track PID for fork detection
+    init_pid = getpid();
 
     // Read pool size from environment (default: 50, max: 100)
     const char *pool_env = getenv("PLEX_PG_POOL_SIZE");
@@ -302,6 +353,9 @@ pg_connection_t* pg_find_handle_connection(sqlite3 *db) {
 
 pg_connection_t* pg_find_connection(sqlite3 *db) {
     if (!db) return NULL;
+
+    // Check if we're in a forked child process
+    check_fork_status();
 
     // Fast path: thread-local cache hit (>99% of calls)
     // Plex reuses the same sqlite3* handle for thousands of queries
@@ -584,6 +638,9 @@ static __thread int tls_pool_slot = -1;
 static __thread uint32_t tls_pool_generation = 0;
 
 static pg_connection_t* pool_get_connection(const char *db_path) {
+    // Check if we're in a forked child process
+    check_fork_status();
+
     if (!is_library_db(db_path)) {
         return NULL;
     }
@@ -1152,6 +1209,34 @@ void pg_set_global_last_insert_rowid(sqlite3_int64 id) {
     pthread_mutex_lock(&global_rowid_mutex);
     global_last_insert_rowid = id;
     pthread_mutex_unlock(&global_rowid_mutex);
+}
+
+// ============================================================================
+// Fork Safety - Connection Pool Cleanup
+// ============================================================================
+
+// Called by pthread_atfork handler in child process after fork()
+// Clears all inherited connection pool state to prevent use-after-fork bugs
+void pg_pool_cleanup_after_fork(void) {
+    // Clear all connection pool state WITHOUT closing sockets
+    // (parent process still owns them - closing would kill parent's queries)
+    for (int i = 0; i < POOL_SIZE_MAX; i++) {
+        if (library_pool[i].conn) {
+            // Don't call PQfinish - parent owns these sockets
+            // Just clear our references
+            library_pool[i].conn = NULL;
+            library_pool[i].owner_thread = 0;
+            library_pool[i].last_used = 0;
+            atomic_store(&library_pool[i].state, SLOT_FREE);
+            atomic_store(&library_pool[i].generation, 0);
+        }
+    }
+
+    // Clear thread-local caches (each thread has its own, but child starts fresh)
+    tls_cached_db = NULL;
+    tls_cached_conn = NULL;
+    tls_pool_slot = -1;
+    tls_pool_generation = 0;
 }
 
 // ============================================================================

@@ -66,74 +66,77 @@ void *sqlite_handle = NULL;
 
 // Original SQLite function pointers (populated by fishhook rebind_symbols)
 // These are called by our my_* implementations to invoke the real SQLite
-int (*orig_sqlite3_open)(const char*, sqlite3**) = NULL;
-int (*orig_sqlite3_open_v2)(const char*, sqlite3**, int, const char*) = NULL;
-int (*orig_sqlite3_close)(sqlite3*) = NULL;
-int (*orig_sqlite3_close_v2)(sqlite3*) = NULL;
-int (*orig_sqlite3_exec)(sqlite3*, const char*, int(*)(void*,int,char**,char**), void*, char**) = NULL;
-int (*orig_sqlite3_changes)(sqlite3*) = NULL;
-sqlite3_int64 (*orig_sqlite3_changes64)(sqlite3*) = NULL;
-sqlite3_int64 (*orig_sqlite3_last_insert_rowid)(sqlite3*) = NULL;
-int (*orig_sqlite3_get_table)(sqlite3*, const char*, char***, int*, int*, char**) = NULL;
+// CRITICAL: VISIBLE attribute ensures child processes can resolve these symbols
+VISIBLE int (*orig_sqlite3_open)(const char*, sqlite3**) = NULL;
+VISIBLE int (*orig_sqlite3_open_v2)(const char*, sqlite3**, int, const char*) = NULL;
+VISIBLE int (*orig_sqlite3_close)(sqlite3*) = NULL;
+VISIBLE int (*orig_sqlite3_close_v2)(sqlite3*) = NULL;
+VISIBLE int (*orig_sqlite3_exec)(sqlite3*, const char*, int(*)(void*,int,char**,char**), void*, char**) = NULL;
+VISIBLE int (*orig_sqlite3_changes)(sqlite3*) = NULL;
+VISIBLE sqlite3_int64 (*orig_sqlite3_changes64)(sqlite3*) = NULL;
+VISIBLE sqlite3_int64 (*orig_sqlite3_last_insert_rowid)(sqlite3*) = NULL;
+VISIBLE int (*orig_sqlite3_get_table)(sqlite3*, const char*, char***, int*, int*, char**) = NULL;
 
-const char* (*orig_sqlite3_errmsg)(sqlite3*) = NULL;
-int (*orig_sqlite3_errcode)(sqlite3*) = NULL;
-int (*orig_sqlite3_extended_errcode)(sqlite3*) = NULL;
+VISIBLE const char* (*orig_sqlite3_errmsg)(sqlite3*) = NULL;
+VISIBLE int (*orig_sqlite3_errcode)(sqlite3*) = NULL;
+VISIBLE int (*orig_sqlite3_extended_errcode)(sqlite3*) = NULL;
 
-int (*orig_sqlite3_prepare)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
-int (*orig_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
-int (*orig_sqlite3_prepare_v3)(sqlite3*, const char*, int, unsigned int, sqlite3_stmt**, const char**) = NULL;
-int (*orig_sqlite3_prepare16_v2)(sqlite3*, const void*, int, sqlite3_stmt**, const void**) = NULL;
+VISIBLE int (*orig_sqlite3_prepare)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
+VISIBLE int (*orig_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
+VISIBLE int (*orig_sqlite3_prepare_v3)(sqlite3*, const char*, int, unsigned int, sqlite3_stmt**, const char**) = NULL;
+VISIBLE int (*orig_sqlite3_prepare16_v2)(sqlite3*, const void*, int, sqlite3_stmt**, const void**) = NULL;
 
-int (*orig_sqlite3_bind_int)(sqlite3_stmt*, int, int) = NULL;
-int (*orig_sqlite3_bind_int64)(sqlite3_stmt*, int, sqlite3_int64) = NULL;
-int (*orig_sqlite3_bind_double)(sqlite3_stmt*, int, double) = NULL;
-int (*orig_sqlite3_bind_text)(sqlite3_stmt*, int, const char*, int, void(*)(void*)) = NULL;
-int (*orig_sqlite3_bind_text64)(sqlite3_stmt*, int, const char*, sqlite3_uint64, void(*)(void*), unsigned char) = NULL;
-int (*orig_sqlite3_bind_blob)(sqlite3_stmt*, int, const void*, int, void(*)(void*)) = NULL;
-int (*orig_sqlite3_bind_blob64)(sqlite3_stmt*, int, const void*, sqlite3_uint64, void(*)(void*)) = NULL;
-int (*orig_sqlite3_bind_value)(sqlite3_stmt*, int, const sqlite3_value*) = NULL;
-int (*orig_sqlite3_bind_null)(sqlite3_stmt*, int) = NULL;
+VISIBLE int (*orig_sqlite3_bind_int)(sqlite3_stmt*, int, int) = NULL;
+VISIBLE int (*orig_sqlite3_bind_int64)(sqlite3_stmt*, int, sqlite3_int64) = NULL;
+VISIBLE int (*orig_sqlite3_bind_double)(sqlite3_stmt*, int, double) = NULL;
+VISIBLE int (*orig_sqlite3_bind_text)(sqlite3_stmt*, int, const char*, int, void(*)(void*)) = NULL;
+VISIBLE int (*orig_sqlite3_bind_text64)(sqlite3_stmt*, int, const char*, sqlite3_uint64, void(*)(void*), unsigned char) = NULL;
+VISIBLE int (*orig_sqlite3_bind_blob)(sqlite3_stmt*, int, const void*, int, void(*)(void*)) = NULL;
+VISIBLE int (*orig_sqlite3_bind_blob64)(sqlite3_stmt*, int, const void*, sqlite3_uint64, void(*)(void*)) = NULL;
+VISIBLE int (*orig_sqlite3_bind_value)(sqlite3_stmt*, int, const sqlite3_value*) = NULL;
+VISIBLE int (*orig_sqlite3_bind_null)(sqlite3_stmt*, int) = NULL;
 
-int (*orig_sqlite3_step)(sqlite3_stmt*) = NULL;
-int (*orig_sqlite3_reset)(sqlite3_stmt*) = NULL;
-int (*orig_sqlite3_finalize)(sqlite3_stmt*) = NULL;
-int (*orig_sqlite3_clear_bindings)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_step)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_reset)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_finalize)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_clear_bindings)(sqlite3_stmt*) = NULL;
 
-int (*orig_sqlite3_column_count)(sqlite3_stmt*) = NULL;
-int (*orig_sqlite3_column_type)(sqlite3_stmt*, int) = NULL;
-int (*orig_sqlite3_column_int)(sqlite3_stmt*, int) = NULL;
-sqlite3_int64 (*orig_sqlite3_column_int64)(sqlite3_stmt*, int) = NULL;
-double (*orig_sqlite3_column_double)(sqlite3_stmt*, int) = NULL;
-const unsigned char* (*orig_sqlite3_column_text)(sqlite3_stmt*, int) = NULL;
-const void* (*orig_sqlite3_column_blob)(sqlite3_stmt*, int) = NULL;
-int (*orig_sqlite3_column_bytes)(sqlite3_stmt*, int) = NULL;
-const char* (*orig_sqlite3_column_name)(sqlite3_stmt*, int) = NULL;
-sqlite3_value* (*orig_sqlite3_column_value)(sqlite3_stmt*, int) = NULL;
-int (*orig_sqlite3_data_count)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_column_count)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_column_type)(sqlite3_stmt*, int) = NULL;
+VISIBLE int (*orig_sqlite3_column_int)(sqlite3_stmt*, int) = NULL;
+VISIBLE sqlite3_int64 (*orig_sqlite3_column_int64)(sqlite3_stmt*, int) = NULL;
+VISIBLE double (*orig_sqlite3_column_double)(sqlite3_stmt*, int) = NULL;
+VISIBLE const unsigned char* (*orig_sqlite3_column_text)(sqlite3_stmt*, int) = NULL;
+VISIBLE const void* (*orig_sqlite3_column_blob)(sqlite3_stmt*, int) = NULL;
+VISIBLE int (*orig_sqlite3_column_bytes)(sqlite3_stmt*, int) = NULL;
+VISIBLE const char* (*orig_sqlite3_column_name)(sqlite3_stmt*, int) = NULL;
+VISIBLE const char* (*orig_sqlite3_column_decltype)(sqlite3_stmt*, int) = NULL;
+VISIBLE sqlite3_value* (*orig_sqlite3_column_value)(sqlite3_stmt*, int) = NULL;
+VISIBLE int (*orig_sqlite3_data_count)(sqlite3_stmt*) = NULL;
 
-int (*orig_sqlite3_value_type)(sqlite3_value*) = NULL;
-const unsigned char* (*orig_sqlite3_value_text)(sqlite3_value*) = NULL;
-int (*orig_sqlite3_value_int)(sqlite3_value*) = NULL;
-sqlite3_int64 (*orig_sqlite3_value_int64)(sqlite3_value*) = NULL;
-double (*orig_sqlite3_value_double)(sqlite3_value*) = NULL;
-int (*orig_sqlite3_value_bytes)(sqlite3_value*) = NULL;
-const void* (*orig_sqlite3_value_blob)(sqlite3_value*) = NULL;
+VISIBLE int (*orig_sqlite3_value_type)(sqlite3_value*) = NULL;
+VISIBLE const unsigned char* (*orig_sqlite3_value_text)(sqlite3_value*) = NULL;
+VISIBLE int (*orig_sqlite3_value_int)(sqlite3_value*) = NULL;
+VISIBLE sqlite3_int64 (*orig_sqlite3_value_int64)(sqlite3_value*) = NULL;
+VISIBLE double (*orig_sqlite3_value_double)(sqlite3_value*) = NULL;
+VISIBLE int (*orig_sqlite3_value_bytes)(sqlite3_value*) = NULL;
+VISIBLE const void* (*orig_sqlite3_value_blob)(sqlite3_value*) = NULL;
 
-int (*orig_sqlite3_create_collation)(sqlite3*, const char*, int, void*, int(*)(void*,int,const void*,int,const void*)) = NULL;
-int (*orig_sqlite3_create_collation_v2)(sqlite3*, const char*, int, void*, int(*)(void*,int,const void*,int,const void*), void(*)(void*)) = NULL;
+VISIBLE int (*orig_sqlite3_create_collation)(sqlite3*, const char*, int, void*, int(*)(void*,int,const void*,int,const void*)) = NULL;
+VISIBLE int (*orig_sqlite3_create_collation_v2)(sqlite3*, const char*, int, void*, int(*)(void*,int,const void*,int,const void*), void(*)(void*)) = NULL;
 
 // New SQLite API functions
-void (*orig_sqlite3_free)(void*) = NULL;
-void* (*orig_sqlite3_malloc)(int) = NULL;
-sqlite3* (*orig_sqlite3_db_handle)(sqlite3_stmt*) = NULL;
-const char* (*orig_sqlite3_sql)(sqlite3_stmt*) = NULL;
-char* (*orig_sqlite3_expanded_sql)(sqlite3_stmt*) = NULL;
-int (*orig_sqlite3_bind_parameter_count)(sqlite3_stmt*) = NULL;
-int (*orig_sqlite3_stmt_readonly)(sqlite3_stmt*) = NULL;
-int (*orig_sqlite3_stmt_busy)(sqlite3_stmt*) = NULL;
-int (*orig_sqlite3_stmt_status)(sqlite3_stmt*, int, int) = NULL;
-const char* (*orig_sqlite3_bind_parameter_name)(sqlite3_stmt*, int) = NULL;
+VISIBLE void (*orig_sqlite3_free)(void*) = NULL;
+VISIBLE void* (*orig_sqlite3_malloc)(int) = NULL;
+VISIBLE sqlite3* (*orig_sqlite3_db_handle)(sqlite3_stmt*) = NULL;
+VISIBLE const char* (*orig_sqlite3_sql)(sqlite3_stmt*) = NULL;
+VISIBLE char* (*orig_sqlite3_expanded_sql)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_bind_parameter_count)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_bind_parameter_index)(sqlite3_stmt*, const char*) = NULL;
+VISIBLE int (*orig_sqlite3_stmt_readonly)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_stmt_busy)(sqlite3_stmt*) = NULL;
+VISIBLE int (*orig_sqlite3_stmt_status)(sqlite3_stmt*, int, int) = NULL;
+VISIBLE const char* (*orig_sqlite3_bind_parameter_name)(sqlite3_stmt*, int) = NULL;
 
 // Aliases for backward compatibility (used by prepare module)
 int (*real_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
@@ -434,6 +437,7 @@ static void setup_fishhook_rebindings(void) {
         {"sqlite3_column_blob", my_sqlite3_column_blob, (void**)&orig_sqlite3_column_blob},
         {"sqlite3_column_bytes", my_sqlite3_column_bytes, (void**)&orig_sqlite3_column_bytes},
         {"sqlite3_column_name", my_sqlite3_column_name, (void**)&orig_sqlite3_column_name},
+        {"sqlite3_column_decltype", my_sqlite3_column_decltype, (void**)&orig_sqlite3_column_decltype},
         {"sqlite3_column_value", my_sqlite3_column_value, (void**)&orig_sqlite3_column_value},
         {"sqlite3_data_count", my_sqlite3_data_count, (void**)&orig_sqlite3_data_count},
 
@@ -457,6 +461,7 @@ static void setup_fishhook_rebindings(void) {
         {"sqlite3_sql", my_sqlite3_sql, (void**)&orig_sqlite3_sql},
         {"sqlite3_expanded_sql", my_sqlite3_expanded_sql, (void**)&orig_sqlite3_expanded_sql},
         {"sqlite3_bind_parameter_count", my_sqlite3_bind_parameter_count, (void**)&orig_sqlite3_bind_parameter_count},
+        {"sqlite3_bind_parameter_index", my_sqlite3_bind_parameter_index, (void**)&orig_sqlite3_bind_parameter_index},
         {"sqlite3_stmt_readonly", my_sqlite3_stmt_readonly, (void**)&orig_sqlite3_stmt_readonly},
         {"sqlite3_stmt_busy", my_sqlite3_stmt_busy, (void**)&orig_sqlite3_stmt_busy},
         {"sqlite3_stmt_status", my_sqlite3_stmt_status, (void**)&orig_sqlite3_stmt_status},
@@ -491,6 +496,39 @@ static void setup_fishhook_rebindings(void) {
 }
 
 // ============================================================================
+// Fork Handlers - Critical for Connection Pool Safety
+// ============================================================================
+
+// Called in PARENT before fork()
+static void atfork_prepare(void) {
+    // No action needed - parent continues with its connections
+}
+
+// Called in PARENT after fork()
+static void atfork_parent(void) {
+    // No action needed - parent keeps its connections
+}
+
+// Called in CHILD after fork()
+static void atfork_child(void) {
+    // CRITICAL: Child process must NOT use parent's PostgreSQL connections
+    // The PostgreSQL protocol is not fork-safe - sockets are in the middle of I/O
+    // This prevents the crash where parent's query on slot N hangs while child
+    // initializes and creates connections in adjacent slots
+
+    // Use fprintf since logging may not be initialized yet
+    fprintf(stderr, "[FORK_CHILD] Cleaning up inherited connection pool\n");
+    fflush(stderr);
+
+    // Call pg_client cleanup function to clear pool state
+    extern void pg_pool_cleanup_after_fork(void);
+    pg_pool_cleanup_after_fork();
+
+    fprintf(stderr, "[FORK_CHILD] Pool cleared, child will create new connections\n");
+    fflush(stderr);
+}
+
+// ============================================================================
 // Constructor/Destructor
 // ============================================================================
 
@@ -507,6 +545,12 @@ static void shim_init(void) {
     signal(SIGFPE, signal_handler);
     signal(SIGILL, signal_handler);
     // Note: atexit handler removed - was used for debugging
+
+    // CRITICAL: Install fork handlers BEFORE any PostgreSQL connections are made
+    // This ensures child processes don't inherit parent's active connections
+    pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
+    fprintf(stderr, "[SHIM_INIT] Registered pthread_atfork handlers for connection pool safety\n");
+    fflush(stderr);
 
     pg_logging_init();
     LOG_INFO("=== Plex PostgreSQL Interpose Shim loaded ===");
@@ -536,12 +580,89 @@ static void shim_init(void) {
         }
     }
 
-    // If fishhook didn't set up the pointers, use dlsym as fallback
-    if (!real_sqlite3_prepare_v2 && sqlite_handle) {
+    // CRITICAL FIX: If fishhook didn't set up ANY pointers, use dlsym as fallback
+    // This happens when fishhook returns success but fails to actually rebind symbols
+    // We need to populate BOTH real_* (for recursion prevention) AND orig_* (for actual calls)
+    if (sqlite_handle && (!real_sqlite3_prepare_v2 || !orig_sqlite3_prepare_v2)) {
+        fprintf(stderr, "[SHIM_INIT] Fishhook incomplete, using dlsym fallback for ALL functions\n");
+
+        // Recursion prevention pointers (used in prepare module)
         real_sqlite3_prepare_v2 = dlsym(sqlite_handle, "sqlite3_prepare_v2");
         real_sqlite3_errmsg = dlsym(sqlite_handle, "sqlite3_errmsg");
         real_sqlite3_errcode = dlsym(sqlite_handle, "sqlite3_errcode");
-        fprintf(stderr, "[SHIM_INIT] Used dlsym fallback for real_sqlite3_* functions\n");
+
+        // CRITICAL: Also populate orig_* pointers that are actually called!
+        if (!orig_sqlite3_open) orig_sqlite3_open = dlsym(sqlite_handle, "sqlite3_open");
+        if (!orig_sqlite3_open_v2) orig_sqlite3_open_v2 = dlsym(sqlite_handle, "sqlite3_open_v2");
+        if (!orig_sqlite3_close) orig_sqlite3_close = dlsym(sqlite_handle, "sqlite3_close");
+        if (!orig_sqlite3_close_v2) orig_sqlite3_close_v2 = dlsym(sqlite_handle, "sqlite3_close_v2");
+        if (!orig_sqlite3_exec) orig_sqlite3_exec = dlsym(sqlite_handle, "sqlite3_exec");
+        if (!orig_sqlite3_get_table) orig_sqlite3_get_table = dlsym(sqlite_handle, "sqlite3_get_table");
+
+        if (!orig_sqlite3_changes) orig_sqlite3_changes = dlsym(sqlite_handle, "sqlite3_changes");
+        if (!orig_sqlite3_changes64) orig_sqlite3_changes64 = dlsym(sqlite_handle, "sqlite3_changes64");
+        if (!orig_sqlite3_last_insert_rowid) orig_sqlite3_last_insert_rowid = dlsym(sqlite_handle, "sqlite3_last_insert_rowid");
+        if (!orig_sqlite3_errmsg) orig_sqlite3_errmsg = dlsym(sqlite_handle, "sqlite3_errmsg");
+        if (!orig_sqlite3_errcode) orig_sqlite3_errcode = dlsym(sqlite_handle, "sqlite3_errcode");
+        if (!orig_sqlite3_extended_errcode) orig_sqlite3_extended_errcode = dlsym(sqlite_handle, "sqlite3_extended_errcode");
+
+        if (!orig_sqlite3_prepare) orig_sqlite3_prepare = dlsym(sqlite_handle, "sqlite3_prepare");
+        if (!orig_sqlite3_prepare_v2) orig_sqlite3_prepare_v2 = dlsym(sqlite_handle, "sqlite3_prepare_v2");
+        if (!orig_sqlite3_prepare_v3) orig_sqlite3_prepare_v3 = dlsym(sqlite_handle, "sqlite3_prepare_v3");
+        if (!orig_sqlite3_prepare16_v2) orig_sqlite3_prepare16_v2 = dlsym(sqlite_handle, "sqlite3_prepare16_v2");
+
+        if (!orig_sqlite3_bind_int) orig_sqlite3_bind_int = dlsym(sqlite_handle, "sqlite3_bind_int");
+        if (!orig_sqlite3_bind_int64) orig_sqlite3_bind_int64 = dlsym(sqlite_handle, "sqlite3_bind_int64");
+        if (!orig_sqlite3_bind_double) orig_sqlite3_bind_double = dlsym(sqlite_handle, "sqlite3_bind_double");
+        if (!orig_sqlite3_bind_text) orig_sqlite3_bind_text = dlsym(sqlite_handle, "sqlite3_bind_text");
+        if (!orig_sqlite3_bind_text64) orig_sqlite3_bind_text64 = dlsym(sqlite_handle, "sqlite3_bind_text64");
+        if (!orig_sqlite3_bind_blob) orig_sqlite3_bind_blob = dlsym(sqlite_handle, "sqlite3_bind_blob");
+        if (!orig_sqlite3_bind_blob64) orig_sqlite3_bind_blob64 = dlsym(sqlite_handle, "sqlite3_bind_blob64");
+        if (!orig_sqlite3_bind_value) orig_sqlite3_bind_value = dlsym(sqlite_handle, "sqlite3_bind_value");
+        if (!orig_sqlite3_bind_null) orig_sqlite3_bind_null = dlsym(sqlite_handle, "sqlite3_bind_null");
+
+        if (!orig_sqlite3_step) orig_sqlite3_step = dlsym(sqlite_handle, "sqlite3_step");
+        if (!orig_sqlite3_reset) orig_sqlite3_reset = dlsym(sqlite_handle, "sqlite3_reset");
+        if (!orig_sqlite3_finalize) orig_sqlite3_finalize = dlsym(sqlite_handle, "sqlite3_finalize");
+        if (!orig_sqlite3_clear_bindings) orig_sqlite3_clear_bindings = dlsym(sqlite_handle, "sqlite3_clear_bindings");
+
+        if (!orig_sqlite3_column_count) orig_sqlite3_column_count = dlsym(sqlite_handle, "sqlite3_column_count");
+        if (!orig_sqlite3_column_type) orig_sqlite3_column_type = dlsym(sqlite_handle, "sqlite3_column_type");
+        if (!orig_sqlite3_column_int) orig_sqlite3_column_int = dlsym(sqlite_handle, "sqlite3_column_int");
+        if (!orig_sqlite3_column_int64) orig_sqlite3_column_int64 = dlsym(sqlite_handle, "sqlite3_column_int64");
+        if (!orig_sqlite3_column_double) orig_sqlite3_column_double = dlsym(sqlite_handle, "sqlite3_column_double");
+        if (!orig_sqlite3_column_text) orig_sqlite3_column_text = dlsym(sqlite_handle, "sqlite3_column_text");
+        if (!orig_sqlite3_column_blob) orig_sqlite3_column_blob = dlsym(sqlite_handle, "sqlite3_column_blob");
+        if (!orig_sqlite3_column_bytes) orig_sqlite3_column_bytes = dlsym(sqlite_handle, "sqlite3_column_bytes");
+        if (!orig_sqlite3_column_name) orig_sqlite3_column_name = dlsym(sqlite_handle, "sqlite3_column_name");
+        if (!orig_sqlite3_column_decltype) orig_sqlite3_column_decltype = dlsym(sqlite_handle, "sqlite3_column_decltype");
+        if (!orig_sqlite3_column_value) orig_sqlite3_column_value = dlsym(sqlite_handle, "sqlite3_column_value");
+        if (!orig_sqlite3_data_count) orig_sqlite3_data_count = dlsym(sqlite_handle, "sqlite3_data_count");
+        if (!orig_sqlite3_db_handle) orig_sqlite3_db_handle = dlsym(sqlite_handle, "sqlite3_db_handle");
+        if (!orig_sqlite3_expanded_sql) orig_sqlite3_expanded_sql = dlsym(sqlite_handle, "sqlite3_expanded_sql");
+        if (!orig_sqlite3_sql) orig_sqlite3_sql = dlsym(sqlite_handle, "sqlite3_sql");
+        if (!orig_sqlite3_free) orig_sqlite3_free = dlsym(sqlite_handle, "sqlite3_free");
+        if (!orig_sqlite3_bind_parameter_name) orig_sqlite3_bind_parameter_name = dlsym(sqlite_handle, "sqlite3_bind_parameter_name");
+
+        if (!orig_sqlite3_value_type) orig_sqlite3_value_type = dlsym(sqlite_handle, "sqlite3_value_type");
+        if (!orig_sqlite3_value_text) orig_sqlite3_value_text = dlsym(sqlite_handle, "sqlite3_value_text");
+        if (!orig_sqlite3_value_int) orig_sqlite3_value_int = dlsym(sqlite_handle, "sqlite3_value_int");
+        if (!orig_sqlite3_value_int64) orig_sqlite3_value_int64 = dlsym(sqlite_handle, "sqlite3_value_int64");
+        if (!orig_sqlite3_value_double) orig_sqlite3_value_double = dlsym(sqlite_handle, "sqlite3_value_double");
+        if (!orig_sqlite3_value_bytes) orig_sqlite3_value_bytes = dlsym(sqlite_handle, "sqlite3_value_bytes");
+        if (!orig_sqlite3_value_blob) orig_sqlite3_value_blob = dlsym(sqlite_handle, "sqlite3_value_blob");
+
+        if (!orig_sqlite3_create_collation) orig_sqlite3_create_collation = dlsym(sqlite_handle, "sqlite3_create_collation");
+        if (!orig_sqlite3_create_collation_v2) orig_sqlite3_create_collation_v2 = dlsym(sqlite_handle, "sqlite3_create_collation_v2");
+
+        if (!orig_sqlite3_malloc) orig_sqlite3_malloc = dlsym(sqlite_handle, "sqlite3_malloc");
+        if (!orig_sqlite3_bind_parameter_count) orig_sqlite3_bind_parameter_count = dlsym(sqlite_handle, "sqlite3_bind_parameter_count");
+        if (!orig_sqlite3_bind_parameter_index) orig_sqlite3_bind_parameter_index = dlsym(sqlite_handle, "sqlite3_bind_parameter_index");
+        if (!orig_sqlite3_stmt_readonly) orig_sqlite3_stmt_readonly = dlsym(sqlite_handle, "sqlite3_stmt_readonly");
+        if (!orig_sqlite3_stmt_busy) orig_sqlite3_stmt_busy = dlsym(sqlite_handle, "sqlite3_stmt_busy");
+        if (!orig_sqlite3_stmt_status) orig_sqlite3_stmt_status = dlsym(sqlite_handle, "sqlite3_stmt_status");
+
+        fprintf(stderr, "[SHIM_INIT] dlsym fallback complete - orig_sqlite3_prepare_v2 = %p\n", (void*)orig_sqlite3_prepare_v2);
     }
 
     LOG_INFO("Resolved real SQLite functions for recursion prevention");

@@ -148,6 +148,8 @@ int (*orig_sqlite3_create_collation_v2)(sqlite3*, const char*, int, void*, int(*
 void* (*orig_sqlite3_malloc)(int) = NULL;
 int (*orig_sqlite3_bind_parameter_count)(sqlite3_stmt*) = NULL;
 int (*orig_sqlite3_stmt_readonly)(sqlite3_stmt*) = NULL;
+int (*orig_sqlite3_stmt_busy)(sqlite3_stmt*) = NULL;
+int (*orig_sqlite3_stmt_status)(sqlite3_stmt*, int, int) = NULL;
 
 // Aliases for backward compatibility (used by prepare module)
 int (*real_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = NULL;
@@ -450,6 +452,8 @@ static void load_original_functions(void) {
     orig_sqlite3_malloc = dlsym(RTLD_NEXT, "sqlite3_malloc");
     orig_sqlite3_bind_parameter_count = dlsym(RTLD_NEXT, "sqlite3_bind_parameter_count");
     orig_sqlite3_stmt_readonly = dlsym(RTLD_NEXT, "sqlite3_stmt_readonly");
+    orig_sqlite3_stmt_busy = dlsym(RTLD_NEXT, "sqlite3_stmt_busy");
+    orig_sqlite3_stmt_status = dlsym(RTLD_NEXT, "sqlite3_stmt_status");
 
     // Set up aliases for backward compatibility
     real_sqlite3_prepare_v2 = orig_sqlite3_prepare_v2;
@@ -472,6 +476,38 @@ static void load_original_functions(void) {
 }
 
 // ============================================================================
+// Fork Handlers - Critical for Connection Pool Safety
+// ============================================================================
+
+// Called in PARENT before fork()
+static void atfork_prepare(void) {
+    // No action needed - parent continues with its connections
+}
+
+// Called in PARENT after fork()
+static void atfork_parent(void) {
+    // No action needed - parent keeps its connections
+}
+
+// Called in CHILD after fork()
+static void atfork_child(void) {
+    // CRITICAL: Child process must NOT use parent's PostgreSQL connections
+    // The PostgreSQL protocol is not fork-safe - sockets are in the middle of I/O
+    // This prevents the crash where parent's query hangs while child creates connections
+
+    // Use fprintf since logging may not be initialized yet
+    fprintf(stderr, "[FORK_CHILD] Cleaning up inherited connection pool\n");
+    fflush(stderr);
+
+    // Call pg_client cleanup function to clear pool state
+    extern void pg_pool_cleanup_after_fork(void);
+    pg_pool_cleanup_after_fork();
+
+    fprintf(stderr, "[FORK_CHILD] Pool cleared, child will create new connections\n");
+    fflush(stderr);
+}
+
+// ============================================================================
 // Constructor/Destructor
 // ============================================================================
 
@@ -487,6 +523,12 @@ static void shim_init(void) {
     signal(SIGFPE, signal_handler);
     signal(SIGILL, signal_handler);
     // Note: No SIGABRT handler (used by legitimate assert/abort) and no atexit (triggers on subprocesses)
+
+    // CRITICAL: Install fork handlers BEFORE any PostgreSQL connections are made
+    // This ensures child processes don't inherit parent's active connections
+    pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
+    fprintf(stderr, "[SHIM_INIT] Registered pthread_atfork handlers for connection pool safety\n");
+    fflush(stderr);
 
     // Load original SQLite functions via RTLD_NEXT
     load_original_functions();
@@ -754,12 +796,19 @@ int sqlite3_stmt_readonly(sqlite3_stmt *pStmt) {
     return my_sqlite3_stmt_readonly(pStmt);
 }
 
-// sqlite3_bind_parameter_name - pass through to real SQLite
+// sqlite3_stmt_busy - use my_ implementation for PG statement support
+int sqlite3_stmt_busy(sqlite3_stmt *pStmt) {
+    return my_sqlite3_stmt_busy(pStmt);
+}
+
+// sqlite3_stmt_status - use my_ implementation for PG statement support
+int sqlite3_stmt_status(sqlite3_stmt *pStmt, int op, int resetFlg) {
+    return my_sqlite3_stmt_status(pStmt, op, resetFlg);
+}
+
+// sqlite3_bind_parameter_name - use my_ implementation for PG statement support
 const char* sqlite3_bind_parameter_name(sqlite3_stmt *pStmt, int idx) {
-    if (orig_sqlite3_bind_parameter_name) {
-        return orig_sqlite3_bind_parameter_name(pStmt, idx);
-    }
-    return NULL;
+    return my_sqlite3_bind_parameter_name(pStmt, idx);
 }
 
 // Value access
