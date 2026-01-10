@@ -359,7 +359,7 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 // QUERY RESULT CACHE: Check if we have cached results
                 // This is critical for Plex's OnDeck which runs 2000+ identical queries
                 // ============================================================
-                #if 1  // ENABLED - fixed with reference counting
+                #if 1  // Re-enabled with proper caching in column_text
                 LOG_DEBUG("CACHE_LOOKUP: checking cache for sql=%.60s", pg_stmt->pg_sql ? pg_stmt->pg_sql : "NULL");
                 cached_result_t *cached = pg_query_cache_lookup(pg_stmt);
                 LOG_DEBUG("CACHE_LOOKUP: result=%p", (void*)cached);
@@ -437,7 +437,8 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 }
 
                 // Use prepared statements for better performance (skip parse/plan overhead)
-                if (pg_stmt->use_prepared && pg_stmt->stmt_name[0]) {
+                // TEMP DEBUG: Force PQexecParams path to test if prepared statements cause crash
+                if (0 && pg_stmt->use_prepared && pg_stmt->stmt_name[0]) {
                     LOG_DEBUG("PREPARED PATH: use_prepared=%d stmt_name=%s sql=%.60s",
                              pg_stmt->use_prepared, pg_stmt->stmt_name, pg_stmt->pg_sql);
                     const char *cached_name = NULL;
@@ -533,7 +534,9 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                 if (pg_stmt->current_row >= pg_stmt->num_rows) {
                     // CRITICAL FIX: Free PGresult immediately when done
                     // Prevents memory accumulation when Plex doesn't call reset()
+                    LOG_DEBUG("DONE_PENDING: calling PQclear result=%p", (void*)pg_stmt->result);
                     PQclear(pg_stmt->result);
+                    LOG_DEBUG("DONE_PENDING: PQclear complete");
                     pg_stmt->result = NULL;
                     pg_stmt->result_conn = NULL;
                     pg_stmt->read_done = 1;  // Prevent re-execution on next step() call
@@ -542,8 +545,8 @@ int my_sqlite3_step(sqlite3_stmt *pStmt) {
                     return SQLITE_DONE;
                 }
                 pthread_mutex_unlock(&pg_stmt->mutex);
-                LOG_DEBUG("RETURNING SQLITE_ROW for stmt=%p pg_stmt=%p sql=%.50s",
-                          (void*)pStmt, (void*)pg_stmt, pg_stmt->sql ? pg_stmt->sql : "NULL");
+                LOG_DEBUG("RETURNING SQLITE_ROW for stmt=%p pg_stmt=%p thread=%p sql=%.50s",
+                          (void*)pStmt, (void*)pg_stmt, (void*)pthread_self(), pg_stmt->sql ? pg_stmt->sql : "NULL");
                 // Flush log to ensure it's written before potential crash
                 fflush(NULL);
                 return SQLITE_ROW;
@@ -715,6 +718,7 @@ int my_sqlite3_reset(sqlite3_stmt *pStmt) {
     // Clear prepared statements
     pg_stmt_t *pg_stmt = pg_find_any_stmt(pStmt);
     if (pg_stmt) {
+        pthread_mutex_lock(&pg_stmt->mutex);
         for (int i = 0; i < MAX_PARAMS; i++) {
             if (pg_stmt->param_values[i] && !is_preallocated_buffer(pg_stmt, i)) {
                 free(pg_stmt->param_values[i]);
@@ -722,10 +726,12 @@ int my_sqlite3_reset(sqlite3_stmt *pStmt) {
             }
         }
         pg_stmt_clear_result(pg_stmt);  // This also resets write_executed
+        int is_pg_only = (pg_stmt->is_pg == 2);
+        pthread_mutex_unlock(&pg_stmt->mutex);
 
         // If this is a PostgreSQL-only statement (is_pg == 2), don't call real SQLite
         // as the statement handle is not a valid SQLite statement
-        if (pg_stmt->is_pg == 2) {
+        if (is_pg_only) {
             return SQLITE_OK;
         }
     }
@@ -733,10 +739,13 @@ int my_sqlite3_reset(sqlite3_stmt *pStmt) {
     // Also clear cached statements - these use a separate registry
     pg_stmt_t *cached = pg_find_cached_stmt(pStmt);
     if (cached) {
+        pthread_mutex_lock(&cached->mutex);
         pg_stmt_clear_result(cached);  // This also resets write_executed
+        int is_pg_only = (cached->is_pg == 2);
+        pthread_mutex_unlock(&cached->mutex);
 
         // If this is a PostgreSQL-only statement, don't call real SQLite
-        if (cached->is_pg == 2) {
+        if (is_pg_only) {
             return SQLITE_OK;
         }
     }
@@ -753,9 +762,19 @@ int my_sqlite3_finalize(sqlite3_stmt *pStmt) {
         is_pg_only = (pg_stmt->is_pg == 2);
 
         // Statement is in global registry
-        // CRITICAL FIX: Use weak clear for TLS (in case same stmt is also cached there)
-        // This prevents double-free: global registry owns the reference
-        pg_clear_cached_stmt_weak(pStmt);
+        // Check if it's also in TLS cache - if so, need to decrement the TLS reference too
+        pg_stmt_t *cached = pg_find_cached_stmt(pStmt);
+        if (cached == pg_stmt) {
+            // Same statement in both caches - TLS added an extra reference
+            // Use normal clear to properly decrement the ref_count
+            LOG_DEBUG("finalize: stmt in both global and TLS, clearing TLS ref");
+            pg_clear_cached_stmt(pStmt);
+        } else if (cached) {
+            // Different statement in TLS cache (shouldn't happen, but be defensive)
+            LOG_ERROR("finalize: BUG - different pg_stmt in global vs TLS for same sqlite_stmt!");
+            pg_clear_cached_stmt(pStmt);
+        }
+
         pg_unregister_stmt(pStmt);
         pg_stmt_unref(pg_stmt);
     } else {
@@ -763,9 +782,13 @@ int my_sqlite3_finalize(sqlite3_stmt *pStmt) {
         pg_stmt_t *cached = pg_find_cached_stmt(pStmt);
         if (cached) {
             is_pg_only = (cached->is_pg == 2);
+            // TLS-only statement - but pg_register_cached_stmt incremented ref_count
+            // so it's now at 2 instead of 1. Need to unref twice.
+            LOG_DEBUG("finalize: stmt only in TLS (ref_count=%d), clearing",
+                     atomic_load(&cached->ref_count));
+            pg_clear_cached_stmt(pStmt);  // This unrefs once
+            pg_stmt_unref(cached);         // Unref again to actually free
         }
-        // Use normal clear which unrefs
-        pg_clear_cached_stmt(pStmt);
     }
 
     // If this was a PostgreSQL-only statement, don't call real SQLite

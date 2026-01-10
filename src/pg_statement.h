@@ -40,5 +40,6 @@ sqlite3_int64 extract_metadata_id_from_generator_sql(const char *sql);
 sqlite3_value* pg_create_column_value(pg_stmt_t *stmt, int col_idx);
 int pg_is_our_value(sqlite3_value *val);
 int pg_oid_to_sqlite_type(Oid oid);
+const char* pg_oid_to_sqlite_decltype(Oid oid);
 
 #endif // PG_STATEMENT_H

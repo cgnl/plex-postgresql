@@ -28,7 +28,7 @@ static pthread_once_t logging_init_once = PTHREAD_ONCE_INIT;
 // ============================================================================
 
 #define THROTTLE_WINDOW_SEC 1           // Time window for counting
-#define THROTTLE_THRESHOLD 1000         // Queries per window before throttling
+#define THROTTLE_THRESHOLD 999999999    // Queries per window before throttling (disabled for debugging)
 #define THROTTLE_SAMPLE_RATE 1000       // Log 1 in N queries when throttled
 #define THROTTLE_SUMMARY_INTERVAL 10    // Log summary every N seconds when throttled
 

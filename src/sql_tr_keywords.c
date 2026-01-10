@@ -151,6 +151,23 @@ char* sql_translate_keywords(const char *sql) {
 
     char *temp;
 
+    // ALTER TABLE ADD COLUMN -> ADD COLUMN IF NOT EXISTS
+    // SQLite doesn't support IF NOT EXISTS for columns, but PostgreSQL does
+    // This prevents "duplicate column" errors when Plex reruns migrations
+    if (strcasestr(current, "ALTER TABLE") && strcasestr(current, " ADD ")) {
+        // Pattern: ALTER TABLE 'x' ADD 'col' -> ALTER TABLE 'x' ADD COLUMN IF NOT EXISTS 'col'
+        // Also handle: ALTER TABLE "x" ADD "col"
+        temp = str_replace_nocase(current, " ADD '", " ADD COLUMN IF NOT EXISTS '");
+        if (temp) { free(current); current = temp; }
+        temp = str_replace_nocase(current, " ADD \"", " ADD COLUMN IF NOT EXISTS \"");
+        if (temp) { free(current); current = temp; }
+        // Handle unquoted column names
+        if (!strcasestr(current, "IF NOT EXISTS")) {
+            temp = str_replace_nocase(current, " ADD ", " ADD COLUMN IF NOT EXISTS ");
+            if (temp) { free(current); current = temp; }
+        }
+    }
+
     // Transaction modes
     temp = str_replace_nocase(current, "BEGIN IMMEDIATE", "BEGIN");
     free(current);

@@ -172,11 +172,103 @@ char* simplify_fts_for_sqlite(const char *sql) {
 // Internal Prepare Implementation
 // ============================================================================
 
+// Helper: Check if column exists in SQLite table
+static int column_exists_in_sqlite(sqlite3 *db, const char *table_name, const char *column_name) {
+    if (!db || !table_name || !column_name || !real_sqlite3_prepare_v2) return 0;
+
+    // Query SQLite's table_info pragma to check if column exists
+    char pragma_sql[512];
+    snprintf(pragma_sql, sizeof(pragma_sql), "PRAGMA table_info(%s)", table_name);
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = real_sqlite3_prepare_v2(db, pragma_sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK || !stmt) return 0;
+
+    int found = 0;
+    while (orig_sqlite3_step && orig_sqlite3_step(stmt) == SQLITE_ROW) {
+        // Column 1 is the column name
+        const char *col = (const char *)orig_sqlite3_column_text(stmt, 1);
+        if (col && strcasecmp(col, column_name) == 0) {
+            found = 1;
+            break;
+        }
+    }
+
+    if (orig_sqlite3_finalize) orig_sqlite3_finalize(stmt);
+    return found;
+}
+
 // Internal prepare_v2 implementation - called either directly or from worker thread
 // from_worker: 0 = called from Plex's thread, 1 = called from worker with large stack
 int my_sqlite3_prepare_v2_internal(sqlite3 *db, const char *zSql, int nByte,
                                    sqlite3_stmt **ppStmt, const char **pzTail,
                                    int from_worker) {
+    // HANDLE ALTER TABLE ADD COLUMN: Skip if column already exists
+    // This prevents "duplicate column name" errors when Plex reruns migrations
+    if (zSql && strcasestr(zSql, "ALTER TABLE") && strcasestr(zSql, " ADD ")) {
+        // Parse: ALTER TABLE 'table_name' ADD 'column_name' type
+        // or:    ALTER TABLE "table_name" ADD "column_name" type
+        const char *table_start = strcasestr(zSql, "ALTER TABLE");
+        if (table_start) {
+            table_start += 11; // Skip "ALTER TABLE"
+            while (*table_start == ' ') table_start++;
+
+            // Extract table name (may be quoted with ' or ")
+            char table_name[256] = {0};
+            char quote = 0;
+            if (*table_start == '\'' || *table_start == '"') {
+                quote = *table_start++;
+                const char *end = strchr(table_start, quote);
+                if (end && (end - table_start) < 255) {
+                    strncpy(table_name, table_start, end - table_start);
+                }
+            } else {
+                // Unquoted table name
+                int i = 0;
+                while (table_start[i] && table_start[i] != ' ' && i < 255) {
+                    table_name[i] = table_start[i];
+                    i++;
+                }
+            }
+
+            // Find ADD and extract column name
+            const char *add_pos = strcasestr(zSql, " ADD ");
+            if (add_pos && table_name[0]) {
+                add_pos += 5; // Skip " ADD "
+                while (*add_pos == ' ') add_pos++;
+
+                char column_name[256] = {0};
+                if (*add_pos == '\'' || *add_pos == '"') {
+                    quote = *add_pos++;
+                    const char *end = strchr(add_pos, quote);
+                    if (end && (end - add_pos) < 255) {
+                        strncpy(column_name, add_pos, end - add_pos);
+                    }
+                } else {
+                    int i = 0;
+                    while (add_pos[i] && add_pos[i] != ' ' && i < 255) {
+                        column_name[i] = add_pos[i];
+                        i++;
+                    }
+                }
+
+                // Check if column already exists
+                if (column_name[0] && column_exists_in_sqlite(db, table_name, column_name)) {
+                    LOG_INFO("ALTER TABLE ADD COLUMN skipped (column '%s' already exists in '%s')",
+                             column_name, table_name);
+                    // Return a dummy statement that does nothing
+                    if (real_sqlite3_prepare_v2) {
+                        int rc = real_sqlite3_prepare_v2(db, "SELECT 1 WHERE 0", -1, ppStmt, pzTail);
+                        return rc;
+                    }
+                    if (ppStmt) *ppStmt = NULL;
+                    if (pzTail) *pzTail = NULL;
+                    return SQLITE_OK;
+                }
+            }
+        }
+    }
+
     // LOOP DETECTION: Break infinite query loops (e.g., OnDeck with many views)
     if (zSql && detect_query_loop(zSql)) {
         // Return empty result to break the loop

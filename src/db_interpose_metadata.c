@@ -99,52 +99,73 @@ sqlite3_int64 my_sqlite3_last_insert_rowid(sqlite3 *db) {
 // to return our tracked error state when we've set it.
 
 const char* my_sqlite3_errmsg(sqlite3 *db) {
+    LOG_DEBUG("ERRMSG: db=%p", (void*)db);
     // CRITICAL: Prevent recursion when called from within our shim
     if (in_interpose_call && real_sqlite3_errmsg) {
         return real_sqlite3_errmsg(db);
     }
 
-    // Check if we have a tracked error for this db
+    // Check if this is a PostgreSQL-managed connection
     pg_connection_t *pg_conn = pg_find_connection(db);
-    if (pg_conn && pg_conn->last_error_code != SQLITE_OK && pg_conn->last_error[0] != '\0') {
-        // Return our tracked error message
-        return pg_conn->last_error;
+    if (pg_conn) {
+        // If we have a tracked error, return it
+        if (pg_conn->last_error_code != SQLITE_OK && pg_conn->last_error[0] != '\0') {
+            LOG_DEBUG("ERRMSG: returning tracked error='%s'", pg_conn->last_error);
+            return pg_conn->last_error;
+        }
+        // PostgreSQL connection with no error - return "not an error"
+        // Don't fall through to real SQLite which would return garbage for our db handle
+        LOG_DEBUG("ERRMSG: returning 'not an error'");
+        return "not an error";
     }
-    // Otherwise, fall through to real SQLite
-    // CRITICAL: Use real function pointer if available to avoid recursion
+
+    // Only fall through to real SQLite for non-PostgreSQL databases
+    const char *msg = NULL;
     if (real_sqlite3_errmsg) {
-        return real_sqlite3_errmsg(db);
+        msg = real_sqlite3_errmsg(db);
+    } else if (orig_sqlite3_errmsg) {
+        msg = orig_sqlite3_errmsg(db);
+    } else {
+        msg = "unknown error";
     }
-    return orig_sqlite3_errmsg ? orig_sqlite3_errmsg(db) : "unknown error";
+    return msg;
 }
 
 int my_sqlite3_errcode(sqlite3 *db) {
+    LOG_DEBUG("ERRCODE: db=%p", (void*)db);
     // CRITICAL: Prevent recursion when called from within our shim
     if (in_interpose_call && real_sqlite3_errcode) {
         return real_sqlite3_errcode(db);
     }
 
-    // Check if we have a tracked error for this db
+    // Check if this is a PostgreSQL-managed connection
     pg_connection_t *pg_conn = pg_find_connection(db);
-    if (pg_conn && pg_conn->last_error_code != SQLITE_OK) {
-        // Return our tracked error code
+    if (pg_conn) {
+        // Return our tracked error code (SQLITE_OK if no error)
+        LOG_DEBUG("ERRCODE: pg_conn found, returning code=%d", pg_conn->last_error_code);
         return pg_conn->last_error_code;
     }
-    // Otherwise, fall through to real SQLite
-    // CRITICAL: Use real function pointer if available to avoid recursion
+
+    // Only fall through to real SQLite for non-PostgreSQL databases
+    int code;
     if (real_sqlite3_errcode) {
-        return real_sqlite3_errcode(db);
+        code = real_sqlite3_errcode(db);
+    } else if (orig_sqlite3_errcode) {
+        code = orig_sqlite3_errcode(db);
+    } else {
+        code = SQLITE_ERROR;
     }
-    return orig_sqlite3_errcode ? orig_sqlite3_errcode(db) : SQLITE_ERROR;
+    return code;
 }
 
 int my_sqlite3_extended_errcode(sqlite3 *db) {
-    // For extended error codes, we just use the basic error code
-    // since we don't track extended codes
+    // For extended error codes, we use the basic error code since we don't track extended codes
     pg_connection_t *pg_conn = pg_find_connection(db);
-    if (pg_conn && pg_conn->last_error_code != SQLITE_OK) {
+    if (pg_conn) {
+        // Return our tracked error code (SQLITE_OK if no error)
         return pg_conn->last_error_code;
     }
+    // Only fall through to real SQLite for non-PostgreSQL databases
     return orig_sqlite3_extended_errcode ? orig_sqlite3_extended_errcode(db) : SQLITE_ERROR;
 }
 
@@ -267,18 +288,35 @@ void* my_sqlite3_malloc(int n) {
 // ============================================================================
 
 sqlite3* my_sqlite3_db_handle(sqlite3_stmt *pStmt) {
+    LOG_DEBUG("DB_HANDLE: pStmt=%p", (void*)pStmt);
     if (!pStmt) return NULL;
 
     // Check if this is one of our PostgreSQL statements
     pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
-    if (pg_stmt && pg_stmt->is_pg == 2 && pg_stmt->conn) {
-        // Return the associated shadow db handle
-        return pg_stmt->conn->shadow_db;
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        // For PostgreSQL statements, we need to return the ORIGINAL SQLite db handle
+        // Not the pool connection's shadow_db (which is NULL for pool connections)
+        // The shadow_stmt was set during prepare with the real SQLite statement
+        // We can get the db handle from that
+        if (pg_stmt->shadow_stmt && orig_sqlite3_db_handle) {
+            sqlite3 *db = orig_sqlite3_db_handle(pg_stmt->shadow_stmt);
+            LOG_DEBUG("DB_HANDLE: returning from shadow_stmt=%p", (void*)db);
+            return db;
+        }
+        // Fallback to conn->shadow_db if available (non-pool connections)
+        if (pg_stmt->conn && pg_stmt->conn->shadow_db) {
+            LOG_DEBUG("DB_HANDLE: returning shadow_db=%p", (void*)pg_stmt->conn->shadow_db);
+            return pg_stmt->conn->shadow_db;
+        }
+        LOG_DEBUG("DB_HANDLE: pg_stmt has no valid db handle");
+        return NULL;
     }
 
     // Pass through to real SQLite for non-PG statements
     if (orig_sqlite3_db_handle) {
-        return orig_sqlite3_db_handle(pStmt);
+        sqlite3 *db = orig_sqlite3_db_handle(pStmt);
+        LOG_DEBUG("DB_HANDLE: returning orig=%p", (void*)db);
+        return db;
     }
     return NULL;
 }
@@ -334,6 +372,102 @@ int my_sqlite3_stmt_readonly(sqlite3_stmt *pStmt) {
         return orig_sqlite3_stmt_readonly(pStmt);
     }
     return 1;  // Default to readonly
+}
+
+int my_sqlite3_stmt_busy(sqlite3_stmt *pStmt) {
+    LOG_DEBUG("STMT_BUSY: stmt=%p", (void*)pStmt);
+    if (!pStmt) return 0;
+
+    // Check if this is one of our PostgreSQL statements
+    pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        // Statement is "busy" if we have returned SQLITE_ROW and have more rows
+        // This matches SQLite semantics: busy = step() was called, results pending
+        int busy = (pg_stmt->result != NULL && pg_stmt->current_row < pg_stmt->num_rows);
+        LOG_DEBUG("STMT_BUSY: pg_stmt, result=%p current_row=%d num_rows=%d -> busy=%d",
+                  (void*)pg_stmt->result, pg_stmt->current_row, pg_stmt->num_rows, busy);
+        return busy;
+    }
+
+    // Pass through to real SQLite for non-PG statements
+    if (orig_sqlite3_stmt_busy) {
+        return orig_sqlite3_stmt_busy(pStmt);
+    }
+    return 0;
+}
+
+int my_sqlite3_stmt_status(sqlite3_stmt *pStmt, int op, int resetFlg) {
+    LOG_DEBUG("STMT_STATUS: stmt=%p op=%d reset=%d", (void*)pStmt, op, resetFlg);
+    if (!pStmt) return 0;
+
+    // Check if this is one of our PostgreSQL statements
+    pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        // For PostgreSQL statements, return 0 for all status counters
+        // SQLite ops: SQLITE_STMTSTATUS_FULLSCAN_STEP (1), VM_STEP (4), SORT (2), etc.
+        LOG_DEBUG("STMT_STATUS: pg_stmt returning 0");
+        return 0;
+    }
+
+    // Pass through to real SQLite for non-PG statements
+    if (orig_sqlite3_stmt_status) {
+        return orig_sqlite3_stmt_status(pStmt, op, resetFlg);
+    }
+    return 0;
+}
+
+const char* my_sqlite3_bind_parameter_name(sqlite3_stmt *pStmt, int idx) {
+    LOG_DEBUG("BIND_PARAM_NAME: stmt=%p idx=%d", (void*)pStmt, idx);
+    if (!pStmt) return NULL;
+
+    // Check if this is one of our PostgreSQL statements
+    pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        // Return the parameter name if we have it stored
+        // Note: SQLite uses 1-based indexing, our param_names array is 0-based
+        if (idx > 0 && idx <= pg_stmt->param_count && pg_stmt->param_names) {
+            const char *name = pg_stmt->param_names[idx - 1];
+            LOG_DEBUG("BIND_PARAM_NAME: pg_stmt returning '%s'", name ? name : "NULL");
+            return name;
+        }
+        LOG_DEBUG("BIND_PARAM_NAME: pg_stmt idx out of range, returning NULL");
+        return NULL;
+    }
+
+    // Pass through to real SQLite for non-PG statements
+    if (orig_sqlite3_bind_parameter_name) {
+        return orig_sqlite3_bind_parameter_name(pStmt, idx);
+    }
+    return NULL;
+}
+
+// sqlite3_bind_parameter_index returns the index of a named parameter.
+// Returns 0 if the parameter is not found.
+int my_sqlite3_bind_parameter_index(sqlite3_stmt *pStmt, const char *zName) {
+    LOG_DEBUG("BIND_PARAM_INDEX: stmt=%p name='%s'", (void*)pStmt, zName ? zName : "NULL");
+    if (!pStmt || !zName) return 0;
+
+    // Check if this is one of our PostgreSQL statements
+    pg_stmt_t *pg_stmt = pg_find_stmt(pStmt);
+    if (pg_stmt && pg_stmt->is_pg == 2) {
+        // Search for the parameter name in our param_names array
+        if (pg_stmt->param_names) {
+            for (int i = 0; i < pg_stmt->param_count; i++) {
+                if (pg_stmt->param_names[i] && strcmp(pg_stmt->param_names[i], zName) == 0) {
+                    LOG_DEBUG("BIND_PARAM_INDEX: found '%s' at index %d", zName, i + 1);
+                    return i + 1;  // SQLite uses 1-based indexing
+                }
+            }
+        }
+        LOG_DEBUG("BIND_PARAM_INDEX: '%s' not found in pg_stmt", zName);
+        return 0;
+    }
+
+    // Pass through to real SQLite for non-PG statements
+    if (orig_sqlite3_bind_parameter_index) {
+        return orig_sqlite3_bind_parameter_index(pStmt, zName);
+    }
+    return 0;
 }
 
 // ============================================================================

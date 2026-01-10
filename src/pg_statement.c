@@ -219,7 +219,7 @@ pg_stmt_t* pg_find_any_stmt(sqlite3_stmt *stmt) {
     pg_stmt_t *pg_stmt = pg_find_stmt(stmt);
     if (pg_stmt) return pg_stmt;
 
-    // Then try TLS cache
+    // Fall back to TLS cache lookup
     pg_stmt = pg_find_cached_stmt(stmt);
     if (pg_stmt) return pg_stmt;
 
@@ -355,6 +355,8 @@ pg_stmt_t* pg_stmt_create(pg_connection_t *conn, const char *sql, sqlite3_stmt *
     stmt->shadow_stmt = shadow_stmt;
     stmt->sql = sql ? strdup(sql) : NULL;
     stmt->current_row = -1;
+    stmt->cached_row = -1;     // CRITICAL FIX: Prevent false cache hits on row 0
+    stmt->decoded_blob_row = -1;  // CRITICAL FIX: Also init decoded blob row
     stmt->write_executed = 0;  // Initialize write execution guard
     stmt->read_done = 0;       // Initialize read completion guard
 
@@ -369,15 +371,25 @@ void pg_stmt_ref(pg_stmt_t *stmt) {
 
 void pg_stmt_unref(pg_stmt_t *stmt) {
     if (!stmt) return;
+
     int old = atomic_fetch_sub(&stmt->ref_count, 1);
-    LOG_DEBUG("pg_stmt_unref: stmt=%p old_ref=%d sql=%.40s", 
-              (void*)stmt, old, stmt->sql ? stmt->sql : "NULL");
+    LOG_DEBUG("pg_stmt_unref: stmt=%p old_ref=%d new_ref=%d sql=%.40s",
+              (void*)stmt, old, old-1, stmt->sql ? stmt->sql : "NULL");
+
+    if (old <= 0) {
+        // CRITICAL BUG: ref_count was already 0 or negative!
+        LOG_ERROR("pg_stmt_unref: CRITICAL BUG - ref_count was %d before decrement! stmt=%p sql=%.40s",
+                  old, (void*)stmt, stmt->sql ? stmt->sql : "NULL");
+        LOG_ERROR("pg_stmt_unref: This indicates double-unref or missing ref. RESTORING to prevent negative.");
+        // Restore ref_count to prevent it from going more negative
+        atomic_store(&stmt->ref_count, 0);
+        return;  // Don't free
+    }
+
     if (old == 1) {
         // Last reference - actually free
+        LOG_DEBUG("pg_stmt_unref: last reference, freeing stmt=%p", (void*)stmt);
         pg_stmt_free(stmt);
-    } else if (old <= 0) {
-        LOG_ERROR("pg_stmt_unref: ref_count was %d, possible double-free! stmt=%p sql=%.40s", 
-                  old, (void*)stmt, stmt->sql ? stmt->sql : "NULL");
     }
 }
 
@@ -390,9 +402,33 @@ static inline int is_preallocated_buffer(pg_stmt_t *stmt, int idx) {
 void pg_stmt_free(pg_stmt_t *stmt) {
     if (!stmt) return;
 
-    if (stmt->sql) free(stmt->sql);
-    if (stmt->pg_sql && stmt->pg_sql != stmt->sql) free(stmt->pg_sql);
-    if (stmt->result) PQclear(stmt->result);
+    // CRITICAL FIX: Verify ref_count is actually 0 before freeing
+    int ref_count = atomic_load(&stmt->ref_count);
+    if (ref_count != 0) {
+        LOG_ERROR("pg_stmt_free: WARNING ref_count=%d (expected 0) for stmt=%p sql=%.50s",
+                  ref_count, (void*)stmt, stmt->sql ? stmt->sql : "NULL");
+        // Don't free if ref_count > 0 - object is still in use!
+        if (ref_count > 0) {
+            LOG_ERROR("pg_stmt_free: ABORT - ref_count=%d, not freeing to prevent use-after-free", ref_count);
+            return;
+        }
+    }
+
+    LOG_DEBUG("pg_stmt_free: START stmt=%p sql=%p pg_sql=%p",
+              (void*)stmt, (void*)stmt->sql, (void*)stmt->pg_sql);
+
+    if (stmt->sql) {
+        LOG_DEBUG("pg_stmt_free: freeing sql=%p (%.50s)", (void*)stmt->sql, stmt->sql);
+        free(stmt->sql);
+    }
+    if (stmt->pg_sql && stmt->pg_sql != stmt->sql) {
+        LOG_DEBUG("pg_stmt_free: freeing pg_sql=%p (%.50s)", (void*)stmt->pg_sql, stmt->pg_sql);
+        free(stmt->pg_sql);
+    }
+    if (stmt->result) {
+        LOG_DEBUG("pg_stmt_free: PQclear result=%p", (void*)stmt->result);
+        PQclear(stmt->result);
+    }
 
     // Validate param_count to prevent out-of-bounds access
     int safe_param_count = stmt->param_count;
@@ -402,6 +438,7 @@ void pg_stmt_free(pg_stmt_t *stmt) {
     for (int i = 0; i < safe_param_count; i++) {
         // Only free if not pointing to pre-allocated buffer
         if (stmt->param_values[i] && !is_preallocated_buffer(stmt, i)) {
+            LOG_DEBUG("pg_stmt_free: freeing param_values[%d]=%p", i, (void*)stmt->param_values[i]);
             free(stmt->param_values[i]);
             stmt->param_values[i] = NULL;  // Prevent double-free
         }
@@ -409,12 +446,16 @@ void pg_stmt_free(pg_stmt_t *stmt) {
 
     // Free parameter names (for named parameter mapping)
     if (stmt->param_names) {
+        LOG_DEBUG("pg_stmt_free: freeing param_names=%p (array of %d)", (void*)stmt->param_names, safe_param_count);
         for (int i = 0; i < safe_param_count; i++) {
             if (stmt->param_names[i]) {
+                LOG_DEBUG("pg_stmt_free: freeing param_names[%d]=%p (%.30s)",
+                          i, (void*)stmt->param_names[i], stmt->param_names[i]);
                 free(stmt->param_names[i]);
                 stmt->param_names[i] = NULL;  // Prevent double-free
             }
         }
+        LOG_DEBUG("pg_stmt_free: freeing param_names array at %p", (void*)stmt->param_names);
         free(stmt->param_names);
         stmt->param_names = NULL;
     }
@@ -422,25 +463,30 @@ void pg_stmt_free(pg_stmt_t *stmt) {
     // Free decoded blob cache
     for (int i = 0; i < MAX_PARAMS; i++) {
         if (stmt->decoded_blobs[i]) {
+            LOG_DEBUG("pg_stmt_free: freeing decoded_blobs[%d]=%p", i, (void*)stmt->decoded_blobs[i]);
             free(stmt->decoded_blobs[i]);
             stmt->decoded_blobs[i] = NULL;
         }
     }
 
-    // Free cached text/blob values
+    // Free cached text and blob
     for (int i = 0; i < MAX_PARAMS; i++) {
         if (stmt->cached_text[i]) {
+            LOG_DEBUG("pg_stmt_free: freeing cached_text[%d]=%p", i, (void*)stmt->cached_text[i]);
             free(stmt->cached_text[i]);
             stmt->cached_text[i] = NULL;
         }
         if (stmt->cached_blob[i]) {
+            LOG_DEBUG("pg_stmt_free: freeing cached_blob[%d]=%p", i, (void*)stmt->cached_blob[i]);
             free(stmt->cached_blob[i]);
             stmt->cached_blob[i] = NULL;
         }
     }
 
+    LOG_DEBUG("pg_stmt_free: destroying mutex and freeing stmt=%p", (void*)stmt);
     pthread_mutex_destroy(&stmt->mutex);
     free(stmt);
+    LOG_DEBUG("pg_stmt_free: DONE");
 }
 
 void pg_stmt_clear_result(pg_stmt_t *stmt) {
@@ -470,7 +516,7 @@ void pg_stmt_clear_result(pg_stmt_t *stmt) {
     }
     stmt->decoded_blob_row = -1;
 
-    // Clear cached text/blob values (these must persist until step/reset/finalize)
+    // Free cached text and blob on clear
     for (int i = 0; i < MAX_PARAMS; i++) {
         if (stmt->cached_text[i]) {
             free(stmt->cached_text[i]);
@@ -565,6 +611,45 @@ int pg_oid_to_sqlite_type(Oid oid) {
         case 1043: // VARCHAR
         default:
             return SQLITE_TEXT;
+    }
+}
+
+// Convert PostgreSQL OID to SQLite declared type string
+// Returns static strings that don't need to be freed
+const char* pg_oid_to_sqlite_decltype(Oid oid) {
+    switch (oid) {
+        case 16:   // BOOL
+            return "INTEGER";  // SQLite has no BOOL, use INTEGER
+        case 20:   // INT8 (bigint)
+            return "INTEGER";
+        case 21:   // INT2 (smallint)
+            return "INTEGER";
+        case 23:   // INT4 (integer)
+            return "INTEGER";
+        case 700:  // FLOAT4
+            return "REAL";
+        case 701:  // FLOAT8
+            return "REAL";
+        case 1700: // NUMERIC
+            return "REAL";
+        case 17:   // BYTEA
+            return "BLOB";
+        case 25:   // TEXT
+            return "TEXT";
+        case 1042: // BPCHAR (char)
+            return "TEXT";
+        case 1043: // VARCHAR
+            return "TEXT";
+        case 1082: // DATE
+            return "TEXT";
+        case 1083: // TIME
+            return "TEXT";
+        case 1114: // TIMESTAMP
+            return "TEXT";
+        case 1184: // TIMESTAMPTZ
+            return "TEXT";
+        default:
+            return "TEXT";  // Default to TEXT for unknown types
     }
 }
 

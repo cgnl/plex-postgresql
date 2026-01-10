@@ -24,6 +24,8 @@ SQLite is great for most Plex installations, but has one major limitation: **dat
 
 ## Benchmark Results
 
+### Concurrent Access (The Real Problem)
+
 Real-world test: **Plex + Kometa + PMM + 4 concurrent streams** (7 separate processes, 15 seconds):
 
 | Metric | SQLite | PostgreSQL (TCP) | PostgreSQL (Socket) |
@@ -39,13 +41,40 @@ Real-world test: **Plex + Kometa + PMM + 4 concurrent streams** (7 separate proc
 - PostgreSQL: Zero errors, everything works simultaneously
 - Unix socket: ~6% faster than TCP (negligible for most setups)
 
-Run the benchmark yourself:
+### Query Latency Comparison
+
+| Query Type | SQLite | PostgreSQL (Socket) | Overhead |
+|------------|--------|---------------------|----------|
+| SELECT (PK lookup) | 3.9 µs | 18.2 µs | 4.6x |
+| INSERT (batched) | 0.7 µs | 15.5 µs | 22x |
+| Range Query | 22.0 µs | 45.2 µs | 2.1x |
+
+PostgreSQL is slower per-query, but **never locks**. For Plex + rclone/Real-Debrid, smooth playback matters more than raw speed.
+
+### Shim Overhead
+
+| Component | Latency | Throughput |
+|-----------|---------|------------|
+| SQL Translation (uncached) | 17.5 µs | 57K/sec |
+| **SQL Translation (cached)** | **0.12 µs** | **8.5M/sec** |
+| Cache Lookup | 22.6 ns | 354M/sec |
+
+The thread-local translation cache provides **145x speedup** for repeated queries. Shim overhead is **<1% of total query time**.
+
+### Run Benchmarks
+
 ```bash
-# Test with Unix socket (recommended for local PostgreSQL)
+# Multi-process stress test (the definitive proof)
 PLEX_PG_SOCKET=/tmp python3 scripts/benchmark_multiprocess.py
 
-# Test with TCP only
-python3 scripts/benchmark_multiprocess.py
+# SQLite vs PostgreSQL latency comparison
+python3 tests/bench_sqlite_vs_pg.py
+
+# Shim component micro-benchmarks
+make benchmark
+
+# Cache implementation comparison (mutex vs thread-local)
+./tests/bin/bench_cache
 ```
 
 For rclone/Real-Debrid setups with Kometa/PMM, **SQLite becomes unusable** during library scans. PostgreSQL handles it without issues.

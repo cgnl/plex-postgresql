@@ -21,6 +21,17 @@
 #include <sqlite3.h>
 #include <libpq-fe.h>
 
+// Visibility attributes for exported symbols
+#ifdef __APPLE__
+    #define EXPORT __attribute__((visibility("default")))
+    // CRITICAL: orig_* pointers must be visible for child processes (Scanner, Transcoder)
+    // when they load the dylib via inherited DYLD_INSERT_LIBRARIES
+    #define VISIBLE __attribute__((visibility("default")))
+#else
+    #define EXPORT
+    #define VISIBLE
+#endif
+
 // Module headers
 #include "pg_types.h"
 #include "pg_logging.h"
@@ -85,62 +96,64 @@ extern void *sqlite_handle;
 
 // Original SQLite function pointers (populated by fishhook)
 // Used by my_* implementations to call the real SQLite functions
-extern int (*orig_sqlite3_open)(const char*, sqlite3**);
-extern int (*orig_sqlite3_open_v2)(const char*, sqlite3**, int, const char*);
-extern int (*orig_sqlite3_close)(sqlite3*);
-extern int (*orig_sqlite3_close_v2)(sqlite3*);
-extern int (*orig_sqlite3_exec)(sqlite3*, const char*, int(*)(void*,int,char**,char**), void*, char**);
-extern int (*orig_sqlite3_changes)(sqlite3*);
-extern sqlite3_int64 (*orig_sqlite3_changes64)(sqlite3*);
-extern sqlite3_int64 (*orig_sqlite3_last_insert_rowid)(sqlite3*);
-extern int (*orig_sqlite3_get_table)(sqlite3*, const char*, char***, int*, int*, char**);
+// CRITICAL: Must be VISIBLE for child processes to resolve symbols!
+VISIBLE extern int (*orig_sqlite3_open)(const char*, sqlite3**);
+VISIBLE extern int (*orig_sqlite3_open_v2)(const char*, sqlite3**, int, const char*);
+VISIBLE extern int (*orig_sqlite3_close)(sqlite3*);
+VISIBLE extern int (*orig_sqlite3_close_v2)(sqlite3*);
+VISIBLE extern int (*orig_sqlite3_exec)(sqlite3*, const char*, int(*)(void*,int,char**,char**), void*, char**);
+VISIBLE extern int (*orig_sqlite3_changes)(sqlite3*);
+VISIBLE extern sqlite3_int64 (*orig_sqlite3_changes64)(sqlite3*);
+VISIBLE extern sqlite3_int64 (*orig_sqlite3_last_insert_rowid)(sqlite3*);
+VISIBLE extern int (*orig_sqlite3_get_table)(sqlite3*, const char*, char***, int*, int*, char**);
 
-extern const char* (*orig_sqlite3_errmsg)(sqlite3*);
-extern int (*orig_sqlite3_errcode)(sqlite3*);
-extern int (*orig_sqlite3_extended_errcode)(sqlite3*);
+VISIBLE extern const char* (*orig_sqlite3_errmsg)(sqlite3*);
+VISIBLE extern int (*orig_sqlite3_errcode)(sqlite3*);
+VISIBLE extern int (*orig_sqlite3_extended_errcode)(sqlite3*);
 
-extern int (*orig_sqlite3_prepare)(sqlite3*, const char*, int, sqlite3_stmt**, const char**);
-extern int (*orig_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**);
-extern int (*orig_sqlite3_prepare_v3)(sqlite3*, const char*, int, unsigned int, sqlite3_stmt**, const char**);
-extern int (*orig_sqlite3_prepare16_v2)(sqlite3*, const void*, int, sqlite3_stmt**, const void**);
+VISIBLE extern int (*orig_sqlite3_prepare)(sqlite3*, const char*, int, sqlite3_stmt**, const char**);
+VISIBLE extern int (*orig_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**);
+VISIBLE extern int (*orig_sqlite3_prepare_v3)(sqlite3*, const char*, int, unsigned int, sqlite3_stmt**, const char**);
+VISIBLE extern int (*orig_sqlite3_prepare16_v2)(sqlite3*, const void*, int, sqlite3_stmt**, const void**);
 
-extern int (*orig_sqlite3_bind_int)(sqlite3_stmt*, int, int);
-extern int (*orig_sqlite3_bind_int64)(sqlite3_stmt*, int, sqlite3_int64);
-extern int (*orig_sqlite3_bind_double)(sqlite3_stmt*, int, double);
-extern int (*orig_sqlite3_bind_text)(sqlite3_stmt*, int, const char*, int, void(*)(void*));
-extern int (*orig_sqlite3_bind_text64)(sqlite3_stmt*, int, const char*, sqlite3_uint64, void(*)(void*), unsigned char);
-extern int (*orig_sqlite3_bind_blob)(sqlite3_stmt*, int, const void*, int, void(*)(void*));
-extern int (*orig_sqlite3_bind_blob64)(sqlite3_stmt*, int, const void*, sqlite3_uint64, void(*)(void*));
-extern int (*orig_sqlite3_bind_value)(sqlite3_stmt*, int, const sqlite3_value*);
-extern int (*orig_sqlite3_bind_null)(sqlite3_stmt*, int);
+VISIBLE extern int (*orig_sqlite3_bind_int)(sqlite3_stmt*, int, int);
+VISIBLE extern int (*orig_sqlite3_bind_int64)(sqlite3_stmt*, int, sqlite3_int64);
+VISIBLE extern int (*orig_sqlite3_bind_double)(sqlite3_stmt*, int, double);
+VISIBLE extern int (*orig_sqlite3_bind_text)(sqlite3_stmt*, int, const char*, int, void(*)(void*));
+VISIBLE extern int (*orig_sqlite3_bind_text64)(sqlite3_stmt*, int, const char*, sqlite3_uint64, void(*)(void*), unsigned char);
+VISIBLE extern int (*orig_sqlite3_bind_blob)(sqlite3_stmt*, int, const void*, int, void(*)(void*));
+VISIBLE extern int (*orig_sqlite3_bind_blob64)(sqlite3_stmt*, int, const void*, sqlite3_uint64, void(*)(void*));
+VISIBLE extern int (*orig_sqlite3_bind_value)(sqlite3_stmt*, int, const sqlite3_value*);
+VISIBLE extern int (*orig_sqlite3_bind_null)(sqlite3_stmt*, int);
 
-extern int (*orig_sqlite3_step)(sqlite3_stmt*);
-extern int (*orig_sqlite3_reset)(sqlite3_stmt*);
-extern int (*orig_sqlite3_finalize)(sqlite3_stmt*);
-extern int (*orig_sqlite3_clear_bindings)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_step)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_reset)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_finalize)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_clear_bindings)(sqlite3_stmt*);
 
-extern int (*orig_sqlite3_column_count)(sqlite3_stmt*);
-extern int (*orig_sqlite3_column_type)(sqlite3_stmt*, int);
-extern int (*orig_sqlite3_column_int)(sqlite3_stmt*, int);
-extern sqlite3_int64 (*orig_sqlite3_column_int64)(sqlite3_stmt*, int);
-extern double (*orig_sqlite3_column_double)(sqlite3_stmt*, int);
-extern const unsigned char* (*orig_sqlite3_column_text)(sqlite3_stmt*, int);
-extern const void* (*orig_sqlite3_column_blob)(sqlite3_stmt*, int);
-extern int (*orig_sqlite3_column_bytes)(sqlite3_stmt*, int);
-extern const char* (*orig_sqlite3_column_name)(sqlite3_stmt*, int);
-extern sqlite3_value* (*orig_sqlite3_column_value)(sqlite3_stmt*, int);
-extern int (*orig_sqlite3_data_count)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_column_count)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_column_type)(sqlite3_stmt*, int);
+VISIBLE extern int (*orig_sqlite3_column_int)(sqlite3_stmt*, int);
+VISIBLE extern sqlite3_int64 (*orig_sqlite3_column_int64)(sqlite3_stmt*, int);
+VISIBLE extern double (*orig_sqlite3_column_double)(sqlite3_stmt*, int);
+VISIBLE extern const unsigned char* (*orig_sqlite3_column_text)(sqlite3_stmt*, int);
+VISIBLE extern const void* (*orig_sqlite3_column_blob)(sqlite3_stmt*, int);
+VISIBLE extern int (*orig_sqlite3_column_bytes)(sqlite3_stmt*, int);
+VISIBLE extern const char* (*orig_sqlite3_column_name)(sqlite3_stmt*, int);
+VISIBLE extern const char* (*orig_sqlite3_column_decltype)(sqlite3_stmt*, int);
+VISIBLE extern sqlite3_value* (*orig_sqlite3_column_value)(sqlite3_stmt*, int);
+VISIBLE extern int (*orig_sqlite3_data_count)(sqlite3_stmt*);
 
-extern int (*orig_sqlite3_value_type)(sqlite3_value*);
-extern const unsigned char* (*orig_sqlite3_value_text)(sqlite3_value*);
-extern int (*orig_sqlite3_value_int)(sqlite3_value*);
-extern sqlite3_int64 (*orig_sqlite3_value_int64)(sqlite3_value*);
-extern double (*orig_sqlite3_value_double)(sqlite3_value*);
-extern int (*orig_sqlite3_value_bytes)(sqlite3_value*);
-extern const void* (*orig_sqlite3_value_blob)(sqlite3_value*);
+VISIBLE extern int (*orig_sqlite3_value_type)(sqlite3_value*);
+VISIBLE extern const unsigned char* (*orig_sqlite3_value_text)(sqlite3_value*);
+VISIBLE extern int (*orig_sqlite3_value_int)(sqlite3_value*);
+VISIBLE extern sqlite3_int64 (*orig_sqlite3_value_int64)(sqlite3_value*);
+VISIBLE extern double (*orig_sqlite3_value_double)(sqlite3_value*);
+VISIBLE extern int (*orig_sqlite3_value_bytes)(sqlite3_value*);
+VISIBLE extern const void* (*orig_sqlite3_value_blob)(sqlite3_value*);
 
-extern int (*orig_sqlite3_create_collation)(sqlite3*, const char*, int, void*, int(*)(void*,int,const void*,int,const void*));
-extern int (*orig_sqlite3_create_collation_v2)(sqlite3*, const char*, int, void*, int(*)(void*,int,const void*,int,const void*), void(*)(void*));
+VISIBLE extern int (*orig_sqlite3_create_collation)(sqlite3*, const char*, int, void*, int(*)(void*,int,const void*,int,const void*));
+VISIBLE extern int (*orig_sqlite3_create_collation_v2)(sqlite3*, const char*, int, void*, int(*)(void*,int,const void*,int,const void*), void(*)(void*));
 
 // Backward compatibility aliases (used by prepare module)
 extern int (*real_sqlite3_prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**);
@@ -199,16 +212,16 @@ static inline int is_preallocated_buffer(pg_stmt_t *stmt, int idx) {
 void drop_icu_root_indexes(sqlite3 *db);
 void drop_fts_triggers(sqlite3 *db);
 
-int my_sqlite3_open(const char *filename, sqlite3 **ppDb);
-int my_sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, const char *zVfs);
-int my_sqlite3_close(sqlite3 *db);
-int my_sqlite3_close_v2(sqlite3 *db);
+EXPORT int my_sqlite3_open(const char *filename, sqlite3 **ppDb);
+EXPORT int my_sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, const char *zVfs);
+EXPORT int my_sqlite3_close(sqlite3 *db);
+EXPORT int my_sqlite3_close_v2(sqlite3 *db);
 
 // ============================================================================
 // Exec Functions (db_interpose_exec.c)
 // ============================================================================
 
-int my_sqlite3_exec(sqlite3 *db, const char *sql,
+EXPORT int my_sqlite3_exec(sqlite3 *db, const char *sql,
                     int (*callback)(void*, int, char**, char**),
                     void *arg, char **errmsg);
 
@@ -218,18 +231,18 @@ int my_sqlite3_exec(sqlite3 *db, const char *sql,
 
 char* simplify_fts_for_sqlite(const char *sql);
 
-int my_sqlite3_prepare_v2_internal(sqlite3 *db, const char *zSql, int nByte,
+EXPORT int my_sqlite3_prepare_v2_internal(sqlite3 *db, const char *zSql, int nByte,
                                    sqlite3_stmt **ppStmt, const char **pzTail,
                                    int from_worker);
 
-int my_sqlite3_prepare(sqlite3 *db, const char *zSql, int nByte,
+EXPORT int my_sqlite3_prepare(sqlite3 *db, const char *zSql, int nByte,
                        sqlite3_stmt **ppStmt, const char **pzTail);
-int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
+EXPORT int my_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
                           sqlite3_stmt **ppStmt, const char **pzTail);
-int my_sqlite3_prepare_v3(sqlite3 *db, const char *zSql, int nByte,
+EXPORT int my_sqlite3_prepare_v3(sqlite3 *db, const char *zSql, int nByte,
                           unsigned int prepFlags, sqlite3_stmt **ppStmt,
                           const char **pzTail);
-int my_sqlite3_prepare16_v2(sqlite3 *db, const void *zSql, int nByte,
+EXPORT int my_sqlite3_prepare16_v2(sqlite3 *db, const void *zSql, int nByte,
                             sqlite3_stmt **ppStmt, const void **pzTail);
 
 // ============================================================================
@@ -240,29 +253,29 @@ int pg_map_param_index(pg_stmt_t *pg_stmt, sqlite3_stmt *pStmt, int sqlite_idx);
 int contains_binary_bytes(const unsigned char *data, size_t len);
 char* bytes_to_pg_hex(const unsigned char *data, size_t len);
 
-int my_sqlite3_bind_int(sqlite3_stmt *pStmt, int idx, int val);
-int my_sqlite3_bind_int64(sqlite3_stmt *pStmt, int idx, sqlite3_int64 val);
-int my_sqlite3_bind_double(sqlite3_stmt *pStmt, int idx, double val);
-int my_sqlite3_bind_text(sqlite3_stmt *pStmt, int idx, const char *val,
+EXPORT int my_sqlite3_bind_int(sqlite3_stmt *pStmt, int idx, int val);
+EXPORT int my_sqlite3_bind_int64(sqlite3_stmt *pStmt, int idx, sqlite3_int64 val);
+EXPORT int my_sqlite3_bind_double(sqlite3_stmt *pStmt, int idx, double val);
+EXPORT int my_sqlite3_bind_text(sqlite3_stmt *pStmt, int idx, const char *val,
                          int nBytes, void (*destructor)(void*));
-int my_sqlite3_bind_text64(sqlite3_stmt *pStmt, int idx, const char *val,
+EXPORT int my_sqlite3_bind_text64(sqlite3_stmt *pStmt, int idx, const char *val,
                            sqlite3_uint64 nBytes, void (*destructor)(void*),
                            unsigned char encoding);
-int my_sqlite3_bind_blob(sqlite3_stmt *pStmt, int idx, const void *val,
+EXPORT int my_sqlite3_bind_blob(sqlite3_stmt *pStmt, int idx, const void *val,
                          int nBytes, void (*destructor)(void*));
-int my_sqlite3_bind_blob64(sqlite3_stmt *pStmt, int idx, const void *val,
+EXPORT int my_sqlite3_bind_blob64(sqlite3_stmt *pStmt, int idx, const void *val,
                            sqlite3_uint64 nBytes, void (*destructor)(void*));
-int my_sqlite3_bind_value(sqlite3_stmt *pStmt, int idx, const sqlite3_value *pValue);
-int my_sqlite3_bind_null(sqlite3_stmt *pStmt, int idx);
+EXPORT int my_sqlite3_bind_value(sqlite3_stmt *pStmt, int idx, const sqlite3_value *pValue);
+EXPORT int my_sqlite3_bind_null(sqlite3_stmt *pStmt, int idx);
 
 // ============================================================================
 // Step Functions (db_interpose_step.c)
 // ============================================================================
 
-int my_sqlite3_step(sqlite3_stmt *pStmt);
-int my_sqlite3_reset(sqlite3_stmt *pStmt);
-int my_sqlite3_finalize(sqlite3_stmt *pStmt);
-int my_sqlite3_clear_bindings(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_step(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_reset(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_finalize(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_clear_bindings(sqlite3_stmt *pStmt);
 
 // ============================================================================
 // Column Functions (db_interpose_column.c)
@@ -270,51 +283,52 @@ int my_sqlite3_clear_bindings(sqlite3_stmt *pStmt);
 
 const void* pg_decode_bytea(pg_stmt_t *pg_stmt, int row, int col, int *out_length);
 
-int my_sqlite3_column_count(sqlite3_stmt *pStmt);
-int my_sqlite3_column_type(sqlite3_stmt *pStmt, int idx);
-int my_sqlite3_column_int(sqlite3_stmt *pStmt, int idx);
-sqlite3_int64 my_sqlite3_column_int64(sqlite3_stmt *pStmt, int idx);
-double my_sqlite3_column_double(sqlite3_stmt *pStmt, int idx);
-const unsigned char* my_sqlite3_column_text(sqlite3_stmt *pStmt, int idx);
-const void* my_sqlite3_column_blob(sqlite3_stmt *pStmt, int idx);
-int my_sqlite3_column_bytes(sqlite3_stmt *pStmt, int idx);
-const char* my_sqlite3_column_name(sqlite3_stmt *pStmt, int idx);
-sqlite3_value* my_sqlite3_column_value(sqlite3_stmt *pStmt, int idx);
-int my_sqlite3_data_count(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_column_count(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_column_type(sqlite3_stmt *pStmt, int idx);
+EXPORT int my_sqlite3_column_int(sqlite3_stmt *pStmt, int idx);
+EXPORT sqlite3_int64 my_sqlite3_column_int64(sqlite3_stmt *pStmt, int idx);
+EXPORT double my_sqlite3_column_double(sqlite3_stmt *pStmt, int idx);
+EXPORT const unsigned char* my_sqlite3_column_text(sqlite3_stmt *pStmt, int idx);
+EXPORT const void* my_sqlite3_column_blob(sqlite3_stmt *pStmt, int idx);
+EXPORT int my_sqlite3_column_bytes(sqlite3_stmt *pStmt, int idx);
+EXPORT const char* my_sqlite3_column_name(sqlite3_stmt *pStmt, int idx);
+EXPORT const char* my_sqlite3_column_decltype(sqlite3_stmt *pStmt, int idx);
+EXPORT sqlite3_value* my_sqlite3_column_value(sqlite3_stmt *pStmt, int idx);
+EXPORT int my_sqlite3_data_count(sqlite3_stmt *pStmt);
 
 // ============================================================================
 // Value Functions (db_interpose_column.c)
 // ============================================================================
 
-int my_sqlite3_value_type(sqlite3_value *pVal);
-const unsigned char* my_sqlite3_value_text(sqlite3_value *pVal);
-int my_sqlite3_value_int(sqlite3_value *pVal);
-sqlite3_int64 my_sqlite3_value_int64(sqlite3_value *pVal);
-double my_sqlite3_value_double(sqlite3_value *pVal);
-int my_sqlite3_value_bytes(sqlite3_value *pVal);
-const void* my_sqlite3_value_blob(sqlite3_value *pVal);
+EXPORT int my_sqlite3_value_type(sqlite3_value *pVal);
+EXPORT const unsigned char* my_sqlite3_value_text(sqlite3_value *pVal);
+EXPORT int my_sqlite3_value_int(sqlite3_value *pVal);
+EXPORT sqlite3_int64 my_sqlite3_value_int64(sqlite3_value *pVal);
+EXPORT double my_sqlite3_value_double(sqlite3_value *pVal);
+EXPORT int my_sqlite3_value_bytes(sqlite3_value *pVal);
+EXPORT const void* my_sqlite3_value_blob(sqlite3_value *pVal);
 
 // ============================================================================
 // Metadata Functions (db_interpose_metadata.c)
 // ============================================================================
 
-int my_sqlite3_changes(sqlite3 *db);
-sqlite3_int64 my_sqlite3_changes64(sqlite3 *db);
-sqlite3_int64 my_sqlite3_last_insert_rowid(sqlite3 *db);
-const char* my_sqlite3_errmsg(sqlite3 *db);
-int my_sqlite3_errcode(sqlite3 *db);
-int my_sqlite3_extended_errcode(sqlite3 *db);
-int my_sqlite3_get_table(sqlite3 *db, const char *sql, char ***pazResult,
+EXPORT int my_sqlite3_changes(sqlite3 *db);
+EXPORT sqlite3_int64 my_sqlite3_changes64(sqlite3 *db);
+EXPORT sqlite3_int64 my_sqlite3_last_insert_rowid(sqlite3 *db);
+EXPORT const char* my_sqlite3_errmsg(sqlite3 *db);
+EXPORT int my_sqlite3_errcode(sqlite3 *db);
+EXPORT int my_sqlite3_extended_errcode(sqlite3 *db);
+EXPORT int my_sqlite3_get_table(sqlite3 *db, const char *sql, char ***pazResult,
                          int *pnRow, int *pnColumn, char **pzErrMsg);
 
 // ============================================================================
 // Collation Functions (db_interpose_metadata.c)
 // ============================================================================
 
-int my_sqlite3_create_collation(sqlite3 *db, const char *zName, int eTextRep,
+EXPORT int my_sqlite3_create_collation(sqlite3 *db, const char *zName, int eTextRep,
                                 void *pArg,
                                 int(*xCompare)(void*,int,const void*,int,const void*));
-int my_sqlite3_create_collation_v2(sqlite3 *db, const char *zName, int eTextRep,
+EXPORT int my_sqlite3_create_collation_v2(sqlite3 *db, const char *zName, int eTextRep,
                                    void *pArg,
                                    int(*xCompare)(void*,int,const void*,int,const void*),
                                    void(*xDestroy)(void*));
@@ -323,21 +337,29 @@ int my_sqlite3_create_collation_v2(sqlite3 *db, const char *zName, int eTextRep,
 // Memory and Statement Info Functions (db_interpose_metadata.c)
 // ============================================================================
 
-void my_sqlite3_free(void *ptr);
-void* my_sqlite3_malloc(int n);
-sqlite3* my_sqlite3_db_handle(sqlite3_stmt *pStmt);
-const char* my_sqlite3_sql(sqlite3_stmt *pStmt);
-char* my_sqlite3_expanded_sql(sqlite3_stmt *pStmt);
-int my_sqlite3_bind_parameter_count(sqlite3_stmt *pStmt);
-int my_sqlite3_stmt_readonly(sqlite3_stmt *pStmt);
+EXPORT void my_sqlite3_free(void *ptr);
+EXPORT void* my_sqlite3_malloc(int n);
+EXPORT sqlite3* my_sqlite3_db_handle(sqlite3_stmt *pStmt);
+EXPORT const char* my_sqlite3_sql(sqlite3_stmt *pStmt);
+EXPORT char* my_sqlite3_expanded_sql(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_bind_parameter_count(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_bind_parameter_index(sqlite3_stmt *pStmt, const char *zName);
+EXPORT int my_sqlite3_stmt_readonly(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_stmt_busy(sqlite3_stmt *pStmt);
+EXPORT int my_sqlite3_stmt_status(sqlite3_stmt *pStmt, int op, int resetFlg);
+EXPORT const char* my_sqlite3_bind_parameter_name(sqlite3_stmt *pStmt, int idx);
 
 // Original function pointers (extern - defined in db_interpose_core.c)
-extern void (*orig_sqlite3_free)(void*);
-extern void* (*orig_sqlite3_malloc)(int);
-extern sqlite3* (*orig_sqlite3_db_handle)(sqlite3_stmt*);
-extern const char* (*orig_sqlite3_sql)(sqlite3_stmt*);
-extern char* (*orig_sqlite3_expanded_sql)(sqlite3_stmt*);
-extern int (*orig_sqlite3_bind_parameter_count)(sqlite3_stmt*);
-extern int (*orig_sqlite3_stmt_readonly)(sqlite3_stmt*);
+VISIBLE extern void (*orig_sqlite3_free)(void*);
+VISIBLE extern void* (*orig_sqlite3_malloc)(int);
+VISIBLE extern sqlite3* (*orig_sqlite3_db_handle)(sqlite3_stmt*);
+VISIBLE extern const char* (*orig_sqlite3_sql)(sqlite3_stmt*);
+VISIBLE extern char* (*orig_sqlite3_expanded_sql)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_bind_parameter_count)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_bind_parameter_index)(sqlite3_stmt*, const char*);
+VISIBLE extern int (*orig_sqlite3_stmt_readonly)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_stmt_busy)(sqlite3_stmt*);
+VISIBLE extern int (*orig_sqlite3_stmt_status)(sqlite3_stmt*, int, int);
+VISIBLE extern const char* (*orig_sqlite3_bind_parameter_name)(sqlite3_stmt*, int);
 
 #endif /* DB_INTERPOSE_H */

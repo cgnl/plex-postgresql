@@ -1169,24 +1169,46 @@ char* fix_integer_text_mismatch(const char *sql) {
     // Pattern 4: status IN (SELECT ... FROM json_array_elements
     // di."status" is INTEGER in download_queue_items, value::text is TEXT
     // Direct pattern match for the download_queue_items query
+    // IMPORTANT: Handle both backticks (before translate_backticks runs) and
+    // double quotes (in final pass after translate_backticks)
     if (strcasestr(current, "download_queue_items") && strcasestr(current, "json_array_elements")) {
         LOG_INFO("Pattern 4 matched: download_queue_items with json_array_elements");
         LOG_INFO("Query before fix: %.200s", current);
-        // Match: di."status" IN (SELECT value::text
-        // Fix:   di."status"::text IN (SELECT value::text
-        temp = str_replace_nocase(current,
-            "di.\"status\" IN",
-            "di.\"status\"::text IN");
-        if (temp && temp != current) {
-            LOG_INFO("Pattern 4 replacement succeeded");
-            free(current);
-            current = temp;
+
+        // Try backtick version first (before translate_backticks)
+        if (strcasestr(current, "di.`status` IN")) {
+            temp = str_replace_nocase(current,
+                "di.`status` IN",
+                "di.`status`::text IN");
+            if (temp) {
+                LOG_INFO("Pattern 4a replacement succeeded (backticks)");
+                free(current);
+                current = temp;
+            }
+        }
+        // Try double-quote version (after translate_backticks or in final pass)
+        else if (strcasestr(current, "di.\"status\" IN")) {
+            temp = str_replace_nocase(current,
+                "di.\"status\" IN",
+                "di.\"status\"::text IN");
+            if (temp) {
+                LOG_INFO("Pattern 4b replacement succeeded (quotes)");
+                free(current);
+                current = temp;
+            }
         } else {
-            LOG_INFO("Pattern 4 replacement did NOT change anything");
+            LOG_INFO("Pattern 4 replacement did NOT match any variant");
         }
     }
 
     // Generic pattern for any "status" column with json_array_elements
+    // Handle both backticks and double quotes
+    if (strcasestr(current, "`status` IN") && strcasestr(current, "json_array_elements")) {
+        temp = str_replace_nocase(current,
+            "`status` IN",
+            "`status`::text IN");
+        if (temp) { free(current); current = temp; }
+    }
     if (strcasestr(current, "\"status\" IN") && strcasestr(current, "json_array_elements")) {
         temp = str_replace_nocase(current,
             "\"status\" IN",
