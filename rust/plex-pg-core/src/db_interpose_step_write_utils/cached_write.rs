@@ -247,6 +247,19 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                     id_str = id_buf.as_ptr();
                 }
                 if !id_str.is_null() && !CStr::from_ptr(id_str).to_bytes().is_empty() {
+                    // Mirror the non-cached write path (write_exec.rs): publish
+                    // the returned id as `last_insert_rowid` on both the
+                    // executing connection and the global atomic. Without this,
+                    // a cached INSERT with `RETURNING id` produces a row on
+                    // PG but `sqlite3_last_insert_rowid()` returns 0, which
+                    // Plex's SOCI wrapper interprets as "insert failed" and
+                    // throws DB::Exception from every async-task tick.
+                    let rowid = crate::db_interpose_helpers::rust_pg_text_to_int64(id_str);
+                    if rowid > 0 {
+                        let ec = &mut *exec_conn;
+                        ec.last_insert_rowid = rowid;
+                        crate::pg_client::rust_set_global_last_insert_rowid(rowid);
+                    }
                     let meta_id = crate::pg_statement::rust_extract_metadata_id(orig_sql);
                     if meta_id > 0 {
                         crate::pg_client::rust_set_global_metadata_id(meta_id);

@@ -48,12 +48,35 @@ pub(super) fn last_insert_rowid_impl(db: *mut sqlite3) -> i64 {
     let pg_conn = crate::pg_client::rust_pg_find_connection(db);
     if pg_conn.is_null() {
         let global_rowid = crate::pg_client::rust_get_global_last_insert_rowid();
+        if global_rowid > 0 {
+            log_debug_lazy!(
+                "last_insert_rowid: CALLED db={:p} pg_conn=NULL (no exact match, global={})",
+                db,
+                global_rowid
+            );
+            return global_rowid;
+        }
+        // Fall back to real SQLite's last_insert_rowid on this db handle.
+        // When the PG path didn't capture the rowid (e.g. the INSERT was
+        // prepared via the real-SQLite path because of stack-depth caution
+        // or because pg_conn lookup missed at prepare time), the shadow
+        // SQLite engine still ran the INSERT and knows the rowid. Returning
+        // 0 here is what makes Plex's SOCI wrapper throw `DB::Exception:
+        // std::exception` every 5s, keeping the server stuck in Maintenance.
+        if let Some(f) = get_orig_sqlite3_last_insert_rowid() {
+            let real_rowid = unsafe { f(db) };
+            log_debug_lazy!(
+                "last_insert_rowid: CALLED db={:p} pg_conn=NULL global=0, real_sqlite={}",
+                db,
+                real_rowid
+            );
+            return real_rowid;
+        }
         log_debug_lazy!(
-            "last_insert_rowid: CALLED db={:p} pg_conn=NULL (no exact match, global={})",
-            db,
-            global_rowid
+            "last_insert_rowid: CALLED db={:p} pg_conn=NULL global=0, no real_sqlite fn",
+            db
         );
-        return if global_rowid > 0 { global_rowid } else { 0 };
+        return 0;
     }
 
     log_debug_lazy!(
