@@ -312,13 +312,21 @@ migrate_sqlite_to_pg() {
 
     # Always clear Flags.dat after migration — it contains stale SQLite
     # state that causes "Invalid uuid length" segfaults on first PG startup.
-    local flags_dat
+    # Also probe a path derived from $SQLITE_DB (with symlinks resolved) so
+    # the clear works when the migrate Job mounts source config at a
+    # non-/config prefix (k8s / CI flows).
+    local flags_dat source_root="" sqlite_real
+    if [[ -n "${SQLITE_DB:-}" ]]; then
+        sqlite_real="$(readlink -f "$SQLITE_DB" 2>/dev/null || echo "$SQLITE_DB")"
+        source_root="$(dirname "$sqlite_real" | sed 's|/Plug-in Support/Databases$||')"
+    fi
     for flags_dat in \
         "/config/Library/Application Support/Plex Media Server/Cache/Flags.dat" \
-        "${PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR:-}/Plex Media Server/Cache/Flags.dat"; do
-        if [[ -f "$flags_dat" ]]; then
+        "${PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR:-}/Plex Media Server/Cache/Flags.dat" \
+        "${source_root}/Cache/Flags.dat"; do
+        if [[ -n "$flags_dat" && -f "$flags_dat" ]]; then
             rm -f "$flags_dat"
-            echo "  Cleared Flags.dat (stale SQLite cache)"
+            echo "  Cleared Flags.dat (stale SQLite cache): $flags_dat"
             break
         fi
     done
