@@ -5,6 +5,36 @@ use crate::db_interpose_bind::support::{
 };
 use crate::log_debug_lazy;
 
+fn parse_machine_identifier(content: &str) -> Option<String> {
+    if let Some(pos) = content.find("MachineIdentifier=\"") {
+        let start = pos + "MachineIdentifier=\"".len();
+        if let Some(end) = content[start..].find("\"") {
+            let hex = &content[start..start+end];
+            if hex.len() == 32 {
+                return Some(format!(
+                    "{}-{}-{}-{}-{}",
+                    &hex[0..8],
+                    &hex[8..12],
+                    &hex[12..16],
+                    &hex[16..20],
+                    &hex[20..32]
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn get_machine_identifier() -> String {
+    let default_uuid = "53cfd87b-f8b2-4db2-af2d-6aaa373b2b34".to_string();
+    let path = "/config/Library/Application Support/Plex Media Server/Preferences.xml";
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return default_uuid,
+    };
+    parse_machine_identifier(&content).unwrap_or(default_uuid)
+}
+
 unsafe fn store_text_param(
     pg_stmt: *mut PgStmt,
     pg_idx: usize,
@@ -82,11 +112,67 @@ unsafe fn store_blob_hex_param(
 pub(super) fn bind_text_impl(
     p_stmt: *mut sqlite3_stmt,
     idx: c_int,
-    val: *const c_char,
-    n_bytes: c_int,
+    mut val: *const c_char,
+    mut n_bytes: c_int,
     destructor: *mut c_void,
 ) -> c_int {
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_TEXT, p_stmt) };
+    let mut _intercepted_uuid = String::new();
+
+    if !pg_stmt.is_null() && !val.is_null() {
+        let stmt = unsafe { &*pg_stmt };
+        let sql_bytes = unsafe { if !stmt.sql.is_null() { crate::byte_utils::cstr_bytes(stmt.sql) } else { b"" } };
+        
+        let bypass = std::env::var("BYPASS_UUID_INTERCEPT").is_ok();
+        if !bypass && crate::byte_utils::contains_bytes(sql_bytes, b"devices") {
+            let actual_len = if n_bytes < 0 {
+                unsafe { libc::strlen(val) as usize }
+            } else {
+                n_bytes as usize
+            };
+            if actual_len == 0 {
+                let param_name = crate::db_interpose_metadata::rust_my_sqlite3_bind_parameter_name(p_stmt, idx);
+                let is_identifier = if !param_name.is_null() {
+                    let name_str = unsafe { std::ffi::CStr::from_ptr(param_name).to_string_lossy().to_lowercase() };
+                    name_str.contains("identifier")
+                } else {
+                    let sql_str = crate::db_interpose_conn_utils::cstr_to_string_or(stmt.sql, "").to_lowercase();
+                    sql_str.contains("where identifier") || (sql_str.contains("select") && idx == 1)
+                };
+
+                if is_identifier {
+                    _intercepted_uuid = get_machine_identifier();
+                    log_debug_lazy!("INTERCEPTED empty UUID bind on devices, replacing with {}", _intercepted_uuid);
+                    val = _intercepted_uuid.as_ptr() as *const c_char;
+                    n_bytes = _intercepted_uuid.len() as c_int;
+                }
+            }
+        }
+    }
+
+    if !pg_stmt.is_null() {
+        let stmt = unsafe { &*pg_stmt };
+        let sql_bytes = unsafe { if !stmt.sql.is_null() { crate::byte_utils::cstr_bytes(stmt.sql) } else { b"" } };
+        if crate::byte_utils::contains_bytes(sql_bytes, b"devices") || crate::byte_utils::contains_bytes(sql_bytes, b"library_sections") || crate::byte_utils::contains_bytes(sql_bytes, b"plugins") {
+            let val_str = if val.is_null() { "NULL".to_string() } else {
+                let actual_len = if n_bytes < 0 {
+                    unsafe { libc::strlen(val) as usize }
+                } else {
+                    n_bytes as usize
+                };
+                let bytes = unsafe { std::slice::from_raw_parts(val as *const u8, actual_len.min(100)) };
+                String::from_utf8_lossy(bytes).into_owned()
+            };
+            log_debug_lazy!(
+                "BIND TEXT: stmt={:p} idx={} val='{}' n_bytes={} sql={}",
+                pg_stmt,
+                idx,
+                val_str,
+                n_bytes,
+                crate::db_interpose_conn_utils::cstr_to_string_or(stmt.sql, "NULL")
+            );
+        }
+    }
 
     let rc = if is_pg_routed_noncached(pg_stmt) {
         // Skip orig_sqlite3_bind_text — PG param storage below is sufficient.
@@ -218,12 +304,44 @@ pub(super) fn bind_blob64_impl(
 pub(super) fn bind_text64_impl(
     p_stmt: *mut sqlite3_stmt,
     idx: c_int,
-    val: *const c_char,
-    n_bytes: u64,
+    mut val: *const c_char,
+    mut n_bytes: u64,
     destructor: *mut c_void,
     encoding: c_uchar,
 ) -> c_int {
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_TEXT64, p_stmt) };
+    let mut _intercepted_uuid = String::new();
+
+    if !pg_stmt.is_null() && !val.is_null() {
+        let stmt = unsafe { &*pg_stmt };
+        let sql_bytes = unsafe { if !stmt.sql.is_null() { crate::byte_utils::cstr_bytes(stmt.sql) } else { b"" } };
+        
+        let bypass = std::env::var("BYPASS_UUID_INTERCEPT").is_ok();
+        if !bypass && crate::byte_utils::contains_bytes(sql_bytes, b"devices") {
+            let actual_len = if n_bytes == u64::MAX {
+                unsafe { libc::strlen(val) as usize }
+            } else {
+                n_bytes as usize
+            };
+            if actual_len == 0 {
+                let param_name = crate::db_interpose_metadata::rust_my_sqlite3_bind_parameter_name(p_stmt, idx);
+                let is_identifier = if !param_name.is_null() {
+                    let name_str = unsafe { std::ffi::CStr::from_ptr(param_name).to_string_lossy().to_lowercase() };
+                    name_str.contains("identifier")
+                } else {
+                    let sql_str = crate::db_interpose_conn_utils::cstr_to_string_or(stmt.sql, "").to_lowercase();
+                    sql_str.contains("where identifier") || (sql_str.contains("select") && idx == 1)
+                };
+
+                if is_identifier {
+                    _intercepted_uuid = get_machine_identifier();
+                    log_debug_lazy!("INTERCEPTED empty UUID bind on devices (64), replacing with {}", _intercepted_uuid);
+                    val = _intercepted_uuid.as_ptr() as *const c_char;
+                    n_bytes = _intercepted_uuid.len() as u64;
+                }
+            }
+        }
+    }
 
     let rc = if is_pg_routed_noncached(pg_stmt) {
         if !val.is_null() {
@@ -268,4 +386,37 @@ pub(super) fn bind_text64_impl(
     drop(guard);
     crate::pg_mem_telemetry::rust_mem_telemetry_maybe_log();
     rc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_machine_identifier_valid() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?><Preferences MachineIdentifier="53cfd87bf8b24db2af2d6aaa373b2b34" ProcessedMachineIdentifier="53cfd87bf8b24db2af2d6aaa373b2b34" AcceptedEULA="1"/>"#;
+        let uuid = parse_machine_identifier(xml);
+        assert_eq!(uuid, Some("53cfd87b-f8b2-4db2-af2d-6aaa373b2b34".to_string()));
+    }
+
+    #[test]
+    fn test_parse_machine_identifier_invalid_len() {
+        let xml = r#"<Preferences MachineIdentifier="abc123" AcceptedEULA="1"/>"#;
+        let uuid = parse_machine_identifier(xml);
+        assert_eq!(uuid, None);
+    }
+
+    #[test]
+    fn test_parse_machine_identifier_missing() {
+        let xml = r#"<Preferences AcceptedEULA="1"/>"#;
+        let uuid = parse_machine_identifier(xml);
+        assert_eq!(uuid, None);
+    }
+
+    #[test]
+    fn test_get_machine_identifier_fallback() {
+        let uuid = get_machine_identifier();
+        // Since /config/... doesn't exist in unit test runner environment, it must fallback to default UUID
+        assert_eq!(uuid, "53cfd87b-f8b2-4db2-af2d-6aaa373b2b34");
+    }
 }

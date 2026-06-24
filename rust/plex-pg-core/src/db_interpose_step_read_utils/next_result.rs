@@ -1,5 +1,7 @@
 use super::*;
 use crate::log_debug_lazy;
+use crate::byte_utils::{contains_icase_bytes, cstr_bytes};
+use crate::db_interpose_conn_utils::{cstr_prefix, cstr_to_string_or};
 
 pub(super) fn advance_cached_result_impl(stmt: *mut PgStmt) -> c_int {
     if stmt.is_null() {
@@ -172,5 +174,32 @@ pub(super) fn log_debug_context_impl(stmt: *mut PgStmt, exec_conn: *mut PgConnec
             stmt,
             exec_conn
         );
+        let has_match = unsafe {
+            !stmt_ref.sql.is_null()
+                && (contains_icase_bytes(cstr_bytes(stmt_ref.sql), b"devices")
+                    || contains_icase_bytes(cstr_bytes(stmt_ref.sql), b"library_sections"))
+            || !stmt_ref.pg_sql.is_null()
+                && (contains_icase_bytes(cstr_bytes(stmt_ref.pg_sql), b"devices")
+                    || contains_icase_bytes(cstr_bytes(stmt_ref.pg_sql), b"library_sections"))
+        };
+        if has_match {
+            log_debug_lazy!(
+                "STEP READ devices/library_sections: param_count={} is_pg={}",
+                stmt_ref.param_count,
+                stmt_ref.is_pg
+            );
+            for i in 0..(stmt_ref.param_count as usize) {
+                if i < stmt_ref.param_values.len() {
+                    let p = stmt_ref.param_values[i];
+                    log_debug_lazy!("  PARAM[{}]: {}", i, cstr_to_string_or(p, "NULL"));
+                } else {
+                    log_debug_lazy!("  PARAM[{}]: OUT_OF_BOUNDS", i);
+                }
+            }
+            log_debug_lazy!("  SQL: {}", cstr_prefix(stmt_ref.sql, 1000, "NULL"));
+            if !stmt_ref.pg_sql.is_null() {
+                log_debug_lazy!("  PG_SQL: {}", cstr_prefix(stmt_ref.pg_sql, 1000, "NULL"));
+            }
+        }
     }
 }

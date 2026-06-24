@@ -439,5 +439,23 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         }
     }
 
-    orig_step(p_stmt)
+    let rc = orig_step(p_stmt);
+    if rc != SQLITE_ROW && rc != SQLITE_DONE {
+        let db = call_sqlite3_db_handle(p_stmt);
+        let errmsg = if db.is_null() {
+            b"no db handle\0".as_ptr() as *const c_char
+        } else {
+            crate::db_interpose_metadata::rust_my_sqlite3_errmsg(db)
+        };
+        let sql = call_sqlite3_sql(p_stmt);
+        libc::fprintf(
+            stderr_ptr(),
+            b"[SQLITE_STEP_ERROR] rc=%d errmsg='%s' sql='%.900s'\n\0".as_ptr() as *const c_char,
+            rc,
+            errmsg,
+            if sql.is_null() { b"<null>\0".as_ptr() as *const c_char } else { sql },
+        );
+        libc::fflush(stderr_ptr());
+    }
+    rc
 }

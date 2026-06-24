@@ -13,6 +13,32 @@ pub extern "C" fn rust_step_write_log_debug_context(
     let stmt = unsafe { &*pg_stmt };
 
     unsafe {
+        let has_match = !stmt.sql.is_null()
+            && (contains_icase_bytes(cstr_bytes(stmt.sql), b"devices")
+                || contains_icase_bytes(cstr_bytes(stmt.sql), b"library_sections"))
+            || !stmt.pg_sql.is_null()
+            && (contains_icase_bytes(cstr_bytes(stmt.pg_sql), b"devices")
+                || contains_icase_bytes(cstr_bytes(stmt.pg_sql), b"library_sections"));
+        if has_match {
+            log_debug_lazy!(
+                "STEP WRITE devices/library_sections: param_count={} is_pg={}",
+                stmt.param_count,
+                stmt.is_pg
+            );
+            for i in 0..(stmt.param_count as usize) {
+                if i < stmt.param_values.len() {
+                    let p = stmt.param_values[i];
+                    log_debug_lazy!("  PARAM[{}]: {}", i, cstr_to_string_or(p, "NULL"));
+                } else {
+                    log_debug_lazy!("  PARAM[{}]: OUT_OF_BOUNDS", i);
+                }
+            }
+            log_debug_lazy!("  SQL: {}", cstr_prefix(stmt.sql, 1000, "NULL"));
+            if !stmt.pg_sql.is_null() {
+                log_debug_lazy!("  PG_SQL: {}", cstr_prefix(stmt.pg_sql, 1000, "NULL"));
+            }
+        }
+
         if !stmt.pg_sql.is_null()
             && contains_bytes(cstr_bytes(stmt.pg_sql), b"play_queue_generators")
         {

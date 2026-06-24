@@ -19,9 +19,20 @@ type SigactionFn =
     unsafe extern "C" fn(c_int, *const libc::sigaction, *mut libc::sigaction) -> c_int;
 type CxaThrowFn =
     unsafe extern "C" fn(*mut c_void, *mut c_void, Option<unsafe extern "C" fn(*mut c_void)>) -> !;
+/// Pass-through hook for create_simple_converter (ASCII path handled at the
+/// create_simple_codecvt level by the AArch64 asm hook below).
+type CreateSimpleConverterFn = unsafe extern "C" fn(*mut u8) -> *mut c_void;
 
 static mut ORIG_SIGACTION: Option<SigactionFn> = None;
 static mut ORIG_CXA_THROW: Option<CxaThrowFn> = None;
+static mut ORIG_CREATE_SIMPLE_CONVERTER: Option<CreateSimpleConverterFn> = None;
+
+/// Function-pointer statics for the AArch64 global_asm hook below.
+/// #[no_mangle] makes them addressable by their exact name from assembler.
+#[no_mangle]
+pub static mut SHIM_CREATE_UTF8_CODECVT_PTR: usize = 0;
+#[no_mangle]
+pub static mut SHIM_CREATE_SIMPLE_CODECVT_PTR: usize = 0;
 
 static FORCE_IGNORE_SIGCHLD: AtomicI32 = AtomicI32::new(1);
 static INTERCEPT_SIGACTION: AtomicI32 = AtomicI32::new(1);
@@ -74,6 +85,37 @@ unsafe fn resolve_interposition_hooks() {
             ptr::addr_of_mut!(ORIG_CXA_THROW),
             Some(std::mem::transmute::<*mut c_void, CxaThrowFn>(sym)),
         );
+    }
+
+    // create_simple_converter — pass-through hook (ASCII handled at codecvt level)
+    let sym = libc::dlsym(
+        libc::RTLD_NEXT,
+        b"_ZN5boost6locale4util23create_simple_converterERKNSt3__212basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE\0".as_ptr() as *const c_char
+    );
+    if !sym.is_null() {
+        ptr::write(
+            ptr::addr_of_mut!(ORIG_CREATE_SIMPLE_CONVERTER),
+            Some(std::mem::transmute::<*mut c_void, CreateSimpleConverterFn>(sym)),
+        );
+    }
+
+    // create_simple_codecvt — original target for the asm hook pass-through path.
+    // Stored as a raw usize so the AArch64 assembler can read it directly.
+    let sym = libc::dlsym(
+        libc::RTLD_NEXT,
+        b"_ZN5boost6locale4util21create_simple_codecvtERKNSt3__26localeERKNS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS0_12char_facet_tE\0".as_ptr() as *const c_char
+    );
+    if !sym.is_null() {
+        ptr::write(ptr::addr_of_mut!(SHIM_CREATE_SIMPLE_CODECVT_PTR), sym as usize);
+    }
+
+    // create_utf8_codecvt — ASCII redirect target for the asm hook.
+    let sym = libc::dlsym(
+        libc::RTLD_NEXT,
+        b"_ZN5boost6locale4util19create_utf8_codecvtERKNSt3__26localeENS0_12char_facet_tE\0".as_ptr() as *const c_char
+    );
+    if !sym.is_null() {
+        ptr::write(ptr::addr_of_mut!(SHIM_CREATE_UTF8_CODECVT_PTR), sym as usize);
     }
 }
 
@@ -484,10 +526,93 @@ static INIT: extern "C" fn() = shim_init_wrapper;
 static FINI: extern "C" fn() = shim_cleanup_wrapper;
 
 // ────────────────────────────────────────────────────────────────────────────
-// LD_PRELOAD wrappers — only compiled when the `interpose` feature is active.
-// This avoids duplicate-symbol errors with rusqlite's bundled sqlite3 in
-// test targets AND bin targets.  The shared-library (.so) build enables
-// `interpose` explicitly via `--features interpose`.
+// ────────────────────────────────────────────────────────────────────────────
+// AArch64 assembly hook for boost::locale::util::create_simple_codecvt.
+//
+// Why assembly? On AArch64 the Itanium C++ ABI returns std::locale (a
+// non-trivially copyable 8-byte struct) via the x8 "indirect result"
+// register (SRET), NOT in x0. Plex's Boost saves x8 on entry, so any Rust
+// wrapper that clobbers x8 before forwarding the call writes the new locale
+// object to a garbage address → SIGSEGV in locale::operator=.
+//
+// This hook:
+//   - Saves x8 + all args on the stack without touching x8 mid-flight.
+//   - Detects ASCII in x1 (the string ptr) and redirects to create_utf8_codecvt
+//     (x0=locale, x1=facet, x8 restored from stack).
+//   - Falls through to the original create_simple_codecvt otherwise.
+// ────────────────────────────────────────────────────────────────────────────
+#[cfg(all(feature = "interpose", target_arch = "aarch64"))]
+std::arch::global_asm!(
+    // Export the symbol so LD_PRELOAD interposition takes effect.
+    ".global _ZN5boost6locale4util21create_simple_codecvtERKNSt3__26localeERKNS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS0_12char_facet_tE",
+    ".type   _ZN5boost6locale4util21create_simple_codecvtERKNSt3__26localeERKNS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS0_12char_facet_tE, %function",
+    "_ZN5boost6locale4util21create_simple_codecvtERKNSt3__26localeERKNS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS0_12char_facet_tE:",
+    // ABI on entry:
+    //   x8  = SRET pointer (output locale buffer allocated by caller)
+    //   x0  = const std::locale& in    (input locale)
+    //   x1  = const std::string& encoding
+    //   x2  = char_facet_t type
+    //   x30 = return address
+    //
+    // Stack frame layout (48 bytes, 16-byte aligned):
+    //   [sp+0]  x29 (frame ptr)    [sp+8]  x30 (lr)
+    //   [sp+16] x8  (SRET ptr)
+    //   [sp+24] x0  (locale ptr)
+    //   [sp+32] x1  (string ptr)   [sp+40] x2  (facet)
+    "stp  x29, x30, [sp, #-48]!",
+    "mov  x29, sp",
+    "str  x8,  [sp, #16]",
+    "str  x0,  [sp, #24]",
+    "stp  x1,  x2,  [sp, #32]",
+    // Check: is *x1 == 'A','S','C','I','I','\0'?
+    "ldrb w9,  [x1]",
+    "cmp  w9,  #65",
+    "b.ne .Lshim_csc_orig",
+    "ldrb w9,  [x1, #1]",
+    "cmp  w9,  #83",
+    "b.ne .Lshim_csc_orig",
+    "ldrb w9,  [x1, #2]",
+    "cmp  w9,  #67",
+    "b.ne .Lshim_csc_orig",
+    "ldrb w9,  [x1, #3]",
+    "cmp  w9,  #73",
+    "b.ne .Lshim_csc_orig",
+    "ldrb w9,  [x1, #4]",
+    "cmp  w9,  #73",
+    "b.ne .Lshim_csc_orig",
+    "ldrb w9,  [x1, #5]",
+    "cbnz w9,  .Lshim_csc_orig",
+    // ASCII detected — GOT-indirect load of fn ptr, then tail-call
+    // create_utf8_codecvt(locale, facet) with x8 = original SRET pointer.
+    // We must use the GOT (:got: / :got_lo12:) because SHIM_* are exported
+    // symbols; direct ADRP generates R_AARCH64_ADR_PREL_PG_HI21 which the
+    // linker rejects in a PIC shared object.
+    "adrp x9,  :got:SHIM_CREATE_UTF8_CODECVT_PTR",
+    "ldr  x9,  [x9, :got_lo12:SHIM_CREATE_UTF8_CODECVT_PTR]",
+    "ldr  x9,  [x9]",                     // x9 = fn-ptr value
+    "cbz  x9,  .Lshim_csc_orig",          // if not resolved, fall through
+    "ldr  x0,  [sp, #24]",                // locale ptr
+    "ldr  x1,  [sp, #40]",                // facet (was x2)
+    "ldr  x8,  [sp, #16]",                // restore SRET!
+    "ldp  x29, x30, [sp], #48",
+    "br   x9",                            // tail call
+    ".Lshim_csc_orig:",
+    // Not ASCII — tail-call original create_simple_codecvt unchanged.
+    "adrp x9,  :got:SHIM_CREATE_SIMPLE_CODECVT_PTR",
+    "ldr  x9,  [x9, :got_lo12:SHIM_CREATE_SIMPLE_CODECVT_PTR]",
+    "ldr  x9,  [x9]",                     // x9 = fn-ptr value
+    "cbz  x9,  .Lshim_csc_abort",
+    "ldr  x0,  [sp, #24]",
+    "ldr  x1,  [sp, #32]",
+    "ldr  x2,  [sp, #40]",
+    "ldr  x8,  [sp, #16]",                // restore SRET!
+    "ldp  x29, x30, [sp], #48",
+    "br   x9",
+    ".Lshim_csc_abort:",
+    // Resolver didn't run — hard abort.
+    "bl   abort",
+);
+
 // ────────────────────────────────────────────────────────────────────────────
 #[cfg(feature = "interpose")]
 mod ld_preload_wrappers {
@@ -810,4 +935,31 @@ mod ld_preload_wrappers {
     ) -> *const c_char {
         c_abi::my_sqlite3_column_decltype(stmt, idx)
     }
+
+    // Simple pass-through: let create_simple_converter proceed normally.
+    // The ASCII → UTF-8 redirect is now handled exclusively at the
+    // create_simple_codecvt level by the AArch64 global_asm hook above.
+    #[no_mangle]
+    #[allow(static_mut_refs)]
+    pub unsafe extern "C" fn _ZN5boost6locale4util23create_simple_converterERKNSt3__212basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE(
+        s: *mut u8,
+    ) -> *mut c_void {
+        let orig = match ptr::read(ptr::addr_of!(ORIG_CREATE_SIMPLE_CONVERTER)) {
+            Some(f) => f,
+            None => {
+                let name = b"_ZN5boost6locale4util23create_simple_converterERKNSt3__212basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE\0";
+                let sym = libc::dlsym(libc::RTLD_NEXT, name.as_ptr() as *const c_char);
+                if sym.is_null() {
+                    libc::abort();
+                }
+                let f = std::mem::transmute::<*mut c_void, CreateSimpleConverterFn>(sym);
+                ptr::write(ptr::addr_of_mut!(ORIG_CREATE_SIMPLE_CONVERTER), Some(f));
+                f
+            }
+        };
+        orig(s)
+    }
+    // Note: create_simple_codecvt is implemented as a global_asm hook above
+    // (AArch64 only) to correctly preserve the x8 SRET pointer while
+    // redirecting ASCII charset requests to create_utf8_codecvt.
 } // mod ld_preload_wrappers

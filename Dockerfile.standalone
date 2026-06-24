@@ -100,6 +100,7 @@ COPY schema/plex_schema.sql /usr/local/lib/plex-postgresql/
 COPY schema/sqlite_schema.sql /usr/local/lib/plex-postgresql/
 COPY schema/sqlite_column_types.sql /usr/local/lib/plex-postgresql/
 COPY schema/pg_compat_functions.sql /usr/local/lib/plex-postgresql/
+COPY schema/seed_data.sql /usr/local/lib/plex-postgresql/
 COPY scripts/migrate_lib.sh /usr/local/lib/plex-postgresql/
 COPY scripts/migrate_table.py /usr/local/lib/plex-postgresql/
 COPY scripts/seed_shadow_table_from_pg.py /usr/local/lib/plex-postgresql/
@@ -121,6 +122,9 @@ RUN printf '%s\n' \
       '#!/usr/bin/env bash' \
       'mkdir -p /run/plex-temp' \
       'chmod 1777 /run/plex-temp 2>/dev/null || true' \
+      'export LANG=C.utf8' \
+      'export LC_ALL=C.utf8' \
+      'export LC_CTYPE=C.utf8' \
       'export LD_LIBRARY_PATH="/usr/local/lib/plex-postgresql:/usr/lib/plexmediaserver/lib:$LD_LIBRARY_PATH"' \
       'export LD_PRELOAD="/usr/local/lib/plex-postgresql/db_interpose_pg.so"' \
       'if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then' \
@@ -129,6 +133,8 @@ RUN printf '%s\n' \
       'exec /usr/local/bin/subreaper "/usr/lib/plexmediaserver/Plex Media Server" "$@"' \
       > /usr/local/lib/plex-postgresql/plex-with-shim.sh && \
     chmod +x /usr/local/lib/plex-postgresql/plex-with-shim.sh && \
+    sed -i 's|s6-setuidgid plex /usr/lib/plexmediaserver/Plex\\ Media\\ Server|s6-setuidgid plex /usr/local/lib/plex-postgresql/plex-with-shim.sh|' \
+      /etc/services.d/plex/run && \
     sed -i 's|s6-setuidgid abc "/usr/lib/plexmediaserver/Plex Media Server"|s6-setuidgid abc /usr/local/lib/plex-postgresql/plex-with-shim.sh|' \
       /etc/services.d/plex/run && \
     sed -i 's|"/usr/lib/plexmediaserver/Plex Media Server"|/usr/local/lib/plex-postgresql/plex-with-shim.sh|' \

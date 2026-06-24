@@ -72,6 +72,7 @@ pub(super) fn bind_value_impl(
 ) -> c_int {
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_VALUE, p_stmt) };
 
+
     let rc = if is_pg_routed_noncached(pg_stmt) {
         SQLITE_OK
     } else {

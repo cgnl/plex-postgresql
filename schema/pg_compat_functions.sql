@@ -41,3 +41,48 @@ BEGIN
     RETURN result;
 END;
 $fn$;
+
+CREATE OR REPLACE FUNCTION public.json_valid(val text)
+RETURNS boolean AS $$
+BEGIN
+  IF val IS NULL THEN
+    RETURN NULL;
+  END IF;
+  PERFORM val::json;
+  RETURN TRUE;
+EXCEPTION WHEN OTHERS THEN
+  RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION public.eq_bool_int(b boolean, i integer)
+RETURNS boolean AS $$
+BEGIN
+  RETURN (b = (i <> 0));
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION public.eq_int_bool(i integer, b boolean)
+RETURNS boolean AS $$
+BEGIN
+  RETURN ((i <> 0) = b);
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+DROP OPERATOR IF EXISTS public.= (boolean, integer);
+CREATE OPERATOR public.= (
+  PROCEDURE = public.eq_bool_int,
+  LEFTARG = boolean,
+  RIGHTARG = integer,
+  COMMUTATOR = =
+);
+
+DROP OPERATOR IF EXISTS public.= (integer, boolean);
+CREATE OPERATOR public.= (
+  PROCEDURE = public.eq_int_bool,
+  LEFTARG = integer,
+  RIGHTARG = boolean,
+  COMMUTATOR = =
+);
+
+

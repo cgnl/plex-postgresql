@@ -113,6 +113,13 @@ init_schema() {
                 # which causes DDL/schema divergence issues with the SQLite shadow DB.
                 local migration_count=$(psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ')
                 echo "schema_migrations has $migration_count entries (kept from dump, shim handles duplicates)"
+
+                # Load default seed data
+                local seed_file="$SHIM_DIR/seed_data.sql"
+                if [ -f "$seed_file" ]; then
+                    echo "Loading default seed data..."
+                    psql -f "$seed_file" 2>/dev/null || true
+                fi
             else
                 echo "WARNING: Schema load had errors, continuing anyway..."
             fi
@@ -342,6 +349,11 @@ if [ -n "$PLEX_PG_HOST" ]; then
         rm -rf "${crash_dir:?}/"*
         echo "Cleaned crash reports (prevents CrashUploader invocation)"
     fi
+
+    # Final permission fix - ensure Plex can write to its directories (including shadow DB folders)
+    # This must be done after all directories and shadow database files are created.
+    echo "Fixing final permissions..."
+    chown -R plex:plex "/config/Library/Application Support/Plex Media Server" 2>/dev/null || chown -R abc:abc "/config/Library/Application Support/Plex Media Server" 2>/dev/null || true
 else
     echo "PLEX_PG_HOST not set, skipping PostgreSQL initialization"
 fi

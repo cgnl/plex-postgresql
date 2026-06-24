@@ -96,6 +96,8 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                 pg_stmt_ref.sql
             };
 
+            remember_finalized_stmt(p_stmt, final_sql, is_pg_value);
+
             let cached = pg_find_cached_stmt(p_stmt);
             if cached == pg_stmt {
                 log_debug("finalize: stmt in both global and TLS, clearing TLS ref");
@@ -120,18 +122,22 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                         cached_ref.sql
                     };
                 }
+                
+                remember_finalized_stmt(p_stmt, final_sql, is_pg_value);
+
                 log_debug_lazy!(
                     "finalize: stmt only in TLS (ref_count={}), clearing",
                     cached_ref.ref_count.load(Ordering::Relaxed)
                 );
                 pg_clear_cached_stmt(p_stmt);
                 pg_stmt_unref(cached);
-            }
-        }
-
-        if final_sql.is_null() {
-            if let Some(f) = orig_sqlite3_sql {
-                final_sql = f(p_stmt);
+            } else {
+                if final_sql.is_null() {
+                    if let Some(f) = orig_sqlite3_sql {
+                        final_sql = f(p_stmt);
+                    }
+                }
+                remember_finalized_stmt(p_stmt, final_sql, is_pg_value);
             }
         }
 
@@ -142,7 +148,6 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                 .unwrap_or(SQLITE_ERROR);
         }
         clear_prepared_stmt(p_stmt);
-        remember_finalized_stmt(p_stmt, final_sql, is_pg_value);
         rc
     }
 }
