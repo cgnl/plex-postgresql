@@ -275,6 +275,32 @@ ensure_plex_temp_dir() {
 # Locale setup removed — Plex's bundled musl+boost::locale handles locale internally.
 # Setting LANG/LC_ALL/CHARSET can interfere with exception handling on aarch64.
 
+verify_config_writable() {
+    local test_dir="/config"
+    local plex_dir="/config/Library/Application Support/Plex Media Server"
+    if [ -d "$plex_dir" ]; then
+        test_dir="$plex_dir"
+    fi
+    local test_file="$test_dir/write_test_$$"
+    if ! touch "$test_file" 2>/dev/null; then
+        echo ""
+        echo "====================================================================="
+        echo "  WARNING: The configuration directory is NOT writable!"
+        echo "====================================================================="
+        echo "  Plex will likely crash with 'attempt to write a readonly database'."
+        echo "  "
+        echo "  Please verify:"
+        echo "  1. The host path mounted to /config has the correct permissions."
+        echo "  2. Run this command on your host to fix permissions:"
+        echo "     sudo chown -R 1000:1000 /your/host/config/path"
+        echo "  3. Ensure the volume is not mounted as read-only (:ro) in compose."
+        echo "====================================================================="
+        echo ""
+    else
+        rm -f "$test_file"
+    fi
+}
+
 # Verify shim is configured in the Plex run script
 verify_plex_shim() {
     local shim_path="$SHIM_DIR/db_interpose_pg.so"
@@ -319,6 +345,7 @@ verify_media_mount() {
 # === Main ===
 
 if [ -n "$PLEX_PG_HOST" ]; then
+    verify_config_writable
     wait_for_postgres
     init_schema
 
