@@ -1,4 +1,4 @@
 {
-  "linuxserver/plex:latest": "sha256:d8b3417b9173bab8bb79b167119b6b69a85558f2127e7fa810a045654e3dbe7f",
+  "linuxserver/plex:latest": "sha256:d5ee6068a20ae57f95060038eaef292cdfd4285efb213ea4daaccdc184e45d1b",
   "plexinc/pms-docker:latest": "sha256:5bc1d13f48da6366f46aaf2a3ce1a6292897eadc1f8efcbbd7321d30e94f2ed4"
 }
