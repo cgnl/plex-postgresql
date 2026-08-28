@@ -75,15 +75,15 @@ check_and_migrate() {
     # Check if PostgreSQL already has data (check multiple tables, not just metadata_items)
     local pg_count=$(psql -t -c "SELECT COUNT(*) FROM $PG_SCHEMA.metadata_items;" 2>/dev/null | tr -d ' ' || echo "0")
     local pg_sections=$(psql -t -c "SELECT COUNT(*) FROM $PG_SCHEMA.library_sections;" 2>/dev/null | tr -d ' ' || echo "0")
-    local pg_accounts=$(psql -t -c "SELECT COUNT(*) FROM $PG_SCHEMA.accounts;" 2>/dev/null | tr -d ' ' || echo "0")
+    # Do NOT check accounts – it's always created as bootstrap data.
     local pg_has_data=0
-    if [[ "$pg_count" -gt 0 ]] || [[ "$pg_sections" -gt 0 ]] || [[ "$pg_accounts" -gt 0 ]]; then
+    if [[ "$pg_count" -gt 0 ]] || [[ "$pg_sections" -gt 0 ]]; then
         pg_has_data=1
     fi
 
     if [[ "$pg_has_data" -eq 1 ]]; then
-        echo -e "${YELLOW}PostgreSQL already has data (metadata_items=$pg_count, library_sections=$pg_sections, accounts=$pg_accounts).${NC}"
-
+        echo -e "${YELLOW}PostgreSQL already has data (metadata_items=$pg_count, library_sections=$pg_sections).${NC}"
+        
         if [[ "$MIGRATION_INTERACTIVE" == "1" ]]; then
             echo ""
             echo "Options:"
