@@ -27,12 +27,6 @@ jobs:
             arch: amd64
             platform: linux/amd64
             runner: ubuntu-latest
-          - name: linuxserver
-            dockerfile: Dockerfile
-            image: ghcr.io/${{ github.repository_owner }}/plex-postgresql-debug
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
           # Optionally add plexinc variant if you use it
 
     steps:
@@ -83,13 +77,11 @@ jobs:
           IMAGE="ghcr.io/${{ github.repository_owner }}/plex-postgresql-debug"
           SHA="${{ github.sha }}"
           docker manifest create "${IMAGE}:latest" \
-            "${IMAGE}:${SHA}-amd64" \
-            "${IMAGE}:${SHA}-arm64"
+            "${IMAGE}:${SHA}-amd64"
           docker manifest push "${IMAGE}:latest"
           # Also tag with sanitizer type if needed
           if [ -n "${{ inputs.sanitizer }}" ]; then
             docker manifest create "${IMAGE}:${{ inputs.sanitizer }}" \
-              "${IMAGE}:${SHA}-amd64" \
-              "${IMAGE}:${SHA}-arm64"
+              "${IMAGE}:${SHA}-amd64"
             docker manifest push "${IMAGE}:${{ inputs.sanitizer }}"
           fi
