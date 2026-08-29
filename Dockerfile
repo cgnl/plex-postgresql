@@ -15,6 +15,14 @@ RUN apk add --no-cache \
     curl \
     perl
 
+# Conditionally install sanitizer libraries for GCC based on build arg
+ARG PLEX_PG_SANITIZE
+RUN if [ "$PLEX_PG_SANITIZE" = "address" ]; then \
+        apk add --no-cache libasan; \
+    elif [ "$PLEX_PG_SANITIZE" = "thread" ]; then \
+        apk add --no-cache libtsan; \
+    fi
+
 # Verify musl version matches Plex (1.2.2)
 RUN /lib/ld-musl-*.so.1 --version 2>&1 | head -2
 
@@ -52,11 +60,15 @@ FROM linuxserver/plex:latest
 
 # Install PostgreSQL client for health checks, sqlite3 for schema fixes,
 # python3 for data migration, gdb for debugging
+# Install runtime tools and conditional sanitizer runtime libraries
+ARG PLEX_PG_SANITIZE
 RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-client \
     sqlite3 \
     python3 \
     gdb \
+    $(if [ "$PLEX_PG_SANITIZE" = "address" ]; then echo "libasan6"; fi) \
+    $(if [ "$PLEX_PG_SANITIZE" = "thread" ]; then echo "libtsan0"; fi) \
     && rm -rf /var/lib/apt/lists/*
 
 # NOTE: Do NOT set LANG/LC_ALL/CHARSET here — Plex's bundled musl+boost::locale
