@@ -10,8 +10,6 @@ ENV PLEX_PG_SANITIZE=${PLEX_PG_SANITIZE}
 # Install build dependencies – includes sanitizer runtime libraries
 RUN apk add --no-cache \
     build-base \
-    libasan \
-    libtsan \
     sqlite-dev \
     linux-headers \
     curl \
