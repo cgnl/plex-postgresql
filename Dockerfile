@@ -7,22 +7,20 @@ FROM alpine:3.15 AS builder
 ARG PLEX_PG_SANITIZE
 ENV PLEX_PG_SANITIZE=${PLEX_PG_SANITIZE}
 
-# Install build dependencies
+# Install build dependencies – includes sanitizer runtime libraries
 RUN apk add --no-cache \
     build-base \
-    gcc-sanitizers \
+    libasan \
+    libtsan \
     sqlite-dev \
     linux-headers \
     curl \
     perl
 
-# Conditionally install sanitizer static runtime support in Alpine
-RUN if [ "$PLEX_PG_SANITIZE" = "address" ] || [ "$PLEX_PG_SANITIZE" = "thread" ]; then \
-        apk add --no-cache gcc-sanitizers compiler-rt-static || true; \
-    fi
-
 # Verify musl version matches Plex (1.2.2)
 RUN /lib/ld-musl-*.so.1 --version 2>&1 | head -2
+
+# ... rest of builder stage unchanged ...
 
 WORKDIR /build
 
