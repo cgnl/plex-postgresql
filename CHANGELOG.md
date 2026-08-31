@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.15] - 2026-08-31
+
+### Changed
+- Updated upstream base Docker images (linuxserver/plex:latest / plexinc/pms-docker:latest).
+
 ## [1.3.14] - 2026-08-18
 
 ### Changed
