@@ -156,6 +156,179 @@ fn setup_exception_catcher_if_enabled() {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+unsafe fn patch_uuid_parser() {
+    let mut base_addr: usize = 0;
+
+    unsafe extern "C" fn phdr_callback(
+        info: *mut libc::dl_phdr_info,
+        _size: usize,
+        data: *mut libc::c_void,
+    ) -> libc::c_int {
+        let info = &*info;
+        let name = if info.dlpi_name.is_null() {
+            ""
+        } else {
+            let s = std::ffi::CStr::from_ptr(info.dlpi_name);
+            s.to_str().unwrap_or("")
+        };
+
+        let counter = *(data as *mut usize);
+
+        let _ = libc::fprintf(
+            stderr_ptr(),
+            b"[SHIM_INIT] [UUID_PATCH] Phdr entry[%zu]: name='%s', addr=0x%zx\n\0".as_ptr() as *const c_char,
+            counter,
+            CString::new(name).unwrap_or_default().as_ptr(),
+            info.dlpi_addr as usize,
+        );
+        let _ = libc::fflush(stderr_ptr());
+
+        if counter == 0 {
+            *(data as *mut usize) = info.dlpi_addr as usize;
+            return 1;
+        }
+
+        *(data as *mut usize) = counter + 1;
+        0
+    }
+
+    let mut callback_data: usize = 0;
+    libc::dl_iterate_phdr(Some(phdr_callback), &mut callback_data as *mut usize as *mut libc::c_void);
+    base_addr = callback_data;
+
+    if base_addr == 0 {
+        let _ = libc::fprintf(
+            stderr_ptr(),
+            b"[SHIM_INIT] [UUID_PATCH] WARNING: Failed to find main executable base address\n\0".as_ptr() as *const c_char,
+        );
+        let _ = libc::fflush(stderr_ptr());
+        return;
+    }
+
+    let target_addr = base_addr + 0x104a6cc;
+
+    let _ = libc::fprintf(
+        stderr_ptr(),
+        b"[SHIM_INIT] [UUID_PATCH] Main executable base: 0x%zx, target_addr: 0x%zx\n\0".as_ptr() as *const c_char,
+        base_addr,
+        target_addr,
+    );
+    let _ = libc::fflush(stderr_ptr());
+
+    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+        let maps_c = CString::new(maps).unwrap_or_default();
+        let _ = libc::fprintf(
+            stderr_ptr(),
+            b"[SHIM_INIT] [UUID_PATCH] Mappings:\n%s\n\0".as_ptr() as *const c_char,
+            maps_c.as_ptr(),
+        );
+        let _ = libc::fflush(stderr_ptr());
+    }
+
+    let patch: [u8; 12] = [
+        0x00, 0x00, 0x80, 0xd2,
+        0x01, 0x00, 0x80, 0xd2,
+        0xc0, 0x03, 0x5f, 0xd6,
+    ];
+
+    // Method 1: Try writing via /proc/self/mem (bypasses W^X and page protections)
+    let mut written_via_proc_mem = false;
+    use std::io::{Seek, SeekFrom, Write};
+    if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open("/proc/self/mem") {
+        if file.seek(SeekFrom::Start(target_addr as u64)).is_ok() {
+            if file.write_all(&patch).is_ok() {
+                let _ = file.flush();
+                written_via_proc_mem = true;
+                let _ = libc::fprintf(
+                    stderr_ptr(),
+                    b"[SHIM_INIT] [UUID_PATCH] Wrote patch successfully via /proc/self/mem\n\0".as_ptr() as *const c_char,
+                );
+                let _ = libc::fflush(stderr_ptr());
+            }
+        }
+    }
+
+    // Method 2: Fallback to mprotect if /proc/self/mem failed
+    if !written_via_proc_mem {
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        if page_size == 0 {
+            let _ = libc::fprintf(
+                stderr_ptr(),
+                b"[SHIM_INIT] [UUID_PATCH] WARNING: sysconf page size is 0\n\0".as_ptr() as *const c_char,
+            );
+            let _ = libc::fflush(stderr_ptr());
+            return;
+        }
+
+        let page_start = target_addr & !(page_size - 1);
+        
+        let mut protect_res = libc::mprotect(
+            page_start as *mut libc::c_void,
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+        );
+
+        if protect_res != 0 {
+            protect_res = libc::mprotect(
+                page_start as *mut libc::c_void,
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            );
+        }
+
+        if protect_res != 0 {
+            let err = std::io::Error::last_os_error();
+            let err_msg = err.to_string();
+            let err_c = CString::new(err_msg).unwrap_or_default();
+            let _ = libc::fprintf(
+                stderr_ptr(),
+                b"[SHIM_INIT] [UUID_PATCH] WARNING: mprotect failed: raw_os_error=%d, msg='%s'\n\0".as_ptr() as *const c_char,
+                err.raw_os_error().unwrap_or(0),
+                err_c.as_ptr(),
+            );
+            let _ = libc::fflush(stderr_ptr());
+            return;
+        }
+
+        std::ptr::copy_nonoverlapping(patch.as_ptr(), target_addr as *mut u8, patch.len());
+
+        let restore_res = libc::mprotect(
+            page_start as *mut libc::c_void,
+            page_size,
+            libc::PROT_READ | libc::PROT_EXEC,
+        );
+
+        if restore_res != 0 {
+            let err = std::io::Error::last_os_error();
+            let err_msg = err.to_string();
+            let err_c = CString::new(err_msg).unwrap_or_default();
+            let _ = libc::fprintf(
+                stderr_ptr(),
+                b"[SHIM_INIT] [UUID_PATCH] WARNING: mprotect restore failed: raw_os_error=%d, msg='%s'\n\0".as_ptr() as *const c_char,
+                err.raw_os_error().unwrap_or(0),
+                err_c.as_ptr(),
+            );
+            let _ = libc::fflush(stderr_ptr());
+        }
+    }
+
+    // Flush instruction cache
+    extern "C" {
+        fn __clear_cache(start: *mut libc::c_void, end: *mut libc::c_void);
+    }
+    __clear_cache(target_addr as *mut libc::c_void, (target_addr + patch.len()) as *mut libc::c_void);
+
+    let _ = libc::fprintf(
+        stderr_ptr(),
+        b"[SHIM_INIT] [UUID_PATCH] Successfully patched UUID parser in memory!\n\0".as_ptr() as *const c_char,
+    );
+    let _ = libc::fflush(stderr_ptr());
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn patch_uuid_parser() {}
+
 #[no_mangle]
 /// # Safety
 /// This is an ABI-level interposition hook for C++ exceptions.
@@ -403,6 +576,7 @@ unsafe extern "C" fn shim_init() {
         || {},
         || {
             setup_exception_catcher_if_enabled();
+            unsafe { patch_uuid_parser(); }
             crate::pms_child_env::configure_from_env();
             crate::pms_child_env::scrub_current_process_preload();
             crate::pms_process_compat::configure_from_env();

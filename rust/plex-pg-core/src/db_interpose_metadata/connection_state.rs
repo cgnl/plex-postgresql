@@ -8,12 +8,17 @@ pub(super) fn changes_impl(db: *mut sqlite3) -> c_int {
     };
 
     let pg_conn = crate::pg_client::rust_pg_find_connection(db);
-    let mut result = 0;
-    if !pg_conn.is_null() {
-        let conn = unsafe { &*pg_conn };
-        if conn.is_pg_active != 0 {
-            result = conn.last_changes;
+    if pg_conn.is_null() {
+        if let Some(f) = get_orig_sqlite3_changes() {
+            return unsafe { f(db) };
         }
+        return 0;
+    }
+
+    let mut result = 0;
+    let conn = unsafe { &*pg_conn };
+    if conn.is_pg_active != 0 {
+        result = conn.last_changes;
     }
     result
 }
@@ -25,12 +30,17 @@ pub(super) fn changes64_impl(db: *mut sqlite3) -> i64 {
     };
 
     let pg_conn = crate::pg_client::rust_pg_find_connection(db);
-    let mut result: i64 = 0;
-    if !pg_conn.is_null() {
-        let conn = unsafe { &*pg_conn };
-        if conn.is_pg_active != 0 {
-            result = conn.last_changes as i64;
+    if pg_conn.is_null() {
+        if let Some(f) = get_orig_sqlite3_changes64() {
+            return unsafe { f(db) };
         }
+        return 0;
+    }
+
+    let mut result: i64 = 0;
+    let conn = unsafe { &*pg_conn };
+    if conn.is_pg_active != 0 {
+        result = conn.last_changes as i64;
     }
     result
 }
@@ -47,9 +57,18 @@ pub(super) fn last_insert_rowid_impl(db: *mut sqlite3) -> i64 {
 
     let pg_conn = crate::pg_client::rust_pg_find_connection(db);
     if pg_conn.is_null() {
+        if let Some(f) = get_orig_sqlite3_last_insert_rowid() {
+            let rowid = unsafe { f(db) };
+            log_debug_lazy!(
+                "last_insert_rowid: CALLED db={:p} pg_conn=NULL (no exact match, SQLite returned {})",
+                db,
+                rowid
+            );
+            return rowid;
+        }
         let global_rowid = crate::pg_client::rust_get_global_last_insert_rowid();
         log_debug_lazy!(
-            "last_insert_rowid: CALLED db={:p} pg_conn=NULL (no exact match, global={})",
+            "last_insert_rowid: CALLED db={:p} pg_conn=NULL (no exact match, no SQLite fn, global={})",
             db,
             global_rowid
         );

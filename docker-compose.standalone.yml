@@ -57,7 +57,14 @@ services:
       - PLEX_PG_TRACE_LOADONE=1
       - PLEX_PG_LOG_FILE=/config/Library/Application Support/Plex Media Server/Logs/plex_redirect_pg.log
       # Clear log file on startup to avoid stale errors
-      - PLEX_PG_LOG_TRUNCATE_ON_START=1
+      - PLEX_PG_LOG_TRUNCATE_ON_START=0
+      - PLEX_PG_EXCEPTION_VERBOSE=1
+      - PLEX_PG_EXCEPTION_ASSUME_OBJECT=1
+      - PLEX_PG_ENABLE_EXCEPTION_CATCHER=1
+      - PLEX_PG_EXCEPTION_LOG_META=1
+      - PLEX_PG_EXCEPTION_DUMP_OBJECT=1
+      - PLEX_PG_EXCEPTION_SCAN_STRINGS=1
+      - PLEX_PG_EXCEPTION_SCAN_STRINGS_BYTES=1024
     volumes:
       - plex_config:/config
       - postgres_socket:/var/run/postgresql

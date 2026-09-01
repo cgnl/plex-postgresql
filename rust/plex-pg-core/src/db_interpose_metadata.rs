@@ -7,6 +7,7 @@ use crate::db_interpose_common::{
     get_orig_sqlite3_bind_parameter_name, get_orig_sqlite3_create_collation,
     get_orig_sqlite3_create_collation_v2, get_orig_sqlite3_db_handle, get_orig_sqlite3_errcode,
     get_orig_sqlite3_errmsg, get_orig_sqlite3_expanded_sql, get_orig_sqlite3_extended_errcode,
+    get_orig_sqlite3_changes, get_orig_sqlite3_changes64, get_orig_sqlite3_last_insert_rowid,
     get_orig_sqlite3_free, get_orig_sqlite3_get_table, get_orig_sqlite3_malloc,
     get_orig_sqlite3_sql, get_orig_sqlite3_stmt_busy, get_orig_sqlite3_stmt_readonly,
     get_orig_sqlite3_stmt_status, get_shim_sqlite3_errcode, get_shim_sqlite3_errmsg,

@@ -10,7 +10,9 @@ fn parse_machine_identifier(content: &str) -> Option<String> {
         let start = pos + "MachineIdentifier=\"".len();
         if let Some(end) = content[start..].find("\"") {
             let hex = &content[start..start+end];
-            if hex.len() == 32 {
+            if hex.len() == 36 {
+                return Some(hex.to_string());
+            } else if hex.len() == 32 {
                 return Some(format!(
                     "{}-{}-{}-{}-{}",
                     &hex[0..8],
@@ -114,7 +116,7 @@ pub(super) fn bind_text_impl(
     idx: c_int,
     mut val: *const c_char,
     mut n_bytes: c_int,
-    destructor: *mut c_void,
+    mut destructor: *mut c_void,
 ) -> c_int {
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_TEXT, p_stmt) };
     let mut _intercepted_uuid = String::new();
@@ -145,6 +147,7 @@ pub(super) fn bind_text_impl(
                     log_debug_lazy!("INTERCEPTED empty UUID bind on devices, replacing with {}", _intercepted_uuid);
                     val = _intercepted_uuid.as_ptr() as *const c_char;
                     n_bytes = _intercepted_uuid.len() as c_int;
+                    destructor = -1isize as *mut c_void;
                 }
             }
         }
@@ -306,7 +309,7 @@ pub(super) fn bind_text64_impl(
     idx: c_int,
     mut val: *const c_char,
     mut n_bytes: u64,
-    destructor: *mut c_void,
+    mut destructor: *mut c_void,
     encoding: c_uchar,
 ) -> c_int {
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_TEXT64, p_stmt) };
@@ -338,6 +341,7 @@ pub(super) fn bind_text64_impl(
                     log_debug_lazy!("INTERCEPTED empty UUID bind on devices (64), replacing with {}", _intercepted_uuid);
                     val = _intercepted_uuid.as_ptr() as *const c_char;
                     n_bytes = _intercepted_uuid.len() as u64;
+                    destructor = -1isize as *mut c_void;
                 }
             }
         }
@@ -395,6 +399,13 @@ mod tests {
     #[test]
     fn test_parse_machine_identifier_valid() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?><Preferences MachineIdentifier="53cfd87bf8b24db2af2d6aaa373b2b34" ProcessedMachineIdentifier="53cfd87bf8b24db2af2d6aaa373b2b34" AcceptedEULA="1"/>"#;
+        let uuid = parse_machine_identifier(xml);
+        assert_eq!(uuid, Some("53cfd87b-f8b2-4db2-af2d-6aaa373b2b34".to_string()));
+    }
+
+    #[test]
+    fn test_parse_machine_identifier_valid_36() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?><Preferences MachineIdentifier="53cfd87b-f8b2-4db2-af2d-6aaa373b2b34" ProcessedMachineIdentifier="53cfd87bf8b24db2af2d6aaa373b2b34" AcceptedEULA="1"/>"#;
         let uuid = parse_machine_identifier(xml);
         assert_eq!(uuid, Some("53cfd87b-f8b2-4db2-af2d-6aaa373b2b34".to_string()));
     }

@@ -218,21 +218,24 @@ pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
         let _guard = unsafe { PgStmt::lock_mutex(dbg_stmt) };
 
         if !pg_stmt.cached_result.is_null() {
-            match unsafe { load_cached_text_state(pg_stmt, idx) } {
-                Some(state) => unsafe { write_cached_text_output(pg_stmt, idx, &state) },
-                // SQL NULL: return empty string instead of NULL to prevent
-                // Plex's std::string(nullptr) → basic_string crash.
-                // Real SQLite returns NULL here, but Plex doesn't always check.
-                None => empty_text_buffer(),
+            let cached = unsafe { &*pg_stmt.cached_result };
+            let row = pg_stmt.current_row;
+            if idx < 0 || idx >= cached.num_cols || row < 0 || row >= cached.num_rows {
+                ptr::null()
+            } else {
+                match unsafe { load_cached_text_state(pg_stmt, idx) } {
+                    Some(state) => unsafe { write_cached_text_output(pg_stmt, idx, &state) },
+                    None => empty_text_buffer(),
+                }
             }
         } else if pg_stmt.result.is_null() {
-            empty_text_buffer()
+            ptr::null()
         } else if idx < 0 || idx >= pg_stmt.num_cols {
-            empty_text_buffer()
+            ptr::null()
         } else {
             let row = pg_stmt.current_row;
             if row < 0 || row >= pg_stmt.num_rows {
-                empty_text_buffer()
+                ptr::null()
             } else {
                 match unsafe { load_live_text_state(pg_stmt, idx) } {
                     Some(state) => unsafe { write_live_text_output(pg_stmt, idx, &state) },

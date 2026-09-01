@@ -251,6 +251,125 @@ init_sqlite_schema() {
     init_single_sqlite_db "$db_dir/com.plexapp.plugins.library.blobs.db" "$schema_file"
 }
 
+generate_uuid() {
+    local uuid
+    if [ -f /proc/sys/kernel/random/uuid ]; then
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+    elif command -v uuidgen >/dev/null 2>&1; then
+        uuid=$(uuidgen)
+    elif command -v python3 >/dev/null 2>&1; then
+        uuid=$(python3 -c 'import uuid; print(uuid.uuid4())')
+    elif command -v python >/dev/null 2>&1; then
+        uuid=$(python -c 'import uuid; print(uuid.uuid4())')
+    else
+        # Fallback pseudo-UUID using random hex digits
+        local hex="0123456789abcdef"
+        uuid=""
+        for i in {1..32}; do
+            uuid+="${hex:$((RANDOM % 16)):1}"
+        done
+        uuid="${uuid:0:8}-${uuid:8:4}-${uuid:12:4}-${uuid:16:4}-${uuid:20:12}"
+    fi
+    echo "$uuid" | tr '[:upper:]' '[:lower:]'
+}
+
+sha1_hex() {
+    local str="$1"
+    if command -v sha1sum >/dev/null 2>&1; then
+        echo -n "$str" | sha1sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        echo -n "$str" | shasum | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        echo -n "$str" | openssl dgst -sha1 | awk '{print $NF}'
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import hashlib; print(hashlib.sha1(b'$str').hexdigest())"
+    elif command -v python >/dev/null 2>&1; then
+        python -c "import hashlib; print(hashlib.sha1(b'$str').hexdigest())"
+    else
+        # Fallback: if absolutely nothing is available (unlikely), just use a 40-char dummy hex string
+        # derived from the uuid.
+        local clean_str
+        clean_str=$(echo -n "$str" | tr -d '-')
+        echo "${clean_str}00000008"
+    fi
+}
+
+update_preferences_uuid() {
+    local plex_dir="/config/Library/Application Support/Plex Media Server"
+    local pref_file="$plex_dir/Preferences.xml"
+    if [ -f "$pref_file" ]; then
+        local machine_id anonymous_id processed_id
+        machine_id=$(sed -n 's/.*[[:space:]]MachineIdentifier="\([^"]*\)".*/\1/p' "$pref_file" || true)
+        anonymous_id=$(sed -n 's/.*[[:space:]]AnonymousMachineIdentifier="\([^"]*\)".*/\1/p' "$pref_file" || true)
+        processed_id=$(sed -n 's/.*[[:space:]]ProcessedMachineIdentifier="\([^"]*\)".*/\1/p' "$pref_file" || true)
+
+        local modified=0
+
+        # Fix/Generate MachineIdentifier
+        if [ -z "$machine_id" ]; then
+            machine_id=$(generate_uuid)
+            echo "Generating missing MachineIdentifier: $machine_id"
+            sed -i "s/<Preferences /<Preferences MachineIdentifier=\"$machine_id\" /g" "$pref_file"
+            modified=1
+        elif [ ${#machine_id} -eq 32 ]; then
+            local new_machine_id="${machine_id:0:8}-${machine_id:8:4}-${machine_id:12:4}-${machine_id:16:4}-${machine_id:20:12}"
+            echo "Formatting 32-char MachineIdentifier to 36-char: $new_machine_id"
+            sed -i "s/MachineIdentifier=\"$machine_id\"/MachineIdentifier=\"$new_machine_id\"/g" "$pref_file"
+            machine_id="$new_machine_id"
+            modified=1
+        fi
+
+        # Fix/Generate AnonymousMachineIdentifier
+        if [ -z "$anonymous_id" ]; then
+            anonymous_id=$(generate_uuid)
+            echo "Generating missing AnonymousMachineIdentifier: $anonymous_id"
+            sed -i "s/<Preferences /<Preferences AnonymousMachineIdentifier=\"$anonymous_id\" /g" "$pref_file"
+            modified=1
+        elif [ ${#anonymous_id} -eq 32 ]; then
+            local new_anonymous_id="${anonymous_id:0:8}-${anonymous_id:8:4}-${anonymous_id:12:4}-${anonymous_id:16:4}-${anonymous_id:20:12}"
+            echo "Formatting 32-char AnonymousMachineIdentifier to 36-char: $new_anonymous_id"
+            sed -i "s/AnonymousMachineIdentifier=\"$anonymous_id\"/AnonymousMachineIdentifier=\"$new_anonymous_id\"/g" "$pref_file"
+            anonymous_id="$new_anonymous_id"
+            modified=1
+        fi
+
+        # Fix/Generate ProcessedMachineIdentifier
+        if [ -z "$processed_id" ]; then
+            processed_id=$(sha1_hex "$machine_id")
+            echo "Generating missing ProcessedMachineIdentifier: $processed_id"
+            sed -i "s/<Preferences /<Preferences ProcessedMachineIdentifier=\"$processed_id\" /g" "$pref_file"
+            modified=1
+        elif [ ${#processed_id} -ne 40 ]; then
+            local new_processed_id
+            new_processed_id=$(sha1_hex "$machine_id")
+            echo "Updating invalid ProcessedMachineIdentifier to SHA-1: $new_processed_id"
+            sed -i "s/ProcessedMachineIdentifier=\"$processed_id\"/ProcessedMachineIdentifier=\"$new_processed_id\"/g" "$pref_file"
+            processed_id="$new_processed_id"
+            modified=1
+        fi
+
+        if [ "$modified" -eq 1 ]; then
+            echo "Preferences.xml was updated with valid UUIDs."
+        fi
+    fi
+}
+
+update_device_uuid() {
+    local plex_dir="/config/Library/Application Support/Plex Media Server"
+    if [ -f "$plex_dir/Preferences.xml" ]; then
+        local machine_id
+        machine_id=$(sed -n 's/.*[[:space:]]MachineIdentifier="\([^"]*\)".*/\1/p' "$plex_dir/Preferences.xml" || true)
+        if [ -n "$machine_id" ]; then
+            local formatted_uuid="$machine_id"
+            if [ ${#machine_id} -eq 32 ]; then
+                formatted_uuid="${machine_id:0:8}-${machine_id:8:4}-${machine_id:12:4}-${machine_id:16:4}-${machine_id:20:12}"
+            fi
+            echo "Updating PostgreSQL devices table with MachineIdentifier: $formatted_uuid"
+            psql -c "UPDATE ${PLEX_PG_SCHEMA:-plex}.devices SET identifier = '$formatted_uuid' WHERE id = 1;" >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
 # Pre-create required Plex directories
 # Prevents boost::filesystem errors when Plex scans for plugins and metadata
 init_plex_directories() {
@@ -267,11 +386,13 @@ init_plex_directories() {
 
     # Ensure Preferences.xml exists (Plex crashes with boost::filesystem error without it)
     if [[ ! -f "$plex_dir/Preferences.xml" ]]; then
-        local machine_id
-        machine_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' || echo "plex-pg-$(date +%s)")"
+        local machine_id anonymous_id processed_id
+        machine_id=$(generate_uuid)
+        anonymous_id=$(generate_uuid)
+        processed_id=$(sha1_hex "$machine_id")
         cat > "$plex_dir/Preferences.xml" << PREFEOF
 <?xml version="1.0" encoding="utf-8"?>
-<Preferences OldestPreviousVersion="1.43.0.10492-121068a07" MachineIdentifier="${machine_id}" ProcessedMachineIdentifier="${machine_id}" AnonymousMachineIdentifier="${machine_id}" AcceptedEULA="1" PublishServerOnPlexOnline="0"/>
+<Preferences OldestPreviousVersion="1.43.0.10492-121068a07" MachineIdentifier="${machine_id}" ProcessedMachineIdentifier="${processed_id}" AnonymousMachineIdentifier="${anonymous_id}" AcceptedEULA="1" PublishServerOnPlexOnline="0"/>
 PREFEOF
         echo "Created initial Preferences.xml (MachineIdentifier=${machine_id})"
     fi
@@ -476,6 +597,8 @@ if [ -n "$PLEX_PG_HOST" ]; then
 
     ensure_plex_temp_dir
     init_plex_directories
+    update_preferences_uuid
+    update_device_uuid
     maybe_clear_flags_dat_on_uuid_error
     init_sqlite_schema
     verify_plex_shim

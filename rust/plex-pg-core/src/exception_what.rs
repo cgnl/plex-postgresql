@@ -52,7 +52,9 @@ mod impl_unix {
     const ABI_LIBS: [&[u8]; 1] = [b"libc++abi.dylib\0"];
 
     #[cfg(target_os = "linux")]
-    const ABI_LIBS: [&[u8]; 6] = [
+    const ABI_LIBS: [&[u8]; 8] = [
+        b"/usr/lib/plexmediaserver/lib/libc++.so.2\0",
+        b"/usr/lib/plexmediaserver/lib/libc++abi.so.1\0",
         b"libc++abi.so.1\0",
         b"libc++abi.so\0",
         b"libc++.so.2\0",
