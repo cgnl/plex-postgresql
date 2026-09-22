@@ -6,6 +6,9 @@ build = "build.rs"
 
 [features]
 interpose = []
+# Interposing __cxa_throw breaks every catch in Plex; see runtime_linux.rs.
+# Kept for diagnosis only.
+exception-hook = []
 
 [lib]
 name = "plex_pg_core"

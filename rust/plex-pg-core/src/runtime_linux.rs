@@ -156,7 +156,24 @@ fn setup_exception_catcher_if_enabled() {
     }
 }
 
-#[no_mangle]
+/// Interposing `__cxa_throw` puts a frame belonging to this library between
+/// every `throw` in Plex and the `catch` that was meant to handle it, and
+/// Plex does not survive that: an unauthenticated `GET /media/providers`
+/// returns a clean 401 without the shim and terminates with the same
+/// exception uncaught with it.
+///
+///     libc++abi: terminating with uncaught exception of type
+///     UnauthorizedException: HTTP status code 401
+///
+/// Plex throws and catches routinely, so the first throw of the process is
+/// fatal whatever it was -- which is why this has surfaced as three unrelated
+/// looking crashes (`std::out_of_range`, `std::domain_error: Invalid uuid
+/// length`, and the one above), each of them an exception Plex handles
+/// normally.
+///
+/// Built behind a feature so the hook and the backtrace that depends on it can
+/// be turned back on for diagnosis, off by default.
+#[cfg_attr(feature = "exception-hook", no_mangle)]
 /// # Safety
 /// This is an ABI-level interposition hook for C++ exceptions.
 /// Callers must follow the platform C++ ABI for `__cxa_throw`.
