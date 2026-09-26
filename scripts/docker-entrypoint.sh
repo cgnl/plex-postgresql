@@ -148,17 +148,24 @@ sync_schema_migrations_to_sqlite() {
     local db_name
     db_name=$(basename "$db_file")
 
-    local pg_count=$(psql -t -c "SELECT COUNT(*) FROM ${PG_SCHEMA}.schema_migrations;" 2>/dev/null | tr -d ' ')
-    local sqlite_count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM schema_migrations;" 2>/dev/null || echo "0")
+    local pg_count sqlite_count new_count insert_sql
+    pg_count=$(psql -v ON_ERROR_STOP=1 -tA -c "SELECT COUNT(*) FROM ${PG_SCHEMA}.schema_migrations;") || return 1
+    sqlite_count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM schema_migrations;") || return 1
 
     if [ "$pg_count" -gt "$sqlite_count" ] 2>/dev/null; then
         echo "Syncing schema_migrations to SQLite ($sqlite_count → $pg_count rows)..."
-        # Export from PG and import into SQLite
-        psql -t -A -c "SELECT version FROM ${PG_SCHEMA}.schema_migrations ORDER BY version;" 2>/dev/null | while IFS= read -r version; do
-            [ -z "$version" ] && continue
-            sqlite3 "$db_file" "INSERT OR IGNORE INTO schema_migrations (version) VALUES ('$version');" 2>/dev/null || true
-        done
-        local new_count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM schema_migrations;" 2>/dev/null || echo "0")
+        # A single transaction avoids starting SQLite once per migration marker.
+        # quote_literal keeps imported version strings safe as SQLite SQL literals.
+        insert_sql=$(psql -v ON_ERROR_STOP=1 -tA -c "
+            SELECT 'INSERT OR IGNORE INTO schema_migrations (version) VALUES ('
+                   || quote_literal(version) || ');'
+            FROM ${PG_SCHEMA}.schema_migrations ORDER BY version;") || return 1
+        printf 'BEGIN IMMEDIATE;\n%s\nCOMMIT;\n' "$insert_sql" | sqlite3 -batch -bail "$db_file" || return 1
+        new_count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM schema_migrations;") || return 1
+        if [ "$new_count" -ne "$pg_count" ]; then
+            echo "ERROR: SQLite schema_migrations count mismatch ($new_count != $pg_count)" >&2
+            return 1
+        fi
         echo "SQLite schema_migrations now has $new_count entries"
     else
         echo "SQLite schema_migrations already in sync ($sqlite_count rows)"
