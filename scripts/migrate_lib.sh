@@ -294,12 +294,30 @@ migrate_sqlite_to_pg() {
 
     echo ""
     echo "Updating sequences..."
-    psql -q -c "
-        SELECT setval(pg_get_serial_sequence('$schema.metadata_items', 'id'), COALESCE((SELECT MAX(id) FROM $schema.metadata_items), 1));
-        SELECT setval(pg_get_serial_sequence('$schema.media_items', 'id'), COALESCE((SELECT MAX(id) FROM $schema.media_items), 1));
-        SELECT setval(pg_get_serial_sequence('$schema.media_parts', 'id'), COALESCE((SELECT MAX(id) FROM $schema.media_parts), 1));
-        SELECT setval(pg_get_serial_sequence('$schema.tags', 'id'), COALESCE((SELECT MAX(id) FROM $schema.tags), 1));
-    " >/dev/null 2>&1 || true
+    # Plex writes to many imported tables during startup, including devices.
+    # Align every owned serial sequence, not just the four common media tables.
+    # An empty table must leave its next sequence value at 1.
+    psql -v ON_ERROR_STOP=1 -q -c "
+        DO \$do\$
+        DECLARE
+            rec record;
+            max_id bigint;
+        BEGIN
+            FOR rec IN
+                SELECT table_schema, table_name, column_name,
+                       pg_get_serial_sequence(format('%I.%I', table_schema, table_name), column_name) AS sequence_name
+                FROM information_schema.columns
+                WHERE table_schema = '$schema' AND column_default LIKE 'nextval%'
+            LOOP
+                IF rec.sequence_name IS NULL THEN
+                    RAISE EXCEPTION 'No owned sequence for %.%', rec.table_name, rec.column_name;
+                END IF;
+                EXECUTE format('SELECT max(%I) FROM %I.%I', rec.column_name, rec.table_schema, rec.table_name) INTO max_id;
+                PERFORM setval(rec.sequence_name, coalesce(max_id, 1), max_id IS NOT NULL);
+            END LOOP;
+        END
+        \$do\$;
+    " >/dev/null || return 1
 
     echo ""
     echo "Migration summary:"
