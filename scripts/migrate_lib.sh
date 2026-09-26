@@ -199,7 +199,8 @@ migrate_sqlite_to_pg() {
 
             if [[ -z "$pg_cols" ]]; then
                 echo -e "${YELLOW}SKIP (no PG table)${NC}"
-                ((skipped++))
+                # Prefix increment succeeds when this script runs under set -e.
+                ((++skipped))
                 continue
             fi
 
@@ -276,10 +277,10 @@ migrate_sqlite_to_pg() {
             if python3 "$migrate_py" \
                 "$SQLITE_DB" "$table" "$sqlite_select" "$pg_cols_list" "$schema" 2>>"$log_dir/migration_errors.log"; then
                 echo -e "${GREEN}OK${NC}"
-                ((migrated++))
+                ((++migrated))
             else
                 echo -e "${RED}FAIL${NC}"
-                ((failed++))
+                ((++failed))
             fi
 
             # Restore check constraints and triggers
