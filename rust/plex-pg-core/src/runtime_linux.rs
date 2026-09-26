@@ -526,6 +526,43 @@ static INIT: extern "C" fn() = shim_init_wrapper;
 static FINI: extern "C" fn() = shim_cleanup_wrapper;
 
 // ────────────────────────────────────────────────────────────────────────────
+// The bundled x86-64 Boost codecvt also rejects the "ASCII" name. Preserve
+// the C++ hidden return pointer in rdi and tail-call the UTF-8 variant with
+// its two explicit arguments (locale in rsi, facet moved from ecx to edx).
+#[cfg(all(feature = "interpose", target_arch = "x86_64"))]
+std::arch::global_asm!(
+    ".global _ZN5boost6locale4util21create_simple_codecvtERKNSt3__26localeERKNS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS0_12char_facet_tE",
+    ".type _ZN5boost6locale4util21create_simple_codecvtERKNSt3__26localeERKNS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS0_12char_facet_tE, @function",
+    "_ZN5boost6locale4util21create_simple_codecvtERKNSt3__26localeERKNS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS0_12char_facet_tE:",
+    "cmp byte ptr [rdx], 65",
+    "jne .Lshim_x86_csc_orig",
+    "cmp byte ptr [rdx + 1], 83",
+    "jne .Lshim_x86_csc_orig",
+    "cmp byte ptr [rdx + 2], 67",
+    "jne .Lshim_x86_csc_orig",
+    "cmp byte ptr [rdx + 3], 73",
+    "jne .Lshim_x86_csc_orig",
+    "cmp byte ptr [rdx + 4], 73",
+    "jne .Lshim_x86_csc_orig",
+    "cmp byte ptr [rdx + 5], 0",
+    "jne .Lshim_x86_csc_orig",
+    "mov r11, qword ptr [rip + SHIM_CREATE_UTF8_CODECVT_PTR@GOTPCREL]",
+    "mov r11, qword ptr [r11]",
+    "test r11, r11",
+    "je .Lshim_x86_csc_orig",
+    "mov edx, ecx",
+    "jmp r11",
+    ".Lshim_x86_csc_orig:",
+    "mov r11, qword ptr [rip + SHIM_CREATE_SIMPLE_CODECVT_PTR@GOTPCREL]",
+    "mov r11, qword ptr [r11]",
+    "test r11, r11",
+    "je .Lshim_x86_csc_abort",
+    "jmp r11",
+    ".Lshim_x86_csc_abort:",
+    "jmp abort@PLT",
+);
+
+// ────────────────────────────────────────────────────────────────────────────
 // ────────────────────────────────────────────────────────────────────────────
 // AArch64 assembly hook for boost::locale::util::create_simple_codecvt.
 //
