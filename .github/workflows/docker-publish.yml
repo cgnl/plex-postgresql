@@ -251,7 +251,7 @@ jobs:
               raise SystemExit('Source evidence mismatch')
           if (root / 'postgres-ref.txt').read_text().strip() != os.environ['EXPECTED_POSTGRES_IMAGE']:
               raise SystemExit('PostgreSQL evidence mismatch')
-          expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'workload-smoke-complete-certification-incomplete', 'exit_code': 1, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'promotion_allowed': False}
+          expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'workload-smoke-complete-certification-incomplete', 'exit_code': 1, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'real_movie_and_tv_playback_verified': True, 'real_media_full_decode_verified': True, 'promotion_allowed': False}
           if any(result.get(key) != value for key, value in expected.items()):
               raise SystemExit('Prior native smoke failed or is incomplete')
           with open(os.environ['GITHUB_ENV'], 'a') as output:

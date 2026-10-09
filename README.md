@@ -6,7 +6,26 @@
 
 A small shim library that catches Plex SQLite calls and sends them to PostgreSQL. You do not need to change Plex source code.
 
-## 🎉 Latest Release: v1.2.0
+## Current stability candidate
+
+`test/stability-native-e2e-20261009` is a prerelease test branch. **Production
+promotion is blocked:** the final candidate's full native matrix and 5h50 soak
+have not completed. Earlier passing probes used intermediate artifacts and do
+not certify this candidate. The published release below is release history,
+not evidence that the current branch has passed these gates.
+
+The acceptance matrix is **LinuxServer and PlexInc × native amd64 and arm64 ×
+PostgreSQL 15 and 18** (eight combinations), with 100 restart cycles per lane
+and a separate 5-hour-50-minute soak using the same immutable image digest.
+See [release gates and known gaps](docs/release-readiness.md) and
+[recorded validation evidence](docs/stability-validation-2026-10-09.md).
+
+## Latest published release: [v1.3.20](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.20)
+
+Published on 5 October 2026. The stability fixes and real-media acceptance tests
+on the candidate branch are not included in this release.
+
+### Runtime architecture introduced in v1.2.0
 
 **100% Rust shim runtime** — the entire interpose layer is now pure Rust. All C runtime code has been eliminated. The shim compiles to a single static library linked into the dylib/so.
 
@@ -20,7 +39,8 @@ A small shim library that catches Plex SQLite calls and sends them to PostgreSQL
 
 Linux and macOS release zips are built by GitHub Actions on tag push via `.github/workflows/release-linux-artifacts.yml` and `.github/workflows/release-macos-artifacts.yml`.
 Pull requests and `main`/`develop` pushes run `.github/workflows/ci.yml` (script validation + Linux amd64 build check + full test suite + FFI header verification).
-Docker images are published to GHCR on release tags via `.github/workflows/docker-publish.yml`:
+The current `.github/workflows/docker-publish.yml` probes uniquely tagged GHCR
+candidates and blocks production promotion. The image repositories are:
 - `ghcr.io/cgnl/plex-postgresql-linuxserver`
 - `ghcr.io/cgnl/plex-postgresql-plexinc`
 
@@ -364,10 +384,23 @@ Translator scope, coverage, and known gaps are tracked in `docs/translator/READM
 
 ## Testing
 
+The native container runner creates a real movie library with **Big Buck Bunny
+(640x360 H.264 with audio, CC BY 3.0)** and a TV library with **The Beverly
+Hillbillies S01E01 and S01E02** (the source uploaders mark these copies Public
+Domain). It checks library identities, server file delivery, byte-range seeking,
+and full video/audio decoding during candidate smoke. The 5h50 soak decodes
+20-second HTTP samples on each iteration. Native testing is in progress; the
+complete GitHub matrix has not passed. These checks do not yet certify browser
+playback or server-side transcoding.
+
+Fixture sources, attribution, evidence and runner instructions are in
+[runtime E2E](docs/runtime-e2e.md). The proposed wiki page is
+[Stability Testing](docs/wiki-stability-testing.md).
+
 ```bash
-make unit-test       # All C unit tests (25 suites, ~550 tests)
-make ci-test         # CI-safe subset (no LD_PRELOAD)
-cargo test           # Rust tests (525 tests) — in rust/plex-pg-core/
+make unit-test       # Focused Rust regression suites
+make ci-test         # CI-safe regression subset
+cargo test           # Full Rust suite — in rust/plex-pg-core/
 make ffi-header      # Regenerate include/plex_pg_core_ffi.h from rust/plex-pg-abi/
 make ffi-header-check  # Verify generated header is up to date
 make benchmark       # Shim micro-benchmarks

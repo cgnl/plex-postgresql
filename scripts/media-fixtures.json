@@ -1,0 +1,26 @@
+[
+  {
+    "name": "BigBuckBunny_640x360.m4v",
+    "url": "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_640x360.m4v.zip",
+    "source_page": "https://peach.blender.org/",
+    "license": "CC BY 3.0",
+    "attribution": "(c) copyright 2008, Blender Foundation / www.bigbuckbunny.org; full credits retained",
+    "archive_sha256": "7118242b6728d40c871479c5b3c0f0fb27d748089df15d7f1b469f297c74a2d6",
+    "zip_member": "BigBuckBunny_640x360.m4v",
+    "sha256": "738e2f999860553d056dd79c952f58f63cbb73892a57c72342ce9e5330d9d2d7"
+  },
+  {
+    "name": "beverly-s01e01.mp4",
+    "url": "https://archive.org/download/Beverly_Hillbillies_Ep01_The_Clampetts_Strike_Oil/BH01_The_Clampetts_Strike_Oil.mp4",
+    "source_page": "https://archive.org/details/Beverly_Hillbillies_Ep01_The_Clampetts_Strike_Oil",
+    "license": "Public Domain as marked by Internet Archive uploader",
+    "sha256": "dfbe4cf37afad226fe1248c32388d37591434fa5e3907acbfaf382c656b7d229"
+  },
+  {
+    "name": "beverly-s01e02.mp4",
+    "url": "https://archive.org/download/Beverly_Hillbillies_Ep02_Getting_Settled/BH02_Getting_Settled.mp4",
+    "source_page": "https://archive.org/details/Beverly_Hillbillies_Ep02_Getting_Settled",
+    "license": "Public Domain as marked by Internet Archive uploader",
+    "sha256": "c7796c3c8a0e9f4ec4d8924ab2d62183660baaf0c9603e87fe1e95eb828eef7d"
+  }
+]

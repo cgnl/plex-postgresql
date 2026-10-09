@@ -20,6 +20,12 @@ soak_seconds_completed=0
 soak_iterations=0
 live_recovery_verified=0
 decoded_fixture_verified=0
+real_media_verified=0
+real_media_full_decode_verified=0
+real_media_sample_seconds=0
+if ((soak_seconds > 60)); then real_media_sample_seconds=20; fi
+script_dir=$(cd "$(dirname "$0")" && pwd)
+media_cache=${PLEX_E2E_MEDIA_CACHE_DIR:-${TMPDIR:-/tmp}/plex-e2e-media-cache}
 mkdir -p "$EVIDENCE_DIR"
 for tool in docker python3; do command -v "$tool" >/dev/null; done
 [[ "$CANDIDATE_IMAGE" =~ (^|@)sha256:[0-9a-f]{64}$ ]] || { echo "Candidate must be immutable" >&2; exit 1; }
@@ -28,6 +34,7 @@ for tool in docker python3; do command -v "$tool" >/dev/null; done
 [[ "$VARIANT" == linuxserver || "$VARIANT" == plexinc ]]
 fixture="plex-canary-$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
 network="$fixture"
+download_network="$fixture-downloads"
 postgres="$fixture-postgres"
 plex="$fixture-plex"
 negative="$fixture-negative"
@@ -57,11 +64,14 @@ cleanup() {
     if [[ $(docker network inspect --format '{{index .Labels "plex-pg-canary"}}' "$network" 2>/dev/null) == "$fixture" ]]; then
         docker network rm "$network" >/dev/null || true
     fi
-    python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" <<'PY'
+    if [[ $(docker network inspect --format '{{index .Labels "plex-pg-canary"}}' "$download_network" 2>/dev/null) == "$fixture" ]]; then
+        docker network rm "$download_network" >/dev/null || true
+    fi
+    python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" "$real_media_verified" "$real_media_full_decode_verified" <<'PY'
 import json
 import sys
 from pathlib import Path
-path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded = sys.argv[1:]
+path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded, real_media, full_decode = sys.argv[1:]
 Path(path).write_text(json.dumps({
     "phase": phase, "exit_code": int(status), "candidate": image,
     "plex_version": version, "variant": variant, "arch": arch,
@@ -70,6 +80,8 @@ Path(path).write_text(json.dumps({
     "soak_iterations": int(iterations),
     "live_postgres_recovery_verified": live_recovery == '1',
     "decoded_fixture_verified": decoded == '1',
+    "real_movie_and_tv_playback_verified": real_media == '1',
+    "real_media_full_decode_verified": full_decode == '1',
     "promotion_allowed": False,
     "missing_gate": "Full native matrix, scan/playback/watch-state/artwork and sustained outage workload",
 }, indent=2) + "\n")
@@ -79,6 +91,9 @@ PY
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+python3 "$script_dir/prepare-media-fixtures.py" "$media_cache"
+cp "$media_cache/media-fixtures.json" "$EVIDENCE_DIR/media-fixtures.json"
 
 if [[ "$CANDIDATE_IMAGE" != sha256:* ]]; then
     docker pull --platform "linux/$EXPECTED_ARCH" "$CANDIDATE_IMAGE"
@@ -204,6 +219,31 @@ print("Actual PMS processes load db_interpose_pg.so:", [p.name for p in processe
 phase="first-start"
 start_plex "$plex" "$config"
 assert_ready "$plex" first-start
+phase="media-bootstrap"
+docker exec "$plex" mkdir -p /config/runtime-fixture-media
+# Plex installs its own H.264/AAC codecs on first analysis. Permit outbound
+# bootstrap on an owned network, then remove it before restarts and soak.
+docker network create --label "plex-pg-canary=$fixture" "$download_network" >/dev/null
+docker network connect "$download_network" "$plex"
+docker cp "$script_dir/bootstrap-plex-codecs.py" "$plex:/tmp/bootstrap-plex-codecs.py"
+docker exec "$plex" python3 /tmp/bootstrap-plex-codecs.py /tmp/codec-bootstrap.json
+docker cp "$plex:/tmp/codec-bootstrap.json" "$EVIDENCE_DIR/codec-bootstrap.json"
+bbb_file='/config/runtime-fixture-media/Big Buck Bunny (2008).m4v'
+tv_root='/config/runtime-tv-media'
+tv_season="$tv_root/The Beverly Hillbillies (1962)/Season 01"
+docker exec "$plex" mkdir -p "$tv_season"
+docker cp "$media_cache/BigBuckBunny_640x360.m4v" "$plex:$bbb_file"
+docker cp "$media_cache/beverly-s01e01.mp4" "$plex:$tv_season/The Beverly Hillbillies - S01E01 - The Clampetts Strike Oil.mp4"
+docker cp "$media_cache/beverly-s01e02.mp4" "$plex:$tv_season/The Beverly Hillbillies - S01E02 - Getting Settled.mp4"
+docker cp "$script_dir/verify-bbb-playback.py" "$plex:/tmp/verify-bbb-playback.py"
+media_file='/config/runtime-fixture-media/Plex Fixture (2000).avi'
+docker exec "$plex" python3 -c 'from pathlib import Path; Path("/tmp/runtime-fixture.rgb").write_bytes(bytes([0, 0, 255]) * 320 * 240 * 20)'
+docker exec "$plex" env -u LD_PRELOAD LD_LIBRARY_PATH=/usr/lib/plexmediaserver/lib \
+    '/usr/lib/plexmediaserver/Plex Transcoder' -hide_banner -loglevel error \
+    -f rawvideo -pixel_format rgb24 -video_size 320x240 -framerate 10 \
+    -i /tmp/runtime-fixture.rgb -c:v rawvideo -pix_fmt bgr24 -threads 1 "$media_file" \
+    > "$EVIDENCE_DIR/fixture-media-generation.log" 2>&1
+docker exec "$plex" test -s "$media_file"
 phase="api-write-routing"
 docker exec "$plex" mkdir -p /config/runtime-fixture-media
 docker exec -i "$plex" python3 - "$fixture" <<'PY' > "$EVIDENCE_DIR/api-created-section.xml"
@@ -272,14 +312,6 @@ phase="native-media-scan"
 section_id=$(docker exec "$postgres" psql -X -U plex -d plex -v ON_ERROR_STOP=1 -Atc \
     "SELECT id FROM plex.library_sections WHERE name='$fixture';")
 [[ "$section_id" =~ ^[1-9][0-9]*$ ]]
-media_file='/config/runtime-fixture-media/Plex Fixture (2000).avi'
-docker exec "$plex" python3 -c 'from pathlib import Path; Path("/tmp/runtime-fixture.rgb").write_bytes(bytes([0, 0, 255]) * 320 * 240 * 20)'
-docker exec "$plex" env -u LD_PRELOAD LD_LIBRARY_PATH=/usr/lib/plexmediaserver/lib \
-    '/usr/lib/plexmediaserver/Plex Transcoder' -hide_banner -loglevel error \
-    -f rawvideo -pixel_format rgb24 -video_size 320x240 -framerate 10 \
-    -i /tmp/runtime-fixture.rgb -c:v rawvideo -pix_fmt bgr24 -threads 1 "$media_file" \
-    > "$EVIDENCE_DIR/fixture-media-generation.log" 2>&1
-docker exec "$plex" test -s "$media_file"
 docker exec "$plex" python3 -c 'import sys, urllib.request; urllib.request.urlopen("http://127.0.0.1:32400/library/sections/" + sys.argv[1] + "/refresh", timeout=10).close()' "$section_id"
 assert_scanned_media() {
     local stage="$1" media_identity
@@ -373,6 +405,61 @@ PY
     decoded_fixture_verified=1
 }
 assert_scanned_media first-start
+phase="real-movie-and-tv-library"
+docker exec -i "$plex" python3 - "$fixture-tv" "$tv_root" <<'PY' > "$EVIDENCE_DIR/tv-created-section.xml"
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+params = urllib.parse.urlencode({"name": sys.argv[1], "type": "show", "agent": "com.plexapp.agents.none",
+    "scanner": "Plex Series Scanner", "language": "xn", "location": sys.argv[2]})
+request = urllib.request.Request("http://127.0.0.1:32400/library/sections?" + params, method="POST")
+for attempt in range(60):
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            print(response.read().decode())
+        break
+    except urllib.error.HTTPError as error:
+        body = error.read().decode(errors="replace")
+        starting_up = error.code == 400 and body.strip() == "the server is still starting up. Please retry later"
+        if error.code != 503 and not starting_up:
+            print(body, file=sys.stderr)
+            raise
+        time.sleep(2)
+else:
+    raise SystemExit("TV library creation never became ready")
+PY
+tv_section_id=$(docker exec "$postgres" psql -X -U plex -d plex -v ON_ERROR_STOP=1 -Atc \
+    "SELECT id FROM plex.library_sections WHERE name='$fixture-tv';")
+[[ "$tv_section_id" =~ ^[1-9][0-9]*$ ]]
+docker exec "$plex" python3 -c 'import sys, urllib.request; [urllib.request.urlopen("http://127.0.0.1:32400/library/sections/" + section + "/refresh?force=1", timeout=10).close() for section in sys.argv[1:]]' "$section_id" "$tv_section_id"
+
+assert_real_media() {
+    local stage="$1" sample="${2:-0}" output="/tmp/real-media-$1" status=0
+    local sample_args=()
+    if ((sample > 0)); then sample_args=(--sample-seconds "$sample"); fi
+    docker exec "$plex" python3 /tmp/verify-bbb-playback.py "$section_id" "$bbb_file" "$output/movie" "${sample_args[@]}" || status=1
+    docker exec "$plex" python3 /tmp/verify-bbb-playback.py "$tv_section_id" "$tv_season/The Beverly Hillbillies - S01E01 - The Clampetts Strike Oil.mp4" "$output/s01e01" --kind episode --season 1 --episode 1 "${sample_args[@]}" || status=1
+    docker exec "$plex" python3 /tmp/verify-bbb-playback.py "$tv_section_id" "$tv_season/The Beverly Hillbillies - S01E02 - Getting Settled.mp4" "$output/s01e02" --kind episode --season 1 --episode 2 "${sample_args[@]}" || status=1
+    mkdir -p "$EVIDENCE_DIR/$stage-real-media"
+    docker cp "$plex:$output/." "$EVIDENCE_DIR/$stage-real-media/" || status=1
+    ((status == 0)) || return 1
+    docker exec "$postgres" psql -X -U plex -d plex -v ON_ERROR_STOP=1 -Atc \
+        "SELECT count(*) FROM plex.metadata_items episode JOIN plex.metadata_items season ON season.id=episode.parent_id JOIN plex.metadata_items show ON show.id=season.parent_id WHERE episode.library_section_id=$tv_section_id AND episode.metadata_type=4 AND season.metadata_type=3 AND season.index=1 AND show.metadata_type=2 AND episode.index IN (1,2);" \
+        > "$EVIDENCE_DIR/$stage-tv-hierarchy.txt"
+    [[ $(cat "$EVIDENCE_DIR/$stage-tv-hierarchy.txt") == 2 ]] || { echo "TV season/episode hierarchy missing or duplicated in PostgreSQL" >&2; return 1; }
+    docker exec "$plex" sqlite3 \
+        'file:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db?mode=ro' \
+        "SELECT count(*) FROM media_parts WHERE file LIKE '/config/runtime-tv-media/%';" \
+        > "$EVIDENCE_DIR/$stage-tv-shadow.txt"
+    [[ $(cat "$EVIDENCE_DIR/$stage-tv-shadow.txt") == 0 ]] || { echo "TV metadata leaked to SQLite" >&2; return 1; }
+    assert_no_crash_reports "$plex"
+}
+assert_real_media first-start "$real_media_sample_seconds"
+real_media_verified=1
+if ((real_media_sample_seconds == 0)); then real_media_full_decode_verified=1; fi
+docker network disconnect "$download_network" "$plex"
 phase="watch-state"
 metadata_id=$(docker exec "$postgres" psql -X -U plex -d plex -v ON_ERROR_STOP=1 -Atc \
     "SELECT metadata.id FROM plex.metadata_items metadata JOIN plex.media_items media ON media.metadata_item_id=metadata.id JOIN plex.media_parts part ON part.media_item_id=media.id WHERE metadata.library_section_id=$section_id AND part.file='$media_file';")
@@ -443,6 +530,7 @@ if ((soak_seconds > 0)); then
             if ! wait "$reader"; then reader_failure=1; fi
         done
         ((reader_failure == 0)) || { echo "Concurrent soak reader failed" >&2; exit 1; }
+        assert_real_media "$stage" 20
         set_watch_state unscrobble
         assert_watch_state "$stage-unwatched" 0
         set_watch_state scrobble
@@ -492,6 +580,7 @@ phase="live-postgres-recovery"
 assert_ready "$plex" live-recovery
 assert_section_routing live-recovery
 assert_scanned_media live-recovery
+assert_real_media live-recovery "$real_media_sample_seconds"
 set_watch_state scrobble
 assert_watch_state live-recovery 1
 [[ $(cat "$EVIDENCE_DIR/live-recovery-shim.txt") == "$live_pms_identity" ]] || { echo "PMS restarted instead of recovering PostgreSQL sessions" >&2; exit 1; }

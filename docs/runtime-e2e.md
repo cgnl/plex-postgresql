@@ -1,5 +1,43 @@
 # Rust shared-shim runtime E2E
 
+## Real movie and TV playback in native runners
+
+`scripts/plex-container-e2e.sh` additionally creates real movie and TV libraries
+on the isolated native Plex candidate. It downloads the checksum-pinned files
+in `scripts/media-fixtures.json` on the host before entering the internal Docker
+network. Plex gets temporary outbound access on an owned bootstrap network to
+install its own H.264/AAC codecs, then that network is disconnected before
+restarts and the soak. Decoder build, codec path and checksum are recorded.
+Downloads are cached under `PLEX_E2E_MEDIA_CACHE_DIR` (default:
+the system temporary directory's `plex-e2e-media-cache`). Media binaries are not
+committed or included in evidence artifacts.
+
+- **Big Buck Bunny (2008), 640x360 H.264/audio.** Blender Foundation,
+  [CC BY 3.0](https://peach.blender.org/about/). Attribution: (c) copyright 2008,
+  Blender Foundation / www.bigbuckbunny.org. Full credits are retained.
+- **The Beverly Hillbillies, season 1, episodes 1 and 2.**
+  [The Clampetts Strike Oil](https://archive.org/details/Beverly_Hillbillies_Ep01_The_Clampetts_Strike_Oil)
+  and [Getting Settled](https://archive.org/details/Beverly_Hillbillies_Ep02_Getting_Settled)
+  are marked Public Domain by their Internet Archive uploaders. This records the
+  source's designation for these copies, not a rights claim for the entire series.
+
+The verifier checks Plex scanner analysis, exact show/season/episode identities,
+PostgreSQL hierarchy and absence of TV media in shadow SQLite, byte-range seeks,
+full HTTP delivery hashes, and decoding the video and audio to the end with
+Plex's bundled decoder. Candidate smoke checks full playback before restarts and
+after live PostgreSQL recovery. The 5h50 job uses 20-second HTTP samples for
+setup, recovery and every soak iteration to keep overhead inside its six-hour
+runner limit. Every soak iteration decodes 20 seconds from
+each real Plex HTTP stream. JSON and decoder logs preserve full and sample
+evidence separately. The short generated AVI remains the fast fixture for all
+100 restart cycles and four concurrent readers.
+
+These are native direct-play delivery/decoding checks. They do not certify a
+browser's player or server-side transcoding. The 5h50 soak refuses prior smoke
+evidence without both `real_movie_and_tv_playback_verified=true` and
+`real_media_full_decode_verified=true`; production promotion
+remains blocked pending the complete matrix and release gates.
+
 Run `bash scripts/run-runtime-e2e.sh` from any directory. The script builds the
 existing Makefile shared shim with `--features interpose`, builds the Rust
 `runtime_e2e` binary, creates a disposable PostgreSQL cluster, and removes it on
@@ -46,6 +84,9 @@ Linux linking retains the existing system SQLite dependency with
 
 ## Coverage
 
+- FTS rebuilds preserve PostgreSQL source metadata, logical FTS searches still
+  read PostgreSQL, missing spellfix tables do not prevent skipped statements
+  from preparing, and temporary SQLite tokenizer cleanup stays on SQLite.
 - Normal Plex library filename/open and PostgreSQL-only table visibility.
 - Real SQLite RTree construction/root-node access, with engine-internal backing
   tables kept off PostgreSQL and schema-qualified internal reads preserved.
