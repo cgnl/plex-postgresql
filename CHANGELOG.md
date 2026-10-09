@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Isolate native thread/request state, retain bind-buffer ownership correctly, and validate the exact server UUID preference.
 - Preserve ordinary INSERT semantics, genuine unique constraints, atomic single-row REPLACE behavior and signed last-insert rowids.
 - Preserve Unicode, prepared FTS prefix terms and same-field phrase matching.
-- Import from private SQLite snapshots, retain source hashes and native Boolean-affinity values, and apply startup schema upgrades atomically.
+- Import from private SQLite snapshots, retain source hashes, native Boolean-affinity values and the source migration history, and apply startup schema upgrades atomically.
+- Require a genuine matching companion database template for native export, preserving its full Plex schema and non-blob contents while replacing current blob data.
 - Include migration helpers and trusted schema/seed files in Docker images and release bundles.
 
 

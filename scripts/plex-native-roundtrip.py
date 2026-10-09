@@ -254,6 +254,30 @@ for p in [Path('/config'),*Path('/config').rglob('*')]:
         require(identity["media_ids"] and identity["part_ids"], "Missing native media rows")
         return identity
 
+    def migration_markers(self, volume):
+        # Inspect private copies of stopped databases, preserving the originals.
+        return json.loads(self.helper(volume, "-c", """
+import hashlib,json,pathlib,shutil,sqlite3,tempfile,sys
+root=pathlib.Path(sys.argv[1])
+result={}
+with tempfile.TemporaryDirectory() as directory:
+    for kind,name in [('library',sys.argv[2]),('blobs',sys.argv[3])]:
+        source=root/name
+        copy=pathlib.Path(directory)/name
+        for suffix in ['', '-wal', '-shm', '-journal']:
+            path=pathlib.Path(str(source)+suffix)
+            if path.exists(): shutil.copy2(path,str(copy)+suffix)
+        connection=sqlite3.connect(copy)
+        try:
+            versions=sorted(str(row[0]) for row in connection.execute('SELECT version FROM schema_migrations LIMIT 10001'))
+        finally:
+            connection.close()
+        if len(versions)>10000: raise RuntimeError('Oversized native migration history')
+        encoded=json.dumps(versions,separators=(',',':')).encode()
+        result[kind]={'count':len(versions),'sha256':hashlib.sha256(encoded).hexdigest()}
+print(json.dumps(result))
+""", DATABASES, LIBRARY, BLOBS))
+
     def playback(self, stage, container, volume, section, sample=False):
         output = "/config/roundtrip-evidence/" + stage
         args = [TOOLS + "/verify-bbb-playback.py", section, MEDIA, output]
@@ -376,6 +400,8 @@ for p in [Path('/config'),*Path('/config').rglob('*')]:
         self.crashes(source_volume)
         self.command("stop", "--time", "30", source)
         hashes = self.source_hashes(source_volume)
+        source_markers = self.migration_markers(source_volume)
+        self.evidence["source_migration_markers"] = source_markers
         self.evidence["source_hashes"] = hashes
         self.sql('CREATE DATABASE "' + self.database + '"', env.get("POSTGRES_DB", self.pg_user))
         self.database_created = True
@@ -403,12 +429,18 @@ for p in [Path('/config'),*Path('/config').rglob('*')]:
         self.command("stop", "--time", "30", imported)
         export_env = {"PGHOST": "postgres", "PGPORT": "5432", "PGUSER": self.pg_user,
                       "PGPASSWORD": self.pg_env["PLEX_PG_PASSWORD"], "PGDATABASE": self.database}
-        self.helper(imported_volume, TOOLS + "/export_pg_to_sqlite.py", "--schema", "plex",
+        export_output = self.helper(imported_volume, TOOLS + "/export_pg_to_sqlite.py", "--schema", "plex",
                     "--output-dir", "/config/roundtrip-export", "--sqlite-schema", TOOLS + "/sqlite_schema.sql",
-                    "--native-plex-sqlite", "/usr/lib/plexmediaserver/Plex SQLite", env=export_env, timeout=600)
+                    "--native-plex-sqlite", "/usr/lib/plexmediaserver/Plex SQLite",
+                    "--native-blobs-template", "/source-config" + DATABASES[len('/config'):] + "/" + BLOBS,
+                    extra_mounts=(source_volume + ":/source-config:ro",), env=export_env, timeout=600)
+        self.evidence["native_export_stdout"] = self.sanitize_diagnostic(export_output, limit=16384)
         restored_volume = self.volume("restored")
         self.clone_config(imported_volume, restored_volume, export=True)
         self.evidence["export_hashes"] = self.source_hashes(restored_volume)
+        exported_markers = self.migration_markers(restored_volume)
+        self.evidence["exported_migration_markers"] = exported_markers
+        require(exported_markers == source_markers, "Native export changed source migration histories")
         restored = self.start("restored", restored_volume, native=True)
         restored_identity = self.ready("restored", restored, restored_volume, native=True)
         require(restored_identity.get("machineIdentifier") == native_identity.get("machineIdentifier"), "Restore changed server identity")

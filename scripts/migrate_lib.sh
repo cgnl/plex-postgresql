@@ -788,7 +788,7 @@ migrate_sqlite_to_pg() (
 
     for table in $tables; do
         [[ "$table" =~ ^[a-z_][a-z0-9_]*$ ]] || { echo "ERROR: Unsupported source table name: $table" >&2; return 1; }
-        case "$table" in schema_migrations|sqlite_column_types) continue ;; esac
+        case "$table" in sqlite_column_types) continue ;; esac
         local count
         count=$(sqlite3 -readonly "$SQLITE_DB" "SELECT COUNT(*) FROM \"$table\";") || return 1
         [[ "$count" =~ ^[0-9]+$ ]] || return 1
@@ -866,6 +866,14 @@ migrate_sqlite_to_pg() (
                     fi
                 fi
             done
+
+            # Native migration history has four columns; PG's id is a shim
+            # surrogate. Assign it in the private stage without consuming the
+            # live destination sequence during COPY or a failed acquisition.
+            if [[ "$table" == schema_migrations ]] && ! echo "$sqlite_cols_raw" | grep -qx id && echo ",$pg_cols," | grep -q ',id,'; then
+                sqlite_select="$sqlite_select,row_number() OVER (ORDER BY \"version\") AS \"id\""
+                pg_cols_list="$pg_cols_list,\"id\""
+            fi
 
             if [[ -z "$sqlite_select" ]]; then
                 echo "ERROR: No common columns for $table" >&2

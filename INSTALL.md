@@ -509,6 +509,31 @@ pg_dump -U plex plex | gzip > plex_backup_$(date +%Y%m%d).sql.gz
 gunzip -c plex_backup_20260113.sql.gz | psql -U plex plex
 ```
 
+### Native SQLite export
+
+Stop Plex and retain the original SQLite databases and `Preferences.xml`.
+A normal data export is not a native Plex rollback. Native export additionally
+requires the `Plex SQLite` executable and original companion database from the
+same Plex build. Its complete schema, bootstrap data and migration history are
+preserved while PostgreSQL supplies the current blob rows.
+
+With the PostgreSQL connection configured through the usual `PGHOST`, `PGPORT`,
+`PGUSER`, `PGDATABASE` and libpq authentication settings, run:
+
+```bash
+python3 scripts/export_pg_to_sqlite.py --schema plex \
+  --output-dir /path/to/export \
+  --sqlite-schema schema/sqlite_schema.sql \
+  --native-plex-sqlite "/path/to/Plex SQLite" \
+  --native-blobs-template /path/to/original/com.plexapp.plugins.library.blobs.db
+```
+
+Verify the exported pair in an isolated instance of the matching Plex build,
+including library identity, watched state, search, artwork and decoded playback,
+before installing it. Keep the original database pair and PostgreSQL backup.
+`--native-rollback` remains unavailable until the complete acceptance matrix is
+certified.
+
 ---
 
 ## 🆘 Troubleshooting

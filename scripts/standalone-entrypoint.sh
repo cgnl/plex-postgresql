@@ -110,14 +110,12 @@ init_schema() {
                 new_count=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ') || return 1
                 echo "Schema loaded successfully! $new_count tables created."
 
-                # NOTE: schema_migrations rows from the dump are kept intact.
-                # The shim intercepts INSERT INTO schema_migrations and adds
-                # ON CONFLICT DO NOTHING, so duplicate versions are silently ignored.
-                # This prevents Plex from re-running all 446 migrations from scratch,
-                # which causes DDL/schema divergence issues with the SQLite shadow DB.
+                # Keep the dump's history for a fresh PostgreSQL bootstrap.
+                # A source import replaces it atomically with the native library's
+                # actual migration rows before synchronizing the SQLite shadows.
                 local migration_count
                 migration_count=$(migration_psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ') || return 1
-                echo "schema_migrations has $migration_count entries (kept from dump, shim handles duplicates)"
+                echo "schema_migrations has $migration_count entries (bootstrap history; source import replaces it)"
 
 
             else

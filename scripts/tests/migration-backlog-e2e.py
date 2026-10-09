@@ -253,6 +253,9 @@ def exercise(image, native_image=None):
                                 if line.startswith('CREATE TABLE IF NOT EXISTS "accounts"'))
             sql('CREATE TABLE plex.preference_boolean_test(id INTEGER PRIMARY KEY,enabled BOOLEAN,active BOOLEAN,nullable BOOLEAN)')
             with sqlite3.connect(source) as connection:
+                connection.execute('CREATE TABLE schema_migrations(version TEXT NOT NULL UNIQUE,rollback_sql TEXT,optimize_on_rollback BOOLEAN,min_version TEXT)')
+                connection.executemany('INSERT INTO schema_migrations VALUES(?,?,?,?)',
+                    [("native-history雪\\quoted", "select '雪';\n", 1, '1.43.4'),('native-only-history',None,None,None)])
                 connection.execute(accounts_ddl)
                 connection.execute("INSERT INTO accounts(id,name) VALUES(4,'native textual defaults')")
                 assert connection.execute('SELECT typeof(auto_select_subtitle),typeof(auto_select_audio) FROM accounts WHERE id=4').fetchone() == ('text','text')
@@ -403,6 +406,11 @@ def exercise(image, native_image=None):
             assert hashes == [digest(source), digest(blob_source)]
             values = json.loads(sql('SELECT json_build_array(title,guid,extra_data) FROM plex.metadata_items WHERE id=71'))
             assert values == [title, guid, extra_data]
+            expected_history = [["native-history雪\\quoted", "select '雪';\n",1,'1.43.4'],['native-only-history',None,None,None]]
+            actual_history = lambda: json.loads(sql('SELECT json_agg(json_build_array(version,rollback_sql,optimize_on_rollback,min_version) ORDER BY version) FROM plex.schema_migrations'))
+            assert actual_history() == expected_history
+            checks.append('source main migration history authoritative: all4 columns exact, repository445 markers replaced atomically with distinct native history')
+
             assert json.loads(sql('SELECT json_agg(json_build_array(id,auto_select_subtitle,auto_select_audio) ORDER BY id) FROM plex.accounts')) == [[4,1,1],[5,0,0],[6,None,None],[7,1,1],[8,0,0],[9,2,-7]]
             assert json.loads(sql('SELECT json_agg(json_build_array(id,enabled,active,nullable) ORDER BY id) FROM plex.preference_boolean_test')) == [[1,True,True,None],[2,False,False,True],[3,None,False,False]]
             # Audit every declared native Boolean against actual PG destination
@@ -453,6 +461,17 @@ def exercise(image, native_image=None):
                     connection.execute(f'UPDATE {table} SET {field}=? WHERE id=?', (1 if field=='active' else 't',4 if table=='accounts' else 1))
             checks.append('unrepresentable Boolean text/fraction rejected for INTEGER destinations, integer 2 rejected for BOOLEAN destination: no activated rows, exact source hashes and staged schema cleanup')
             with sqlite3.connect(source) as connection:
+                connection.execute("UPDATE schema_migrations SET optimize_on_rollback='unrepresentable marker' WHERE version='native-only-history'")
+            failed_history_hashes = [digest(source),digest(blob_source)]
+            history_sequence_before = sql("SELECT last_value||':'||is_called FROM plex.schema_migrations_id_seq")
+            shell('migrate_sqlite_to_pg',ok=False,extra=import_env)
+            assert actual_history() == expected_history
+            assert sql("SELECT last_value||':'||is_called FROM plex.schema_migrations_id_seq") == history_sequence_before
+            assert failed_history_hashes == [digest(source),digest(blob_source)]
+            with sqlite3.connect(source) as connection:
+                connection.execute("UPDATE schema_migrations SET optimize_on_rollback=NULL WHERE version='native-only-history'")
+            checks.append('invalid source migration marker COPY preserves previous all4 history fields and live surrogate sequence/source hashes')
+            with sqlite3.connect(source) as connection:
                 connection.execute('UPDATE metadata_items SET metadata_type=\'not-an-integer\'')
             hashes = [digest(source), digest(blob_source)]
             result = shell('migrate_sqlite_to_pg', ok=False, extra=import_env)
@@ -461,6 +480,7 @@ def exercise(image, native_image=None):
             assert hashes == [digest(source), digest(blob_source)]
             assert 'invalid input syntax' in (temp / 'logs/migration_errors.log').read_text()
             assert sql("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'plex_import_%'") == '0'
+            assert actual_history() == expected_history
             checks.append('failed COPY: visible diagnostics, no activation, staging removed, exact source hashes')
             sql('DROP TABLE plex.preference_boolean_test')
             # Successful data export and failed export must preserve existing files.
@@ -511,16 +531,62 @@ def exercise(image, native_image=None):
                 native_cli.write_text('#!/bin/bash\nexec docker run --rm -i --network none -v "$(dirname "$1"):$(dirname "$1")" --entrypoint "/usr/lib/plexmediaserver/Plex SQLite" "$PLEX_TEST_NATIVE_IMAGE" "$@"\n')
                 native_cli.chmod(0o700)
                 native_env = dict(env, PLEX_TEST_NATIVE_IMAGE=native_image)
+                os.environ['PLEX_TEST_NATIVE_IMAGE'] = native_image
+                companion_stage = temp / 'native-companion-staging'
+                companion_stage.mkdir()
+                template_library,template_blobs = exporter.create_destinations(companion_stage,ROOT / 'schema/sqlite_schema.sql',native=True)
+                template_library.close()
+                template_blobs.close()
+                exporter.finalize_native(companion_stage,ROOT / 'schema/sqlite_schema.sql',native_cli)
+                native_template = temp / 'genuine-companion-template.db'
+                shutil.copyfile(companion_stage / exporter.LIBRARY,native_template)
+                with sqlite3.connect(companion_stage / exporter.ARTWORK) as blob_connection:
+                    blob_statements = blob_connection.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name<>'sqlite_sequence' ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END").fetchall()
+                with sqlite3.connect(native_template) as template_connection:
+                    for (statement,) in blob_statements:
+                        template_connection.execute(statement)
+                run([str(native_cli),str(native_template),
+                    "INSERT INTO schema_migrations VALUES('companion-only-history','select 42',1,'1.43.4'); "
+                    "INSERT INTO accounts(id,name) VALUES(1,'companion account'); "
+                    "INSERT INTO preferences(id,name,value) VALUES(2,'template bootstrap','unchanged'); "
+                    "INSERT INTO blobs(id,blob) VALUES(17,x'0102');"],env=native_env)
+                template_hashes = {suffix:digest(Path(str(native_template)+suffix)) for suffix in ('','-wal','-shm') if Path(str(native_template)+suffix).exists()}
                 native_output = temp / 'native-export'
                 native_command = ['python3', str(ROOT / 'scripts/export_pg_to_sqlite.py'), '--schema', 'plex',
-                                  '--output-dir', str(native_output), '--native-plex-sqlite', str(native_cli)]
+                                  '--output-dir', str(native_output), '--native-blobs-template',str(native_template),'--native-plex-sqlite', str(native_cli)]
                 sql("UPDATE plex.metadata_items SET title_sort=title,original_title=title; INSERT INTO plex.locations(id,lat_min,lat_max,lon_min,lon_max) VALUES(3,1.25,1.5,2.25,2.5); INSERT INTO plex.tags(id,tag) VALUES(9,'Snow');")
                 run(native_command, env=native_env)
                 native_library = native_output / 'com.plexapp.plugins.library.db'
                 native_artwork = native_output / 'com.plexapp.plugins.library.blobs.db'
                 result = run([str(native_cli), str(native_library), "SELECT id FROM metadata_items WHERE id IN (SELECT docid FROM fts4_metadata_titles_icu WHERE fts4_metadata_titles_icu MATCH 'export'); SELECT docid FROM fts4_tag_titles WHERE fts4_tag_titles MATCH 'Snow'; SELECT id||'|'||lat_min FROM locations; PRAGMA integrity_check;"], env=native_env)
                 assert result.stdout.strip() == '72\n9\n3|1.25\nok'
+                with sqlite3.connect(native_artwork) as companion:
+                    assert companion.execute('SELECT version,rollback_sql,optimize_on_rollback,min_version FROM schema_migrations').fetchall() == [('companion-only-history','select 42',1,'1.43.4')]
+                    assert companion.execute('SELECT name FROM accounts').fetchall() == [('companion account',)]
+                    assert companion.execute('SELECT value FROM preferences').fetchall() == [('unchanged',)]
+                    assert companion.execute('SELECT id,blob FROM blobs').fetchall() == [(1001,b'\x00\xff')]
+                assert template_hashes == {suffix:digest(Path(str(native_template)+suffix)) for suffix in template_hashes}
+                checks.append('explicit full native companion template: separate exact migration history/bootstrap preserved; only PG blobs replace old template blobs; original DB/WAL/SHM hashes unchanged')
                 native_hashes = [digest(native_library), digest(native_artwork)]
+                missing_template = native_command.copy()
+                position = missing_template.index('--native-blobs-template')
+                del missing_template[position:position+2]
+                missing = run(missing_template+['--yes'],env=native_env,ok=False)
+                assert 'requires --native-blobs-template' in missing.stderr
+                without_cli = native_command[:-2]+['--yes']
+                missing = run(without_cli,env=native_env,ok=False)
+                assert '--native-blobs-template requires --native-plex-sqlite' in missing.stderr
+                assert native_hashes == [digest(native_library),digest(native_artwork)]
+                wrong_template = native_command.copy()
+                wrong_template[wrong_template.index('--native-blobs-template')+1] = str(exports[1])
+                invalid_template = run(wrong_template+['--yes'],env=native_env,ok=False)
+                assert 'lacks full initialized Plex schema' in invalid_template.stderr
+                assert native_hashes == [digest(native_library),digest(native_artwork)]
+                alias_template = native_command.copy()
+                alias_template[alias_template.index('--native-blobs-template')+1] = str(native_artwork)
+                alias = run(alias_template+['--yes'],env=native_env,ok=False)
+                assert 'cannot alias an output' in alias.stderr
+                assert native_hashes == [digest(native_library),digest(native_artwork)]
                 # NULL indexed columns reproduce the diagnostic in an entirely
                 # native-created control, without PostgreSQL or export involved.
                 control = run(['docker', 'run', '--rm', '-i', '--network', 'none', '--entrypoint',
@@ -546,6 +612,9 @@ if os.environ['PLEX_TEST_CORRUPT'] == 'index' and 'PRAGMA integrity_check;' in s
 result=subprocess.run([os.environ['PLEX_TEST_REAL_CLI'], *sys.argv[1:]], input=script, text=True, capture_output=True)
 sys.stdout.write(result.stdout)
 sys.stderr.write(result.stderr)
+if result.returncode == 0 and os.environ['PLEX_TEST_CORRUPT'] == 'template' and 'RTREE_CONTENT' in script:
+    with sqlite3.connect(os.environ['PLEX_TEST_TEMPLATE']) as connection:
+        connection.execute("UPDATE preferences SET value='changed by concurrent writer'")
 if result.returncode == 0 and os.environ['PLEX_TEST_CORRUPT'] == 'physical' and 'RTREE_CONTENT' in script:
     path=pathlib.Path(sys.argv[1])
     with sqlite3.connect(path) as connection:
@@ -570,6 +639,14 @@ sys.exit(result.returncode)
                         assert 'integrity validation failed' in result.stderr or 'index/source count mismatch' in result.stderr, result.stderr
                     assert native_hashes == [digest(native_library), digest(native_artwork)]
 
+                template_bytes = native_template.read_bytes()
+                mutation_env = dict(native_env,PLEX_TEST_CORRUPT='template',PLEX_TEST_REAL_CLI=str(native_cli),PLEX_TEST_TEMPLATE=str(native_template))
+                mutation = run(corrupt_command,env=mutation_env,ok=False)
+                assert 'Native companion template changed during export' in mutation.stderr,mutation.stderr
+                assert native_hashes == [digest(native_library),digest(native_artwork)]
+                native_template.write_bytes(template_bytes)
+                assert template_hashes == {suffix:digest(Path(str(native_template)+suffix)) for suffix in template_hashes}
+                checks.append('concurrent native companion template mutation detected before publication; existing output pair preserved')
                 sql('ALTER TABLE plex.metadata_items ALTER COLUMN subtype DROP EXPRESSION; UPDATE plex.metadata_items SET subtype=1')
                 unsupported = run(native_command + ['--yes'], env=native_env, ok=False)
                 assert 'non-generated metadata_items.subtype' in unsupported.stderr

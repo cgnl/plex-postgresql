@@ -267,7 +267,81 @@ def finalize_native(stage, schema_path, executable):
         raise ValueError("Native artwork integrity/foreign key validation failed: " + output)
 
 
-def create_destinations(stage, schema_path, native=False):
+def template_fingerprint(path):
+    result = {}
+    for suffix in ('', '-wal', '-shm', '-journal'):
+        current = Path(str(path) + suffix)
+        if not current.exists():
+            result[suffix] = None
+            continue
+        before = current.stat()
+        digest = hashlib.sha256()
+        with current.open('rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        after = current.stat()
+        identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        if identity(before) != identity(after):
+            raise ValueError('Native companion template changed while hashing')
+        result[suffix] = [identity(after), digest.hexdigest()]
+    return result
+
+
+def clone_native_companion(template, stage, executable):
+    helper = Path(__file__).resolve().with_name('migrate_lib.sh')
+    if not helper.is_file():
+        raise ValueError('Native companion template requires bundled migrate_lib.sh snapshot helper')
+    with tempfile.TemporaryDirectory(prefix='.companion-snapshot-', dir=stage) as temporary:
+        result = subprocess.run(['bash', '-c', 'source "$1"; snapshot_sqlite_sources "$2" "$3"',
+                                 'native-companion-snapshot', str(helper), str(template), temporary],
+                                env=dict(native_environment(), MIGRATION_PLEX_SQLITE=str(executable)),
+                                text=True, capture_output=True, timeout=360)
+        if result.returncode:
+            raise RuntimeError('Native companion template snapshot failed: ' + result.stderr.strip())
+        os.replace(Path(temporary) / 'library.db', stage / ARTWORK)
+
+
+def companion_contents(executable, database):
+    schema = native_json(executable, database,
+        "SELECT json_group_array(json_array(type,name,tbl_name,sql)) FROM "
+        "(SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name);")
+    present = {row[1] for row in schema if row[0]=='table'}
+    required = {'schema_migrations','accounts','preferences','metadata_items','blobs'}
+    if not required <= present:
+        raise ValueError('Native companion template lacks full initialized Plex schema: ' + ','.join(sorted(required-present)))
+    history_count = native_json(executable,database,'SELECT json(count(*)) FROM schema_migrations;')
+    if not history_count:
+        raise ValueError('Native companion template has no source migration history')
+    columns = native_json(executable, database,
+        "SELECT json_group_array(json_array(table_name,column_name)) FROM "
+        "(SELECT m.name AS table_name,p.name AS column_name FROM sqlite_master m,pragma_table_info(m.name) p "
+        "WHERE m.type='table' AND m.name <> 'blobs' ORDER BY m.name,p.cid);")
+    tables = {}
+    for table, column in columns:
+        tables.setdefault(table, []).append(column)
+    queries = []
+    for table, names in tables.items():
+        expressions = []
+        for column in names:
+            quoted = identifier(column)
+            expressions.extend([f'typeof({quoted})', f"CASE WHEN typeof({quoted})='blob' THEN hex({quoted}) ELSE {quoted} END"])
+        where = " WHERE name <> 'blobs'" if table == 'sqlite_sequence' else ''
+        queries.append(f"SELECT json_array({literal(table)},{','.join(expressions)}) FROM {identifier(table)}{where};")
+    output = run_native_cli(executable, database, '\n'.join(queries))
+    # Order-independent typed row digests preserve companion bootstrap, markers,
+    # virtual content and physical backing rows. Only blobs' own allocator moves.
+    digests = {table: [0, 0] for table in tables}
+    for line in output.splitlines():
+        row = json.loads(line)
+        digests[row[0]][0] += 1
+        value = int.from_bytes(hashlib.sha256(json.dumps(row,ensure_ascii=True,separators=(',',':')).encode()).digest(),'big')
+        digests[row[0]][1] = (digests[row[0]][1] + value) % (1 << 256)
+    return {'schema': schema, 'typed_rows': digests}
+
+
+def create_destinations(stage, schema_path, native=False, companion_template=None, native_cli=None):
+    if companion_template:
+        clone_native_companion(companion_template, stage, native_cli)
     library = sqlite3.connect(stage / LIBRARY)
     artwork = sqlite3.connect(stage / ARTWORK)
     try:
@@ -283,8 +357,9 @@ def create_destinations(stage, schema_path, native=False):
         ).fetchall()
         if not blob_schema:
             raise ValueError("SQLite schema has no blobs table")
-        for (statement,) in blob_schema:
-            artwork.execute(statement)
+        if not companion_template:
+            for (statement,) in blob_schema:
+                artwork.execute(statement)
         library.execute('DROP TABLE "blobs"')
         library.commit()
         artwork.commit()
@@ -478,6 +553,8 @@ def main():
                         default=Path(__file__).resolve().parent.parent / "schema/sqlite_schema.sql")
     parser.add_argument("--native-plex-sqlite", type=Path,
                         help="Rebuild native virtual indices with this official Plex SQLite executable (server certification still required)")
+    parser.add_argument("--native-blobs-template", type=Path,
+                        help="Required for native export: genuine stopped version-matched companion SQLite database; preserves its full schema, migrations and bootstrap")
     parser.add_argument("--yes", action="store_true", help="Replace existing inactive output files")
     parser.add_argument("--native-rollback", action="store_true",
                         help="Require certified native rollback (currently unsupported)")
@@ -486,8 +563,21 @@ def main():
         raise ValueError("Native Plex rollback unsupported: no version-matched schema/extension certification")
     if args.native_plex_sqlite and not (args.native_plex_sqlite.is_file() and os.access(args.native_plex_sqlite, os.X_OK)):
         raise ValueError("Native Plex SQLite executable missing or not executable")
+    if args.native_plex_sqlite and not args.native_blobs_template:
+        raise ValueError("Native export requires --native-blobs-template from the matching stopped Plex server")
+    if args.native_blobs_template and not args.native_plex_sqlite:
+        raise ValueError("--native-blobs-template requires --native-plex-sqlite")
+    if args.native_blobs_template and not args.native_blobs_template.is_file():
+        raise ValueError("Native companion template is missing")
+    companion_fingerprint = template_fingerprint(args.native_blobs_template) if args.native_blobs_template else None
     identifier(args.schema)
     output = args.output_dir.resolve()
+    if args.native_blobs_template:
+        source_path = args.native_blobs_template.resolve()
+        for name in (LIBRARY,ARTWORK):
+            target = output / name
+            if target.resolve() == source_path or (target.exists() and os.path.samefile(source_path,target)):
+                raise ValueError('Native companion template cannot alias an output; retain a separate source backup')
     output.mkdir(parents=True, exist_ok=True)
     directory = os.open(output, os.O_RDONLY)
     try:
@@ -503,7 +593,9 @@ def main():
               else "Native Plex rollback: UNSUPPORTED (data export; native indices omitted).", flush=True)
         with tempfile.TemporaryDirectory(prefix=".pg-to-sqlite-", dir=output) as temporary:
             stage = Path(temporary)
-            library, artwork = create_destinations(stage, args.sqlite_schema, native=bool(args.native_plex_sqlite))
+            library, artwork = create_destinations(stage, args.sqlite_schema, native=bool(args.native_plex_sqlite),
+                                                      companion_template=args.native_blobs_template, native_cli=args.native_plex_sqlite)
+            companion_before = companion_contents(args.native_plex_sqlite,stage / ARTWORK) if args.native_blobs_template else None
             with contextlib.closing(library), contextlib.closing(artwork), contextlib.closing(Postgres()) as postgres:
                 postgres.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; "
                                  "SET LOCAL standard_conforming_strings = on; "
@@ -522,11 +614,15 @@ def main():
                     raise ValueError("Source schema changed during snapshot setup")
                 if args.native_plex_sqlite:
                     tables = native_catalog(postgres, args.schema, tables, library, artwork)
+                if args.native_blobs_template:
+                    artwork.execute('DELETE FROM blobs')
                 for table, columns in tables.items():
                     export_table(postgres, args.schema, artwork if table == "blobs" else library, table, columns,
                                  native=bool(args.native_plex_sqlite))
                 for database in (library, artwork):
                     database.commit()
+                    if args.native_blobs_template and database is artwork:
+                        continue
                     if database.execute("PRAGMA foreign_key_check").fetchone() is not None:
                         raise ValueError("SQLite foreign key validation failed")
                     if database.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
@@ -534,6 +630,15 @@ def main():
                 postgres.execute("COMMIT;")
             if args.native_plex_sqlite:
                 finalize_native(stage, args.sqlite_schema, args.native_plex_sqlite)
+            if args.native_blobs_template:
+                companion_after = companion_contents(args.native_plex_sqlite,stage / ARTWORK)
+                if companion_before != companion_after:
+                    raise ValueError("Native companion schema/non-blob contents changed during export")
+                if companion_fingerprint != template_fingerprint(args.native_blobs_template):
+                    raise ValueError("Native companion template changed during export; existing outputs preserved")
+                print("Native companion preserved: " + json.dumps({"template_sha256": companion_fingerprint[''][1],
+                      "non_blob_tables": len(companion_before['typed_rows']),
+                      "schema_migrations_count": companion_before['typed_rows'].get('schema_migrations',[0])[0]},sort_keys=True),flush=True)
             promote(stage, output)
         print(f"Validated data exports published: {output / LIBRARY}\n{output / ARTWORK}")
         print("Native indices rebuilt; verify with the matching Plex server before rollback. Retain original SQLite backups." if args.native_plex_sqlite
