@@ -13,7 +13,9 @@ Issue #10 contains seven independently verifiable subreports. Issue #24 was
 closed for perceived inactivity, #6 for missing feedback, and #8's closing
 discussion does not establish a tested recovery fix.
 
-**Current decision: do not release.** The schema-delegation deadlock is fixed
+**Publication decision (9 October 2026): v1.3.21 is published as a regular release at the maintainer's explicit request, before completion of the native matrix/soak. Binary publication does not certify those unresolved runtime gates; Docker production promotion remains gated.**
+
+**Native certification status: incomplete.** The schema-delegation deadlock is fixed
 and macOS plus Linux/musl PostgreSQL 15/18 runtime E2E pass. Native ARM64 scan,
 file-byte delivery, thumbnail/art routes, restart and outage/recovery smoke have
 passed in isolated runs. However, the same updated candidate subsequently
@@ -98,7 +100,7 @@ prove identical causes.
 6. **Promote exactly what passed.** Freeze source and Plex versions, retain all
    test reports, and promote the tested immutable image digest without rebuilding.
    A missing/skipped lane, unresolved blocking ledger row or failed canary forbids
-   promotion. Keep the last validated release and tested restoration path.
+   certified Docker promotion. Keep the last validated release and tested restoration path.
 
 For every future public Plex version, discovery creates a pinned candidate;
 the same gates establish support before promotion. Failure leaves the last

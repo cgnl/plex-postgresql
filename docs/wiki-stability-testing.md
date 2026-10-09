@@ -1,10 +1,12 @@
 # Stability Testing
 
-As of 9 October 2026, `test/stability-native-e2e-20261009` is a prerelease test
-branch. Production promotion remains blocked. Native testing is in progress;
-the full GitHub matrix and continuous 5h50 soak have not completed for the final
-candidate. Passing results from intermediate images are not release evidence
-for a different image digest.
+As of 9 October 2026, [v1.3.21](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.21)
+is a regular release, published before the complete native matrix and 5h50 soak
+at the maintainer's explicit request. Local PlexInc/arm64/PG18 real-media and
+recovery checks passed. Some GitHub runner fixture downloads fail with HTTP 403.
+Binary publication does not claim full native certification; Docker production
+promotion remains gated. Passing results from different image digests are not
+acceptance evidence for the release's Docker candidate.
 
 ## Native acceptance matrix
 
@@ -43,6 +45,6 @@ Consult the repository documents for current results and the complete gates:
 - [Release readiness and issue ledger](https://github.com/cgnl/plex-postgresql/blob/test/stability-native-e2e-20261009/docs/release-readiness.md)
 - [Recorded validation evidence](https://github.com/cgnl/plex-postgresql/blob/test/stability-native-e2e-20261009/docs/stability-validation-2026-10-09.md)
 
-Release approval requires a frozen candidate, passing native evidence, and all
-blocking release gates resolved. A successful download or one clean startup is
-insufficient to approve a production release.
+Certified Docker promotion requires a frozen candidate, passing native evidence,
+and all blocking runtime gates resolved. A successful download or one clean startup is
+insufficient to certify native production stability.

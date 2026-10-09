@@ -32,12 +32,21 @@ jobs:
           git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.wiki.git" wiki
 
       - name: Update version in Home.md
+        env:
+          RELEASE_TAG: v${{ steps.ver.outputs.new }}
         run: |
-          set -eux
-          TAG="v${{ steps.ver.outputs.new }}"
-          sed -i "s|## Latest release: v[0-9.]*|## Latest release: ${TAG}|" wiki/Home.md
-          echo "Updated Home.md to ${TAG}"
-          grep "Latest release" wiki/Home.md
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          tag = os.environ['RELEASE_TAG']
+          path = Path('wiki/Home.md')
+          heading = f'## Latest published release: [{tag}](https://github.com/${{ github.repository }}/releases/tag/{tag})'
+          text, count = re.subn(r'^## Latest (?:published )?release:.*$', heading, path.read_text(), flags=re.M | re.I)
+          if count != 1:
+              raise SystemExit('Expected one latest-release heading in wiki/Home.md')
+          path.write_text(text)
+          print(heading)
+          PY
 
       - name: Push wiki changes
         run: |
@@ -47,5 +56,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Home.md
-          git commit -m "auto: update latest release to v$(cat ../VERSION)"
+          git commit -m "Keep wiki readers on the published release" -m "Tested: Latest-release heading updated from VERSION"
           git push

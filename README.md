@@ -6,13 +6,15 @@
 
 A small shim library that catches Plex SQLite calls and sends them to PostgreSQL. You do not need to change Plex source code.
 
-## Current stability candidate
+## Current validation status
 
-`test/stability-native-e2e-20261009` is a prerelease test branch. **Production
-promotion is blocked:** the final candidate's full native matrix and 5h50 soak
-have not completed. Earlier passing probes used intermediate artifacts and do
-not certify this candidate. The published release below is release history,
-not evidence that the current branch has passed these gates.
+**v1.3.21 is a regular release.** The complete native matrix and 5h50 soak
+remain unfinished; publication does not claim full runtime certification.
+Local PlexInc/arm64/PG18 movie and TV playback/recovery passed, along with
+1,050 Rust tests and 15 shared-shim runtime E2E cases. Some GitHub runners could
+not download the real-media fixtures (HTTP 403). Browser playback and
+server-side transcoding remain unverified. Docker production promotion stays
+gated on complete native evidence.
 
 The acceptance matrix is **LinuxServer and PlexInc × native amd64 and arm64 ×
 PostgreSQL 15 and 18** (eight combinations), with 100 restart cycles per lane
@@ -20,10 +22,10 @@ and a separate 5-hour-50-minute soak using the same immutable image digest.
 See [release gates and known gaps](docs/release-readiness.md) and
 [recorded validation evidence](docs/stability-validation-2026-10-09.md).
 
-## Latest published release: [v1.3.20](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.20)
+## Latest published release: [v1.3.21](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.21)
 
-Published on 5 October 2026. The stability fixes and real-media acceptance tests
-on the candidate branch are not included in this release.
+Published on 9 October 2026. Includes transaction/reconnect, migration and FTS
+fixes, plus real movie/TV acceptance tooling. See [the changelog](CHANGELOG.md).
 
 ### Runtime architecture introduced in v1.2.0
 
@@ -35,7 +37,7 @@ on the candidate branch are not included in this release.
 - 🔧 **Stack safety:** heap-allocated thread-local buffers for Plex's 544K worker thread stacks
 - ✅ **712 tests passing** across unit, integration, and compatibility suites
 
-[📥 Download v1.2.0](https://github.com/cgnl/plex-postgresql/releases/tag/v1.2.0) | [📋 Full Changelog](CHANGELOG.md)
+[📥 Download v1.3.21](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.21) | [📋 Full Changelog](CHANGELOG.md)
 
 Linux and macOS release zips are built by GitHub Actions on tag push via `.github/workflows/release-linux-artifacts.yml` and `.github/workflows/release-macos-artifacts.yml`.
 Pull requests and `main`/`develop` pushes run `.github/workflows/ci.yml` (script validation + Linux amd64 build check + full test suite + FFI header verification).
@@ -50,7 +52,7 @@ candidates and blocks production promotion. The image repositories are:
 
 **macOS:**
 ```bash
-curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.0.0/plex-postgresql-v1.0.0-macos.zip \
+curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.21/plex-postgresql-v1.3.21-macos.zip \
   -o /tmp/plex-pg-macos.zip
 mkdir -p /tmp/plex-pg-macos && cd /tmp/plex-pg-macos
 unzip /tmp/plex-pg-macos.zip
@@ -60,7 +62,7 @@ pkill -f "Plex Media Server" 2>/dev/null || true
 
 **Linux (x86_64):**
 ```bash
-sudo curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.0.0/plex-postgresql-v1.0.0-linux.zip \
+sudo curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.21/plex-postgresql-v1.3.21-linux.zip \
   -o /tmp/plex-postgresql-linux.zip
 sudo unzip -j /tmp/plex-postgresql-linux.zip db_interpose_pg-linux-x86_64.so -d /usr/local/lib
 sudo mv /usr/local/lib/db_interpose_pg-linux-x86_64.so /usr/local/lib/db_interpose_pg.so
@@ -266,7 +268,7 @@ volumes:
 Use the latest macOS zip and run the wrapper installer. The installer copies the shim dylib into `Plex Media Server.app`, patches the binaries, and sets up the wrapper script. Everything lives inside the Plex app bundle.
 
 ```bash
-curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.0.0/plex-postgresql-v1.0.0-macos.zip -o /tmp/plex-pg-macos.zip
+curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.21/plex-postgresql-v1.3.21-macos.zip -o /tmp/plex-pg-macos.zip
 mkdir -p /tmp/plex-pg-macos && cd /tmp/plex-pg-macos
 unzip /tmp/plex-pg-macos.zip
 
@@ -289,7 +291,7 @@ pkill -f "Plex Media Server" 2>/dev/null || true
 Use the latest Linux zip and install the binary for your CPU.
 
 ```bash
-curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.0.0/plex-postgresql-v1.0.0-linux.zip -o /tmp/plex-pg-linux.zip
+curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.21/plex-postgresql-v1.3.21-linux.zip -o /tmp/plex-pg-linux.zip
 mkdir -p /tmp/plex-pg-linux
 cd /tmp/plex-pg-linux
 unzip /tmp/plex-pg-linux.zip
@@ -394,7 +396,7 @@ complete GitHub matrix has not passed. These checks do not yet certify browser
 playback or server-side transcoding.
 
 Fixture sources, attribution, evidence and runner instructions are in
-[runtime E2E](docs/runtime-e2e.md). The proposed wiki page is
+[runtime E2E](docs/runtime-e2e.md). The wiki page is
 [Stability Testing](docs/wiki-stability-testing.md).
 
 ```bash

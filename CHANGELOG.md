@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.21] - 2026-10-09
+
+### Fixed
+- Route SQLite transaction control, including `sqlite3_exec`, through real PostgreSQL transactions; preserve rollback/savepoint semantics and reject aborted commits.
+- Recover PostgreSQL sessions and cached prepared statements after disconnects without requiring a Plex restart in the validated native fixture.
+- Preserve SQLite ABI numeric/NULL behavior and keep SQLite engine work on the invoking thread.
+- Keep SQLite FTS/RTree backing tables, tokenizers, collations and engine configuration off PostgreSQL.
+- Treat Plex FTS index rebuild writes as no-ops so PostgreSQL views cannot delete or duplicate source metadata; keep logical searches on PostgreSQL.
+- Prepare skipped spellfix statements without requiring missing virtual tables and clean up temporary tokenizers on SQLite.
+- Tighten migration, schema initialization and export error handling to preserve source data and avoid silently swallowing failed work.
+- Limit inherited shim settings in Plex helper processes and exclude incompatible default interpose exports.
+- Build the shim static library without accidentally linking test-harness SQLite symbols.
+
+### Added
+- Real shared-shim runtime E2E checks for transactions, constraints, types, statement reuse and reconnect; 15 requested cases pass locally.
+- Eight native Docker acceptance lanes: LinuxServer/PlexInc, amd64/arm64, PostgreSQL 15/18, with 100 restart cycles and a separate 5h50 soak.
+- Checksum-pinned Big Buck Bunny movie and The Beverly Hillbillies S01E01/S01E02 TV libraries, covering scanning, episode hierarchy, byte-range seeks, delivery hashes and full audio/video decoding.
+- Official build-matched H.264/AAC codec bootstrap with SHA256/provenance records, then offline playback samples during the soak.
+- Failure-safe PostgreSQL-to-SQLite export tooling, compatibility documentation and an evidence ledger.
+- SHA256 files alongside the Linux/macOS release bundles.
+
+### Changed
+- Publish v1.3.21 as a regular release rather than a prerelease, with validation limits recorded explicitly.
+- Update README and wiki release pointers and testing documentation.
+- Keep Docker production promotion gated on complete native evidence; binary release publication is separate from runtime certification.
+
+### Validation and known limitations
+- 1,050 Rust tests pass (two existing tests ignored), with Clippy and 15 shared-shim runtime E2E cases passing.
+- Local native PlexInc/arm64/PG18 tests pass for full movie/TV delivery and audio/video decoding, byte-range seeks, watch state, artwork, one restart and live PostgreSQL recovery.
+- The local short soak requested 10 seconds and measured 11 seconds. It is not evidence of a completed 5h50 soak or 100 restarts.
+- The full GitHub native matrix and 5h50 soak are unfinished. Some runner fixture downloads fail with HTTP 403.
+- Browser playback, server-side transcoding and the remaining imported-library/rollback/crash acceptance gates are not fully certified. See `docs/release-readiness.md` and `docs/stability-validation-2026-10-09.md`.
+
 ## [1.3.20] - 2026-10-05
 
 ### Changed
