@@ -333,15 +333,8 @@ if [ -n "$PLEX_PG_HOST" ]; then
     verify_config_writable
     wait_for_postgres
     init_schema
-    if [[ ! -f "$SQLITE_DB" && -f "$SHIM_DIR/seed_data.sql" ]]; then
-        if destination_has_data; then
-            :
-        else
-            destination_status=$?
-            [[ "$destination_status" == 1 ]] || exit 1
-            migration_psql -1 -f "$SHIM_DIR/seed_data.sql"
-            sync_all_sequences
-        fi
+    if [[ ! -f "$SQLITE_DB" ]]; then
+        seed_fresh_pg_defaults
     fi
 
     # Run migration if source SQLite DB exists (mounted via -v)

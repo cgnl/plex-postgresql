@@ -73,6 +73,34 @@ def exercise(image, native_image=None):
         assert sql("SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'") == 'public'
         env['PGDATABASE'] = 'postgres'
         checks.append('full fresh schema + pg_trgm bootstrap/existing public extension placement')
+        assert sql('SELECT count(*) FROM plex.accounts') == '0'
+        shell('seed_fresh_pg_defaults')
+        assert sql("SELECT name FROM plex.accounts WHERE id=1") == 'Administrator'
+        assert sql('SELECT count(*) FROM plex.accounts') == '1'
+        seed_tables = ['accounts','activities','devices','metadata_agent_providers','metadata_agent_provider_groups',
+                       'metadata_agent_provider_group_items','plugin_prefixes','plugins','preferences','tags']
+        def bootstrap_rows():
+            return sql(' '.join(f'SELECT row_to_json(t) FROM plex.{table} t ORDER BY id;' for table in seed_tables))
+        before_bootstrap = bootstrap_rows()
+        seed_seq_before = sql("SELECT last_value||':'||is_called FROM plex.accounts_id_seq; SELECT last_value||':'||is_called FROM plex.devices_id_seq;")
+        shell('seed_fresh_pg_defaults')
+        assert bootstrap_rows() == before_bootstrap
+        assert seed_seq_before == sql("SELECT last_value||':'||is_called FROM plex.accounts_id_seq; SELECT last_value||':'||is_called FROM plex.devices_id_seq;")
+        sql("UPDATE plex.preferences SET value='custom user preference' WHERE id=2")
+        before_user = bootstrap_rows()
+        shell('seed_fresh_pg_defaults')
+        assert bootstrap_rows() == before_user
+        sql("UPDATE plex.preferences SET value='0' WHERE id=2; DELETE FROM plex.accounts WHERE id=1")
+        shell('seed_fresh_pg_defaults')
+        assert bootstrap_rows() == before_bootstrap
+        sql("INSERT INTO plex.metadata_items(id,metadata_type,title) VALUES(42,1,'actual user library')")
+        real_before = bootstrap_rows()
+        shell('seed_fresh_pg_defaults')
+        assert bootstrap_rows() == real_before
+        assert sql("SELECT title FROM plex.metadata_items WHERE id=42") == 'actual user library'
+        sql('TRUNCATE plex.metadata_items,'+','.join('plex.'+table for table in seed_tables))
+        checks.append('fresh/bootstrap seeding account0->Administrator1, repeat no row/sequence changes, missing exact account restored; changed preferences/real library retained')
+
         assert sql("SELECT count(*) FROM pg_constraint WHERE conname IN ('metadata_item_settings_account_guid_unique', 'statistics_bandwidth_account_id_device_id_timespan_at_lan_key')") == '0'
         # Recreate older-release constraints and populated rows to exercise upgrade.
         sql('''INSERT INTO plex.metadata_item_settings(id,account_id,guid,extra_data) VALUES(41,2,'same','preserve');
@@ -664,7 +692,7 @@ sys.exit(result.returncode)
 
         return {'image': image, 'server_version': sql('SHOW server_version'), 'checks': checks}
     finally:
-        run(['docker', 'rm', '-f', name])
+        run(['docker', 'rm', '-f', '-v', name])
 
 
 def main():

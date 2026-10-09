@@ -25,7 +25,7 @@ docker image inspect "$BASE_PLEX_IMAGE" >/dev/null 2>&1 || docker pull "$BASE_PL
 STAGE=$(mktemp -d)
 CONTAINER=""
 cleanup() {
-    [[ -z "$CONTAINER" ]] || docker rm -f "$CONTAINER" >/dev/null
+    [[ -z "$CONTAINER" ]] || docker rm -fv "$CONTAINER" >/dev/null
     rm -rf "$STAGE"
 }
 trap cleanup EXIT
@@ -35,7 +35,8 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     archive.extractall(sys.argv[2])
 PY
 CONTAINER=$(docker create --label plex-postgresql.test=native-bundle \
-    --entrypoint /bin/bash -e HOME=/tmp/plex-bundle-home "$BASE_PLEX_IMAGE" -c 'sleep 300')
+    --entrypoint /bin/bash -e HOME=/tmp/plex-bundle-home \
+    -e TMPDIR=/tmp/plex-bundle-temp "$BASE_PLEX_IMAGE" -c 'sleep 300')
 docker start "$CONTAINER" >/dev/null
 docker cp "$STAGE/." "$CONTAINER:/tmp/plex-bundle"
 docker image inspect "$BASE_PLEX_IMAGE" > "$EVIDENCE_DIR/base-image.json"
@@ -53,7 +54,7 @@ PLEX_DIR=/usr/lib/plexmediaserver
 BUNDLE=/tmp/plex-bundle
 INSTALLER="$BUNDLE/scripts/install_wrappers_linux.sh"
 export HOME=/tmp/plex-bundle-home
-mkdir -p "$HOME"
+mkdir -p "$HOME" "$TMPDIR"
 cd "$BUNDLE"
 sha256sum "$PLEX_DIR/Plex Media Server" "$PLEX_DIR/Plex Media Scanner" > /tmp/plex-original-sha256
 assert_unchanged() {

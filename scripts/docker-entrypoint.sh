@@ -447,6 +447,9 @@ if [ -n "$PLEX_PG_HOST" ]; then
     protect_shadow_destinations "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
     wait_for_postgres
     init_schema
+    if [[ ! -f "$SQLITE_DB" ]]; then
+        seed_fresh_pg_defaults
+    fi
 
     # Run migration if source SQLite DB exists (mounted via -v)
     if [[ -f "$MIGRATE_LIB" ]] && [[ -f "$SQLITE_DB" ]]; then

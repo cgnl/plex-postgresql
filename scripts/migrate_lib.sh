@@ -320,6 +320,11 @@ if path.is_file():
 encoded = json.dumps(manifest, ensure_ascii=True, separators=(',', ':'))
 delimiter = '$seed_' + uuid.uuid4().hex + '$'
 print("""
+CREATE OR REPLACE FUNCTION pg_temp.plex_pg_bootstrap_rows()
+RETURNS TABLE(target_table text,row_value jsonb) LANGUAGE sql IMMUTABLE AS $seed_rows$
+ SELECT definitions.key,source_rows.value FROM jsonb_each(""" + delimiter + encoded + delimiter + """::jsonb) definitions,
+ LATERAL jsonb_array_elements(definitions.value) source_rows;
+$seed_rows$;
 CREATE OR REPLACE FUNCTION pg_temp.plex_pg_is_bootstrap_row(target_table text, row_value jsonb)
 RETURNS boolean LANGUAGE sql STABLE AS $matcher$
  SELECT EXISTS (
@@ -391,10 +396,15 @@ SQL
 }
 
 sequence_sync_sql() {
+    local seed_gate=""
+    if [[ "${1:-}" == bootstrap ]]; then
+        seed_gate="IF current_setting('plex.bootstrap_changed',true) IS DISTINCT FROM 'true' THEN RETURN; END IF;"
+    fi
     printf '%s\n' "
         DO \$do\$
         DECLARE rec record; maximum bigint; minimum bigint; initial bigint;
         BEGIN
+            $seed_gate
             FOR rec IN
                 SELECT table_schema, table_name, column_name,
                        pg_get_serial_sequence(format('%I.%I', table_schema, table_name), column_name) AS sequence_name
@@ -436,6 +446,45 @@ destination_guard_sql() {
         END \$guard\$;
     "
 }
+
+# Native startup assumes the default account exists. Restore only missing
+# repository bootstrap rows under the same destination locks as import guards.
+# A real/changed destination is preserved; repeated complete bootstrap is a no-op.
+seed_fresh_pg_defaults() (
+    validate_migration_schema || return 1
+    local status temporary
+    if destination_has_data; then
+        return 0
+    else
+        status=$?
+        [[ "$status" == 1 ]] || return 1
+    fi
+    temporary=$(mktemp "${TMPDIR:-/tmp}/plex-bootstrap-seed.XXXXXX") || return 1
+    trap 'rm -f "$temporary"' EXIT
+    printf 'BEGIN;\n' > "$temporary" || return 1
+    destination_guard_sql >> "$temporary" || return 1
+    cat >> "$temporary" <<SQL
+DO \$seed_missing\$
+DECLARE seed record; columns text; inserted bigint; changed boolean := false;
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pg_temp.plex_pg_bootstrap_rows()) THEN
+        RAISE EXCEPTION 'Fresh bootstrap requires the trusted repository seed_data.sql';
+    END IF;
+    FOR seed IN SELECT * FROM pg_temp.plex_pg_bootstrap_rows() LOOP
+        SELECT string_agg(format('%I',key),', ' ORDER BY key) INTO columns FROM jsonb_object_keys(seed.row_value) key;
+        EXECUTE format('INSERT INTO %I.%I (%s) SELECT %s FROM jsonb_populate_record(NULL::%I.%I,\$1) seed_record WHERE NOT EXISTS(SELECT 1 FROM %I.%I existing WHERE to_jsonb(existing) @> \$1)',
+                       '$PG_SCHEMA',seed.target_table,columns,columns,'$PG_SCHEMA',seed.target_table,'$PG_SCHEMA',seed.target_table)
+        USING seed.row_value;
+        GET DIAGNOSTICS inserted = ROW_COUNT;
+        changed := changed OR inserted > 0;
+    END LOOP;
+    PERFORM set_config('plex.bootstrap_changed',changed::text,true);
+END \$seed_missing\$;
+SQL
+    sequence_sync_sql bootstrap >> "$temporary" || return 1
+    printf 'COMMIT;\n' >> "$temporary" || return 1
+    migration_psql -q -f "$temporary"
+)
 
 sync_all_sequences() {
     sequence_sync_sql | migration_psql -q

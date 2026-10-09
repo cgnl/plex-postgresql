@@ -1,5 +1,5 @@
 {
-  "scope": "Local native ARM64 PlexInc/PostgreSQL 18; not complete matrix or long soak",
+  "scope": "Local native ARM64 PlexInc/PostgreSQL18 and LinuxServer/PostgreSQL15; complete matrix and long soak pending",
   "full_workload": {
     "phase": "native-workload-complete",
     "exit_code": 0,
@@ -99,5 +99,68 @@
     "Native ZIP proof runs ARM64 only; amd64 and both variants are required CI gates.",
     "Browser playback, server transcoding and continuous simultaneous network transfer are not demonstrated.",
     "100-restart final matrix and 5h50 soak remain pending."
-  ]
+  ],
+  "linuxserver_bootstrap_followup": {
+    "workload": {
+      "phase": "native-workload-complete",
+      "exit_code": 0,
+      "candidate": "sha256:bc6f64204f7080beb6b16e8e4f502d68c3d2ab1dadcd3c2543de0157c5c3734d",
+      "plex_version": "1.43.4.10903-e5521bd8c",
+      "variant": "linuxserver",
+      "arch": "arm64",
+      "restart_cycles_requested": 1,
+      "restart_cycles_completed": 1,
+      "soak_seconds_requested": 10,
+      "soak_seconds_completed": 25,
+      "soak_iterations": 1,
+      "live_postgres_recovery_verified": true,
+      "decoded_fixture_verified": true,
+      "real_movie_and_tv_playback_verified": true,
+      "real_media_full_decode_verified": true,
+      "native_import_and_rollback_verified": true,
+      "four_concurrent_real_media_clients_verified": true,
+      "workload_passed": true,
+      "promotion_allowed": false,
+      "missing_gate": "Full native matrix, scan/playback/watch-state/artwork and sustained outage workload"
+    },
+    "native_roundtrip": {
+      "passed": true,
+      "source_migration_markers": {
+        "library": {
+          "count": 442,
+          "sha256": "12876128ffb9642087d5a5b9708aa64874cf46c5fc9134a927eb37bb4596ac96"
+        },
+        "blobs": {
+          "count": 442,
+          "sha256": "12876128ffb9642087d5a5b9708aa64874cf46c5fc9134a927eb37bb4596ac96"
+        }
+      },
+      "exported_migration_markers": {
+        "library": {
+          "count": 442,
+          "sha256": "12876128ffb9642087d5a5b9708aa64874cf46c5fc9134a927eb37bb4596ac96"
+        },
+        "blobs": {
+          "count": 442,
+          "sha256": "12876128ffb9642087d5a5b9708aa64874cf46c5fc9134a927eb37bb4596ac96"
+        }
+      },
+      "source_preserved": true,
+      "restart_preserved_contents": true,
+      "native_rollback_verified": true,
+      "cleanup_errors": []
+    },
+    "concurrent_overlap_seconds": 19.605717453996476,
+    "mixed_events": 61,
+    "source_sha256": {
+      "/tmp/plex-linuxserver-bootstrap-native-positive-2/result.json": "888c8fd55a5d4af9832674d527b47a138a18676254c712a9befe100defd1e0a4",
+      "/tmp/plex-linuxserver-bootstrap-native-positive-2/native-roundtrip/native-roundtrip.json": "cc97335d8949768518b549670da72f2508165ce06ffb6bcbff741e7584e3acae",
+      "/tmp/plex-linuxserver-bootstrap-native-positive-2/smoke-concurrent-real-media/concurrent-playback.json": "702f574f42ed87bd585def7efaf2bf5dfe1d27c96a363df30b76cbb40dc90be8"
+    },
+    "notes": [
+      "Native source binary and locale are unchanged; missing fresh default account was repaired.",
+      "One restart and short soak only; 100-cycle and 5h50 certification pending.",
+      "A first local run was discarded after Docker VM exhaustion; this replacement exited0."
+    ]
+  }
 }

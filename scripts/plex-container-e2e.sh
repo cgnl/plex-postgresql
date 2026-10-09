@@ -333,10 +333,13 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 url = "http://127.0.0.1:32400/library/sections/" + sys.argv[1] + "/all"
+last_body = b""
+last_error = "Analyzed fixture metadata not yet available"
 for attempt in range(90):
     try:
         with urllib.request.urlopen(url, timeout=3) as response:
             body = response.read()
+        last_body = body
         videos = [video for video in ET.fromstring(body).iter("Video")
                   if any(part.get("file") == sys.argv[2] for part in video.iter("Part"))]
         if len(videos) > 1:
@@ -347,6 +350,14 @@ for attempt in range(90):
                                   and any(part.get("file") == sys.argv[2] for part in media.iter("Part"))
                                   for media in videos[0].iter("Media")):
             video = videos[0]
+            # The scanner commits dimensions before generated thumbnail/art
+            # URLs. Poll publication as part of readiness, then certify both
+            # native routes and their actual image payloads below.
+            missing_images = [attribute for attribute in ("thumb", "art") if not video.get(attribute)]
+            if missing_images:
+                last_error = "Native " + "/".join(missing_images) + " route not yet published"
+                time.sleep(2)
+                continue
             parts = [part for part in video.iter("Part") if part.get("file") == sys.argv[2]]
             if len(parts) != 1 or not parts[0].get("key", "").startswith("/library/parts/"):
                 raise SystemExit("Scanned media lacks a unique native file route")
@@ -384,11 +395,12 @@ for attempt in range(90):
             print("PASS native media-file bytes, decoded frames and thumbnail/art routes", file=sys.stderr)
             print(body.decode())
             break
-    except (urllib.error.URLError, TimeoutError):
-        pass
+    except (urllib.error.URLError, TimeoutError) as error:
+        last_error = str(error)
     time.sleep(2)
 else:
-    raise SystemExit("Actual scanner never exposed analyzed fixture media through Plex API")
+    print(last_body.decode(errors="replace"))
+    raise SystemExit("Actual scanner never exposed analyzed fixture media and native artwork through Plex API: " + last_error)
 PY
     assert_no_crash_reports "$plex"
     docker exec "$postgres" psql -X -U plex -d plex -v ON_ERROR_STOP=1 -Atc \

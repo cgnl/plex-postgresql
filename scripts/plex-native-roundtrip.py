@@ -330,7 +330,7 @@ print(json.dumps(result))
             "rejected": True, "reason": marker, "postgres_contents_preserved": True,
             "source_hashes_preserved": True}
         self.owned("container", container)
-        self.command("container", "rm", container)
+        self.command("container", "rm", "-v", container)
         # Migration is a one-time installation step. Normal startup must use
         # the existing PostgreSQL database without the explicit source mount.
         return self.start("imported", volume)
@@ -503,7 +503,7 @@ else:
                     if probe.returncode != 0:
                         continue
                     self.owned(kind, name)
-                    self.command(kind, "rm", *( ["-f"] if kind == "container" else []), name)
+                    self.command(kind, "rm", *( ["-f", "-v"] if kind == "container" else []), name)
                 except (RuntimeError, subprocess.SubprocessError):
                     errors.append(kind + ":" + name)
         if self.database_created:

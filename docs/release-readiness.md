@@ -28,12 +28,15 @@ candidate's complete native matrix and soak remain pending. See
 ## Follow-up evidence
 
 [The checked-in local evidence summary](evidence/backlog-native-arm64-20261009.json)
-records native PlexInc/ARM64/PostgreSQL 18 source import, restart, both search
+records native PlexInc/ARM64/PostgreSQL 18 and LinuxServer/ARM64/PostgreSQL 15
+source import, restart, both search
 routes, export and vanilla restoration with the same 442 migration markers in
 both databases. Source hashes, watched state and server/media identity survive.
 The full real movie/TV workload, PostgreSQL recovery without a PMS restart and
 four overlapping 20-second native decoder clients pass in the local smoke.
-The four-client common overlap is 19.60 seconds, with 61 mixed workload events.
+The PlexInc four-client common overlap is 19.60 seconds, with 61 mixed workload events.
+The repaired LinuxServer fresh start also passes the complete local workload.
+Its original crash came from a missing canonical default account; no binary or locale patch was needed.
 Browser playback and server transcoding are not claimed.
 
 The native Linux ZIP audit found that the published v1.3.21 bundle ships an
