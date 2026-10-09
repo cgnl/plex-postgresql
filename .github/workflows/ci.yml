@@ -145,11 +145,19 @@ jobs:
     name: Build Linux amd64 shim
     runs-on: ubuntu-latest
     steps:
+      - name: Use an isolated Docker client configuration
+        run: |
+          set -eu
+          docker_config=$(mktemp -d "$RUNNER_TEMP/plex-docker-config.XXXXXX")
+          printf '{}\n' > "$docker_config/config.json"
+          chmod 700 "$docker_config"
+          chmod 600 "$docker_config/config.json"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
+      - name: Require a native amd64 runner
+        run: test "$(uname -m)" = x86_64
+
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -161,6 +169,7 @@ jobs:
           docker buildx build \
             --platform linux/amd64 \
             --target builder \
+            --build-arg BUILDER_IMAGE=public.ecr.aws/docker/library/alpine@sha256:19b4bcc4f60e99dd5ebdca0cbce22c503bbcff197549d7e19dab4f22254dc864 \
             --output type=local,dest=out \
             .
 

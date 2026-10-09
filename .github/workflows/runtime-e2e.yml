@@ -13,22 +13,47 @@ jobs:
       fail-fast: false
       matrix:
         postgres: ['15', '18']
-    services:
-      postgres:
-        image: postgres:${{ matrix.postgres }}
-        env:
-          POSTGRES_USER: runtime_e2e_admin
-          POSTGRES_PASSWORD: runtime_e2e_fixture_password
-          POSTGRES_DB: runtime_e2e_admin
-        ports:
-          - 5432/tcp
-        options: >-
-          --health-cmd "pg_isready -U runtime_e2e_admin -d runtime_e2e_admin"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
+      - name: Use an isolated Docker client configuration
+        run: |
+          set -eu
+          docker_config=$(mktemp -d "$RUNNER_TEMP/plex-docker-config.XXXXXX")
+          printf '{}\n' > "$docker_config/config.json"
+          chmod 700 "$docker_config"
+          chmod 600 "$docker_config/config.json"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+      - name: Start the owned PostgreSQL fixture
+        id: postgres
+        env:
+          POSTGRES_IMAGE: postgres:${{ matrix.postgres }}
+        run: |
+          set -eu
+          ownership="runtime-e2e-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          container_file=$(mktemp "$RUNNER_TEMP/runtime-e2e-postgres.XXXXXX")
+          echo "RUNTIME_E2E_CONTAINER_FILE=$container_file" >> "$GITHUB_ENV"
+          docker pull "$POSTGRES_IMAGE"
+          container=$(docker create \
+            --label plex-postgresql.test=runtime-e2e \
+            --label "plex-postgresql.run=$ownership" \
+            -e POSTGRES_USER=runtime_e2e_admin \
+            -e POSTGRES_PASSWORD=runtime_e2e_fixture_password \
+            -e POSTGRES_DB=runtime_e2e_admin \
+            -p 127.0.0.1::5432 "$POSTGRES_IMAGE")
+          printf '%s\n' "$container" > "$container_file"
+          docker start "$container" >/dev/null
+          ready=0
+          for attempt in $(seq 1 60); do
+            if docker exec "$container" pg_isready -h 127.0.0.1 -p 5432 -U runtime_e2e_admin -d runtime_e2e_admin >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1
+          binding=$(docker port "$container" 5432/tcp)
+          [[ "$binding" =~ ^127\.0\.0\.1:([0-9]+)$ ]]
+          echo "port=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install existing native link prerequisites
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libsqlite3-dev postgresql-client
@@ -36,8 +61,27 @@ jobs:
         env:
           RUNTIME_E2E_EXTERNAL_FIXTURE: '1'
           RUNTIME_E2E_ADMIN_HOST: 127.0.0.1
-          RUNTIME_E2E_ADMIN_PORT: ${{ job.services.postgres.ports[5432] }}
+          RUNTIME_E2E_ADMIN_PORT: ${{ steps.postgres.outputs.port }}
           RUNTIME_E2E_ADMIN_USER: runtime_e2e_admin
           RUNTIME_E2E_ADMIN_PASSWORD: runtime_e2e_fixture_password
           RUNTIME_E2E_ADMIN_DATABASE: runtime_e2e_admin
         run: bash scripts/run-runtime-e2e.sh --reconnect
+
+      - name: Clean up the owned PostgreSQL fixture
+        if: always()
+        run: |
+          set -eu
+          if [[ -z "${RUNTIME_E2E_CONTAINER_FILE:-}" || ! -s "$RUNTIME_E2E_CONTAINER_FILE" ]]; then
+            exit 0
+          fi
+          container=$(cat "$RUNTIME_E2E_CONTAINER_FILE")
+          [[ "$container" =~ ^[0-9a-f]{64}$ ]]
+          expected="runtime-e2e-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          actual=$(docker inspect --format '{{ index .Config.Labels "plex-postgresql.run" }}' "$container")
+          kind=$(docker inspect --format '{{ index .Config.Labels "plex-postgresql.test" }}' "$container")
+          [[ "$actual" == "$expected" && "$kind" == runtime-e2e ]]
+          if [[ "${{ job.status }}" != success ]]; then
+            docker logs --tail 80 "$container" || true
+          fi
+          docker rm -fv "$container"
+          rm "$RUNTIME_E2E_CONTAINER_FILE"
