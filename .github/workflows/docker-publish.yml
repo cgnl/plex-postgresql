@@ -51,6 +51,25 @@ jobs:
           path: evidence/upstream-candidate.json
           if-no-files-found: error
 
+  media-fixtures:
+    name: Prepare pinned real media once
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - name: Fetch and verify immutable movie and TV fixtures
+        run: python3 scripts/prepare-media-fixtures.py media-fixture-cache
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinned-real-media
+          path: media-fixture-cache
+          compression-level: 0
+          if-no-files-found: error
+
   runtime-e2e:
     name: Require the real interpose runtime E2E driver
     needs: resolve
@@ -134,7 +153,7 @@ jobs:
 
   candidate:
     name: Probe ${{ matrix.variant }} / ${{ matrix.arch }} / PG${{ matrix.postgres }}
-    needs: resolve
+    needs: [resolve, media-fixtures]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy: &native_strategy
@@ -196,6 +215,10 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
+          name: pinned-real-media
+          path: media-fixture-cache
+      - uses: actions/download-artifact@v4
+        with:
           name: upstream-candidate
           path: evidence
       - uses: docker/setup-buildx-action@v3
@@ -238,6 +261,7 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.arch }}
           VARIANT: ${{ matrix.variant }}
           EVIDENCE_DIR: evidence/container
+          PLEX_E2E_MEDIA_CACHE_DIR: ${{ github.workspace }}/media-fixture-cache
           PLEX_E2E_RESTART_CYCLES: '100'
         run: bash scripts/plex-container-e2e.sh
       - name: Preserve candidate digest and build metadata
@@ -288,6 +312,10 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
+          name: pinned-real-media
+          path: media-fixture-cache
+      - uses: actions/download-artifact@v4
+        with:
           name: candidate-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
           path: prior-evidence
       - name: Require completed 100-cycle smoke on the exact source and digest
@@ -332,6 +360,7 @@ jobs:
           PLEX_E2E_RESTART_CYCLES: '1'
           PLEX_E2E_SOAK_SECONDS: '21000'
           EVIDENCE_DIR: evidence/soak
+          PLEX_E2E_MEDIA_CACHE_DIR: ${{ github.workspace }}/media-fixture-cache
         run: bash scripts/plex-container-e2e.sh
       - uses: actions/upload-artifact@v4
         if: always()
@@ -343,7 +372,7 @@ jobs:
   native-acceptance:
     name: Require complete native workload evidence
     if: always()
-    needs: [resolve, runtime-e2e, candidate, soak, native-bundle-install]
+    needs: [resolve, media-fixtures, runtime-e2e, candidate, soak, native-bundle-install]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every native matrix lane completed
@@ -353,12 +382,14 @@ jobs:
           CANDIDATES: ${{ needs.candidate.result }}
           SOAK: ${{ needs.soak.result }}
           BUNDLES: ${{ needs.native-bundle-install.result }}
+          MEDIA: ${{ needs.media-fixtures.result }}
         run: |
           test "$RESOLUTION" = success
           test "$RUNTIME" = success
           test "$CANDIDATES" = success
           test "$SOAK" = success
           test "$BUNDLES" = success
+          test "$MEDIA" = success
           echo 'PASS all declared native workload lanes. Image promotion remains a separate action.'
 
   native-bundle-install:
