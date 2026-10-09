@@ -257,6 +257,43 @@ for p in [Path('/config'),*Path('/config').rglob('*')]:
             result[table] = json.loads(rows)
         return result
 
+    def replay_source_rejected(self, container, volume, source_volume, before, hashes):
+        """Keep the one-time import mount a negative case, then detach it."""
+        self.owned("container", container)
+        self.command("restart", "--time", "30", container)
+        marker = "Remove the migration source mount to use an existing destination"
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            logs = subprocess.run(["docker", "logs", container], capture_output=True, text=True,
+                                  timeout=10)
+            require(logs.returncode == 0, "Cannot inspect source-mount replay refusal")
+            if marker in logs.stdout + logs.stderr:
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("Populated destination did not reject the replayed source mount")
+        self.command("stop", "--time", "30", container)
+        require(self.snapshot() == before, "Rejected source-mount replay changed PostgreSQL contents")
+        require(self.source_hashes(source_volume) == hashes, "Rejected replay mutated native source")
+        self.evidence["source_mount_replay_rejected"] = True
+        self.evidence["stages"]["source-mount-replay"] = {
+            "rejected": True, "reason": marker, "postgres_contents_preserved": True,
+            "source_hashes_preserved": True}
+        self.owned("container", container)
+        self.command("container", "rm", container)
+        # Migration is a one-time installation step. Normal startup must use
+        # the existing PostgreSQL database without the explicit source mount.
+        return self.start("imported", volume)
+
+    def search(self, stage, container, volume, key):
+        results = {}
+        for path in ("/search", "/hubs/search"):
+            response = self.api(container, volume, path, params={"query": "Big Buck Bunny"})
+            require(any(node.get("ratingKey") == key for node in response["nodes"]),
+                    stage + " Plex search failed: " + path)
+            results[path] = {"query": "Big Buck Bunny", "rating_key": key, "found": True}
+        self.evidence["stages"][stage]["search"] = results
+
     def run(self):
         require(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,90}", self.args.fixture), "Invalid fixture name")
         require(re.search(r"@sha256:[0-9a-f]{64}$", self.args.base_image), "Native base must be digest pinned")
@@ -323,13 +360,17 @@ for p in [Path('/config'),*Path('/config').rglob('*')]:
         self.playback("imported", imported, imported_volume, section)
         require(self.source_hashes(source_volume) == hashes, "Import mutated source SQLite or preferences")
         before = self.snapshot()
-        self.command("restart", "--time", "30", imported)
-        self.ready("imported-restart", imported, imported_volume)
+        imported = self.replay_source_rejected(imported, imported_volume, source_volume, before, hashes)
+        restart_identity = self.ready("imported-restart", imported, imported_volume)
+        require(restart_identity.get("machineIdentifier") == native_identity.get("machineIdentifier"),
+                "Post-import restart changed server identity")
         require(self.media_identity(imported, imported_volume, section) == original, "Restart changed imported media")
         require(self.snapshot() == before, "Restart changed imported database contents")
         require(self.source_hashes(source_volume) == hashes, "Restart mutated native source")
         self.evidence["source_preserved"] = True
         self.evidence["restart_preserved_contents"] = True
+        self.plugins("imported-restart", imported, imported_volume)
+        self.search("imported-restart", imported, imported_volume, key)
         self.command("stop", "--time", "30", imported)
         export_env = {"PGHOST": "postgres", "PGPORT": "5432", "PGUSER": self.pg_user,
                       "PGPASSWORD": self.pg_env["PLEX_PG_PASSWORD"], "PGDATABASE": self.database}
@@ -344,10 +385,7 @@ for p in [Path('/config'),*Path('/config').rglob('*')]:
         require(restored_identity.get("machineIdentifier") == native_identity.get("machineIdentifier"), "Restore changed server identity")
         require(self.media_identity(restored, restored_volume, section) == original, "Native restore changed media or watched state")
         self.plugins("restored", restored, restored_volume)
-        # Both legacy FTS-backed search and title search must find the restored item.
-        for path in ("/search", "/hubs/search"):
-            search = self.api(restored, restored_volume, path, params={"query": "Big Buck Bunny"})
-            require(any(node.get("ratingKey") == key for node in search["nodes"]), "Restored native search failed: " + path)
+        self.search("restored", restored, restored_volume, key)
         self.playback("restored", restored, restored_volume, section, sample=True)
         self.crashes(restored_volume)
         require(self.source_hashes(source_volume) == hashes, "Export/restore mutated original native source")

@@ -8,9 +8,9 @@ every historical Plex binary is supported, or that future Plex binaries will
 remain compatible. Closed GitHub issues are not automatically passing evidence.
 
 The 9 October 2026 GitHub snapshot contains 14 issues excluding pull requests:
-three open and eleven closed. Bodies and all available comments were reviewed.
+four open and ten closed after reopening #24. Bodies and all available comments were reviewed.
 Issue #10 contains seven independently verifiable subreports. Issue #24 was
-closed for perceived inactivity, #6 for missing feedback, and #8's closing
+previously closed for perceived inactivity and has now been reopened, #6 was closed for missing feedback, and #8's closing
 discussion does not establish a tested recovery fix.
 
 **Publication decision (9 October 2026): v1.3.21 is published as a regular release at the maintainer's explicit request, before completion of the native matrix/soak. Binary publication does not certify those unresolved runtime gates; Docker production promotion remains gated.**
@@ -46,7 +46,7 @@ prove identical causes.
 | [#17](https://github.com/cgnl/plex-postgresql/issues/17): native shim crash | Fresh and migrated startup, plugin initialization and preferences reads remain crash-free through repeated cycles on each native lane. | Real candidate still produces a startup crash report. |
 | [#22](https://github.com/cgnl/plex-postgresql/issues/22): STRM/zurg question | Controlled local HTTP/STRM fixture proves the supported scan/stream behavior, or documentation explicitly declares it unsupported. | Synthetic AVI evidence does not establish STRM or remote VPS support. |
 | [#23](https://github.com/cgnl/plex-postgresql/issues/23): PostgreSQL 18 question | PostgreSQL 18 migration plus the actual native workload matrix, not just translation tests. | Linux/musl PG 18 runtime E2E passes; native PG 18 matrix remains pending. |
-| [#24](https://github.com/cgnl/plex-postgresql/issues/24): bootstrap migration | Bootstrap Administrator/preferences rows do not suppress real import; genuine populated destinations are preserved; required shadow extensions are checked. | Migration/entrypoint E2E exists; full imported-library native acceptance remains. |
+| [#24](https://github.com/cgnl/plex-postgresql/issues/24): bootstrap migration | Bootstrap Administrator/preferences rows do not suppress real import; genuine populated destinations are preserved; required shadow extensions are checked. | The complete Administrator plus preferences seed-state regression and full imported-library native acceptance remain. #24 is reopened until all three reported failures have evidence. |
 | [#26](https://github.com/cgnl/plex-postgresql/issues/26): plugin preferences crash | Native reproduction and causal fix for its signature, with repeated standalone startup and valid NULL/BLOB/preferences behavior. | Do not declare this solved by the unrelated schema-delegation fix. |
 
 ### Issue #10 subreports

@@ -77,6 +77,11 @@ fn tls_key() -> Option<libc::pthread_key_t> {
         }
         let mut key: libc::pthread_key_t = 0;
         if libc::pthread_key_create(&mut key, Some(tls_destructor)) == 0 {
+            #[cfg(test)]
+            if tests::MAP_ZERO.load(std::sync::atomic::Ordering::Acquire) {
+                tests::REAL_KEY.store(key as usize, std::sync::atomic::Ordering::Release);
+                return Some(0);
+            }
             Some(key)
         } else {
             None
@@ -91,6 +96,10 @@ unsafe fn tls_state() -> *mut TlsState {
     let Some(key) = tls_key() else {
         return fallback_state();
     };
+    // Tests can expose logical key zero while libc retains its actual owned
+    // key. Production passes the key returned by pthread_key_create directly.
+    #[cfg(test)]
+    let key = tests::real_key(key);
     let ptr_val = libc::pthread_getspecific(key) as *mut TlsState;
     if !ptr_val.is_null() {
         return ptr_val;
@@ -145,11 +154,22 @@ pub(crate) fn tls_last_query_ptr() -> *mut *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
     pub(super) static FAILURE: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static MAP_ZERO: AtomicBool = AtomicBool::new(false);
+    pub(super) static REAL_KEY: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn real_key(key: libc::pthread_key_t) -> libc::pthread_key_t {
+        if MAP_ZERO.load(Ordering::Acquire) {
+            assert_eq!(key, 0);
+            REAL_KEY.load(Ordering::Acquire) as libc::pthread_key_t
+        } else {
+            key
+        }
+    }
     pub(super) static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
     pub(super) static DEALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -236,16 +256,24 @@ mod tests {
 
     fn isolated_case(mode: &str) {
         unsafe {
-            let mut reserved = 0;
-            assert_eq!(libc::pthread_key_create(&mut reserved, None), 0);
-            #[cfg(target_os = "linux")]
-            assert_eq!(
-                reserved, 0,
-                "fresh Linux process must exercise the first pthread key"
-            );
-            if mode != "nonzero" {
-                assert_eq!(libc::pthread_key_delete(reserved), 0);
+            // The runtime may own keys zero and one already. Reserve only
+            // our own keys, and never probe/delete a key we did not allocate.
+            let mut reserved = Vec::new();
+            if matches!(mode, "nonzero" | "preoccupied-zero") {
+                for _ in 0..2 {
+                    let mut key = 0;
+                    assert_eq!(libc::pthread_key_create(&mut key, None), 0);
+                    assert_eq!(
+                        libc::pthread_setspecific(key, c"reserved key sentinel".as_ptr().cast()),
+                        0
+                    );
+                    reserved.push(key);
+                }
             }
+            MAP_ZERO.store(
+                matches!(mode, "zero" | "preoccupied-zero"),
+                Ordering::Release,
+            );
             FAILURE.store(
                 match mode {
                     "key-failure" => 1,
@@ -260,13 +288,25 @@ mod tests {
                 assert!(key.is_none());
             } else {
                 assert!(key.is_some());
+                let actual = real_key(key.unwrap());
+                assert!(
+                    !reserved.contains(&actual),
+                    "TLS must use its own allocated key"
+                );
                 if mode == "nonzero" {
-                    assert_ne!(key.unwrap(), reserved);
+                    assert_ne!(actual, 0);
                 }
-                #[cfg(target_os = "linux")]
-                if mode == "zero" {
-                    assert_eq!(key, Some(0));
+                if MAP_ZERO.load(Ordering::Acquire) {
+                    assert_eq!(
+                        key,
+                        Some(0),
+                        "logical zero must reach the production validity check"
+                    );
                 }
+                eprintln!(
+                    "TLS case {mode}: logical key {:?}, actual allocated key {actual}",
+                    key
+                );
             }
             let main = tls_state();
             assert_eq!((*main).prepare_v2_depth, 0);
@@ -302,7 +342,7 @@ mod tests {
             );
             check(main, 100);
             match mode {
-                "zero" | "nonzero" => {
+                "zero" | "preoccupied-zero" | "nonzero" | "native-key" => {
                     assert_eq!(ALLOCATIONS.load(Ordering::Acquire), 9);
                     assert_eq!(
                         DEALLOCATIONS.load(Ordering::Acquire),
@@ -328,8 +368,12 @@ mod tests {
             FAILURE.store(0, Ordering::Release);
             check(main, 100);
             fork_surviving_thread(main);
-            if mode == "nonzero" {
-                assert_eq!(libc::pthread_key_delete(reserved), 0);
+            for key in reserved {
+                assert_eq!(
+                    libc::pthread_getspecific(key),
+                    c"reserved key sentinel".as_ptr().cast_mut().cast()
+                );
+                assert_eq!(libc::pthread_key_delete(key), 0);
             }
         }
     }
@@ -343,7 +387,9 @@ mod tests {
         }
         for mode in [
             "zero",
+            "preoccupied-zero",
             "nonzero",
+            "native-key",
             "key-failure",
             "allocation-failure",
             "registration-failure",
