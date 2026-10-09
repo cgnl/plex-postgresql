@@ -99,13 +99,14 @@ jobs:
           STAGE="macos-zip"
 
           rm -rf "$STAGE"
-          mkdir -p "$STAGE/scripts"
+          mkdir -p "$STAGE/scripts" "$STAGE/schema"
 
           cp release-assets/macos-arm64/db_interpose_pg-arm64.dylib "$STAGE/"
           cp release-assets/macos-arm64/db_interpose_pg.dylib "$STAGE/"
 
           cp README.md CHANGELOG.md INSTALL.md LICENSE THIRD_PARTY_LICENSES "$STAGE/"
           cp -R scripts/* "$STAGE/scripts/"
+          cp schema/*.sql "$STAGE/schema/"
 
           (cd "$STAGE" && zip -r "../$OUT" .)
           shasum -a 256 "$OUT" > "$OUT.sha256"

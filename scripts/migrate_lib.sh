@@ -266,26 +266,128 @@ if missing:
 PY
 }
 
-destination_has_data() {
-    local table tables count accounts
-    count=$(migration_psql -tA -c "SELECT (SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE n.nspname = '$PG_SCHEMA' AND NOT c.convalidated) + (SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '$PG_SCHEMA' AND t.tgenabled NOT IN ('O','A'));") || return 2
-    [[ "$count" == 0 ]] || { echo "ERROR: Destination has unvalidated constraints or disabled triggers" >&2; return 2; }
-    tables=$(migration_psql -tA -c "SELECT tablename FROM pg_tables WHERE schemaname = '$PG_SCHEMA' ORDER BY tablename;") || return 2
-    for table in $tables; do
-        case "$table" in
-            schema_migrations|sqlite_column_types|maintenance_control) continue ;;
-        esac
-        count=$(migration_psql -tA -c "SELECT count(*) FROM $PG_SCHEMA.\"${table//\"/\"\"}\";") || return 2
-        [[ "$count" =~ ^[0-9]+$ ]] || return 2
-        [[ "$count" -gt 0 ]] || continue
-        if [[ "$table" == accounts && "$count" == 1 ]]; then
-            accounts=$(migration_psql -tA -c "SELECT count(*) FROM $PG_SCHEMA.accounts a WHERE to_jsonb(a) = jsonb_build_object('id', 1, 'name', 'Administrator', 'created_at', 1289520473, 'updated_at', 1782210228, 'default_audio_language', '', 'default_subtitle_language', '', 'auto_select_subtitle', 1, 'auto_select_audio', 1) || (SELECT coalesce(jsonb_object_agg(key, value), '{}'::jsonb) FROM jsonb_each(to_jsonb(a)) WHERE key NOT IN ('id','name','created_at','updated_at','default_audio_language','default_subtitle_language','auto_select_subtitle','auto_select_audio') AND value = 'null'::jsonb);") || return 2
-            [[ "$accounts" == 1 ]] && continue
-        fi
-        echo "Existing or partial PostgreSQL data in $table ($count rows); refusing implicit replacement." >&2
-        return 0
+# Recognize literal repository-owned bootstrap rows, never arbitrary accounts
+# or a database inferred empty solely from its metadata_items count. Functions
+# exist only for the current psql connection and add no persistent schema DDL.
+bootstrap_seed_functions_sql() {
+    local seed_file candidate migration_dir
+    migration_dir="$(dirname "${BASH_SOURCE[0]}")"
+    seed_file="$migration_dir/../schema/seed_data.sql"
+    for candidate in "${SHIM_DIR:-$migration_dir}/seed_data.sql" "${SHIM_DIR:-$migration_dir}/schema/seed_data.sql" "$migration_dir/../schema/seed_data.sql" "$migration_dir/schema/seed_data.sql"; do
+        if [[ -f "$candidate" ]]; then seed_file="$candidate"; break; fi
     done
-    return 1
+    python3 - "$seed_file" <<'PY_SEEDS'
+import json
+import pathlib
+import re
+import sqlite3
+import sys
+import uuid
+
+path = pathlib.Path(sys.argv[1])
+manifest = {}
+# Older bundles without a seed definition fail conservatively for existing
+# rows, while genuinely empty destinations remain usable.
+if path.is_file():
+    pending = ''
+    connection = sqlite3.connect(':memory:')
+    for line in path.read_text().splitlines(keepends=True):
+        pending += line
+        if not sqlite3.complete_statement(pending):
+            continue
+        statement = re.sub(r'(?m)^\s*--[^\n]*', '', pending).strip()
+        pending = ''
+        if not statement:
+            continue
+        match = re.fullmatch(r'INSERT INTO plex\.([a-z_][a-z_0-9]*)\s*\(([^)]*)\)\s*VALUES\s*\((.*)\);', statement, re.DOTALL)
+        if not match:
+            if re.match(r'^SELECT setval\(', statement):
+                continue
+            raise RuntimeError('Unsupported repository bootstrap statement')
+        table, names, values = match.groups()
+        columns = [name.strip().strip('"') for name in names.split(',')]
+        if any(not re.fullmatch(r'[a-z_][a-z_0-9]*', name) for name in columns) or len(set(columns)) != len(columns):
+            raise RuntimeError('Unsupported repository bootstrap columns')
+        # Evaluate only the trusted literal VALUES expression in an isolated
+        # in-memory SQLite connection; never execute INSERTs or setval.
+        row = connection.execute('SELECT ' + values).fetchone()
+        if len(row) != len(columns):
+            raise RuntimeError('Repository bootstrap value/column mismatch')
+        manifest.setdefault(table, []).append(dict(zip(columns, row)))
+    if re.sub(r'(?m)^\s*--[^\n]*', '', pending).strip():
+        raise RuntimeError('Incomplete repository bootstrap statement')
+    connection.close()
+encoded = json.dumps(manifest, ensure_ascii=True, separators=(',', ':'))
+delimiter = '$seed_' + uuid.uuid4().hex + '$'
+print("""
+CREATE OR REPLACE FUNCTION pg_temp.plex_pg_is_bootstrap_row(target_table text, row_value jsonb)
+RETURNS boolean LANGUAGE sql STABLE AS $matcher$
+ SELECT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(coalesce((""" + delimiter + encoded + delimiter + """::jsonb)->target_table, '[]'::jsonb)) seed
+    WHERE row_value = seed.value ||
+      CASE WHEN target_table='tags' AND row_value ? 'search_vector'
+        THEN jsonb_build_object('search_vector', to_tsvector('simple', coalesce(seed.value->>'tag',''))::text)
+        ELSE '{}'::jsonb END ||
+      (SELECT coalesce(jsonb_object_agg(key,value), '{}'::jsonb)
+       FROM jsonb_each(row_value)
+       WHERE NOT seed.value ? key AND value='null'::jsonb
+         AND NOT (target_table='tags' AND key='search_vector'))
+ );
+$matcher$;
+CREATE OR REPLACE FUNCTION pg_temp.plex_pg_is_bootstrap_table(target_schema text, target_table text)
+RETURNS boolean LANGUAGE plpgsql VOLATILE AS $table_matcher$
+DECLARE matches boolean;
+BEGIN
+    -- Stop at the first real row instead of sorting every row in a large
+    -- existing library. Duplicate detection runs only for recognized seeds.
+    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.%I t WHERE NOT pg_temp.plex_pg_is_bootstrap_row($1,to_jsonb(t)))', target_schema,target_table)
+    INTO matches USING target_table;
+    IF matches THEN RETURN false; END IF;
+    EXECUTE format('SELECT NOT EXISTS(SELECT 1 FROM %I.%I t GROUP BY to_jsonb(t) HAVING count(*)>1)', target_schema,target_table)
+    INTO matches;
+    RETURN matches;
+END $table_matcher$;
+""")
+PY_SEEDS
+}
+
+destination_has_data() {
+    validate_migration_schema || return 2
+    local temporary result
+    temporary=$(mktemp "${TMPDIR:-/tmp}/plex-destination-check.XXXXXX") || return 2
+    if ! bootstrap_seed_functions_sql > "$temporary"; then
+        rm -f "$temporary"
+        return 2
+    fi
+    cat >> "$temporary" <<SQL
+CREATE OR REPLACE FUNCTION pg_temp.plex_pg_destination_has_data()
+RETURNS boolean LANGUAGE plpgsql AS \$check\$
+DECLARE item record;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='$PG_SCHEMA' AND NOT c.convalidated)
+       OR EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='$PG_SCHEMA' AND t.tgenabled NOT IN ('O','A')) THEN
+        RAISE EXCEPTION 'Destination has unvalidated constraints or disabled triggers';
+    END IF;
+    FOR item IN SELECT tablename FROM pg_tables WHERE schemaname='$PG_SCHEMA' ORDER BY tablename LOOP
+        IF item.tablename IN ('schema_migrations','sqlite_column_types','maintenance_control') THEN CONTINUE; END IF;
+        IF NOT pg_temp.plex_pg_is_bootstrap_table('$PG_SCHEMA',item.tablename) THEN
+            RAISE NOTICE 'Existing or partial PostgreSQL data in %; refusing implicit replacement', item.tablename;
+            RETURN true;
+        END IF;
+    END LOOP;
+    RETURN false;
+END \$check\$;
+SELECT pg_temp.plex_pg_destination_has_data();
+SQL
+    result=$(migration_psql -qAt -f "$temporary")
+    local status=$?
+    rm -f "$temporary"
+    [[ "$status" == 0 ]] || return 2
+    case "$result" in
+        t) return 0 ;;
+        f) return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 sequence_sync_sql() {
@@ -313,24 +415,23 @@ sequence_sync_sql() {
 }
 
 destination_guard_sql() {
+    bootstrap_seed_functions_sql || return 1
     printf '%s\n' "
         DO \$guard\$
-        DECLARE item record; row_count bigint; seed_count bigint;
+        DECLARE item record;
         BEGIN
             FOR item IN SELECT tablename FROM pg_tables WHERE schemaname = '$PG_SCHEMA' ORDER BY tablename LOOP
                 EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE', '$PG_SCHEMA', item.tablename);
             END LOOP;
+            IF EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='$PG_SCHEMA' AND NOT c.convalidated)
+               OR EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='$PG_SCHEMA' AND t.tgenabled NOT IN ('O','A')) THEN
+                RAISE EXCEPTION 'Destination has unvalidated constraints or disabled triggers';
+            END IF;
             FOR item IN SELECT tablename FROM pg_tables WHERE schemaname = '$PG_SCHEMA' ORDER BY tablename LOOP
                 IF item.tablename IN ('schema_migrations', 'sqlite_column_types', 'maintenance_control') THEN CONTINUE; END IF;
-                EXECUTE format('SELECT count(*) FROM %I.%I', '$PG_SCHEMA', item.tablename) INTO row_count;
-                IF row_count = 0 THEN CONTINUE; END IF;
-                IF item.tablename = 'accounts' AND row_count = 1 THEN
-                    SELECT count(*) INTO seed_count FROM $PG_SCHEMA.accounts a
-                    WHERE to_jsonb(a) = jsonb_build_object('id', 1, 'name', 'Administrator', 'created_at', 1289520473, 'updated_at', 1782210228, 'default_audio_language', '', 'default_subtitle_language', '', 'auto_select_subtitle', 1, 'auto_select_audio', 1) ||
-                        (SELECT coalesce(jsonb_object_agg(key, value), '{}'::jsonb) FROM jsonb_each(to_jsonb(a)) WHERE key NOT IN ('id','name','created_at','updated_at','default_audio_language','default_subtitle_language','auto_select_subtitle','auto_select_audio') AND value = 'null'::jsonb);
-                    IF seed_count = 1 THEN CONTINUE; END IF;
+                IF NOT pg_temp.plex_pg_is_bootstrap_table('$PG_SCHEMA',item.tablename) THEN
+                    RAISE EXCEPTION 'Destination changed or contains data: %', item.tablename;
                 END IF;
-                RAISE EXCEPTION 'Destination changed or contains data: %', item.tablename;
             END LOOP;
         END \$guard\$;
     "

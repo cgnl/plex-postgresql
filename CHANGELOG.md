@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Preserve the SQLite MATCH boundary before following AND/OR filters and retain grouping for tag ranking by `count(*)`, fixing both observed native `/hubs/search` HTTP 500 errors.
+- Recognize exact repository bootstrap rows, including Administrator and preferences, before migration; reject modified defaults and preserve existing library data under destination locks.
+- Isolate native thread/request state, retain bind-buffer ownership correctly, and validate the exact server UUID preference.
+- Preserve ordinary INSERT semantics, genuine unique constraints, atomic single-row REPLACE behavior and signed last-insert rowids.
+- Preserve Unicode, prepared FTS prefix terms and same-field phrase matching.
+- Import from private SQLite snapshots, retain source hashes and native Boolean-affinity values, and apply startup schema upgrades atomically.
+- Include migration helpers and trusted schema/seed files in Docker images and release bundles.
+
+
 ## [1.3.21] - 2026-10-09
 
 ### Fixed

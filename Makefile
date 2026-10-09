@@ -383,16 +383,18 @@ release-universal: $(RUST_TRANSLATOR_LIB)
 release: release-universal
 	@echo "Packaging macOS release..."
 	@cd $(RELEASE_DIR)/v$(VERSION) && \
-		mkdir -p scripts && \
+		mkdir -p scripts schema && \
 		cp ../../README.md ../../LICENSE ../../THIRD_PARTY_LICENSES ../../CHANGELOG.md ../../RELEASE_NOTES.md ../../INSTALL.md . 2>/dev/null || true && \
 		cp ../../scripts/install_wrappers.sh scripts/ && \
 		cp ../../scripts/install_wrappers_linux.sh scripts/ && \
 		cp ../../scripts/uninstall_wrappers.sh scripts/ && \
 		cp ../../scripts/uninstall_wrappers_linux.sh scripts/ && \
 		cp ../../scripts/migrate_sqlite_to_pg.sh scripts/ && \
+		cp ../../scripts/migrate_lib.sh ../../scripts/migrate_table.py ../../scripts/seed_shadow_table_from_pg.py scripts/ && \
+		cp ../../schema/*.sql schema/ && \
 		cp ../../scripts/docker-entrypoint.sh scripts/ && \
 		tar -czf ../plex-postgresql-v$(VERSION)-macos.tar.gz \
-			*.dylib README.md LICENSE THIRD_PARTY_LICENSES CHANGELOG.md RELEASE_NOTES.md INSTALL.md scripts/
+			*.dylib README.md LICENSE THIRD_PARTY_LICENSES CHANGELOG.md RELEASE_NOTES.md INSTALL.md scripts/ schema/
 	@echo "  ✓ $(RELEASE_DIR)/plex-postgresql-v$(VERSION)-macos.tar.gz"
 	@ls -lh $(RELEASE_DIR)/plex-postgresql-v$(VERSION)-macos.tar.gz
 
@@ -417,17 +419,19 @@ release-linux:
 	@echo "  ✓ linux-x86_64"
 	@# Package
 	@cd $(RELEASE_DIR)/v$(VERSION) && \
-		mkdir -p scripts && \
+		mkdir -p scripts schema && \
 		cp ../../README.md ../../LICENSE ../../THIRD_PARTY_LICENSES ../../CHANGELOG.md ../../RELEASE_NOTES.md ../../INSTALL.md . 2>/dev/null || true && \
 		cp ../../scripts/install_wrappers.sh scripts/ && \
 		cp ../../scripts/install_wrappers_linux.sh scripts/ && \
 		cp ../../scripts/uninstall_wrappers.sh scripts/ && \
 		cp ../../scripts/uninstall_wrappers_linux.sh scripts/ && \
 		cp ../../scripts/migrate_sqlite_to_pg.sh scripts/ && \
+		cp ../../scripts/migrate_lib.sh ../../scripts/migrate_table.py ../../scripts/seed_shadow_table_from_pg.py scripts/ && \
+		cp ../../schema/*.sql schema/ && \
 		cp ../../scripts/docker-entrypoint.sh scripts/ && \
 		tar -czf ../plex-postgresql-v$(VERSION)-linux.tar.gz \
 			db_interpose_pg-linux-*.so libpq.so.5 \
-			README.md LICENSE THIRD_PARTY_LICENSES CHANGELOG.md RELEASE_NOTES.md INSTALL.md scripts/
+			README.md LICENSE THIRD_PARTY_LICENSES CHANGELOG.md RELEASE_NOTES.md INSTALL.md scripts/ schema/
 	@echo "  ✓ $(RELEASE_DIR)/plex-postgresql-v$(VERSION)-linux.tar.gz"
 	@ls -lh $(RELEASE_DIR)/plex-postgresql-v$(VERSION)-linux.tar.gz
 

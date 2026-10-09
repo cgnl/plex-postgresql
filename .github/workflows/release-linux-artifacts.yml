@@ -105,7 +105,7 @@ jobs:
           OUT="plex-postgresql-${TAG}-linux.zip"
 
           rm -rf "$STAGE"
-          mkdir -p "$STAGE/scripts"
+          mkdir -p "$STAGE/scripts" "$STAGE/schema"
 
           cp release-assets/linux-x86_64/db_interpose_pg-linux-x86_64.so "$STAGE/"
           cp release-assets/linux-aarch64/db_interpose_pg-linux-aarch64.so "$STAGE/"
@@ -113,6 +113,7 @@ jobs:
 
           cp README.md CHANGELOG.md INSTALL.md LICENSE THIRD_PARTY_LICENSES "$STAGE/"
           cp -R scripts/* "$STAGE/scripts/"
+          cp schema/*.sql "$STAGE/schema/"
 
           (cd "$STAGE" && zip -r "../$OUT" .)
           shasum -a 256 "$OUT" > "$OUT.sha256"

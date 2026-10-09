@@ -98,6 +98,7 @@ COPY schema/sqlite_column_types.sql /usr/local/lib/plex-postgresql/
 COPY schema/pg_compat_functions.sql /usr/local/lib/plex-postgresql/
 COPY schema/sqlite_constraint_parity_upgrade.sql /usr/local/lib/plex-postgresql/
 COPY schema/fts_view_parity_upgrade.sql /usr/local/lib/plex-postgresql/
+COPY schema/seed_data.sql /usr/local/lib/plex-postgresql/
 COPY scripts/migrate_lib.sh /usr/local/lib/plex-postgresql/
 COPY scripts/migrate_table.py /usr/local/lib/plex-postgresql/
 COPY scripts/seed_shadow_table_from_pg.py /usr/local/lib/plex-postgresql/

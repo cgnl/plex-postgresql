@@ -10,6 +10,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
+import selectors
 from pathlib import Path
 import shutil
 import sqlite3
@@ -260,6 +262,10 @@ def exercise(image, native_image=None):
                 connection.executemany('INSERT INTO preference_boolean_test VALUES(?,?,?,?)', [(1,'t',1,None),(2,'f',0,1.0),(3,None,0,0.0)])
                 connection.execute('CREATE TABLE metadata_items(id INTEGER PRIMARY KEY, metadata_type INTEGER, title TEXT, guid TEXT, extra_data TEXT)')
                 connection.execute('INSERT INTO metadata_items VALUES(?,?,?,?,?)', (71, 1, title, guid, extra_data))
+                connection.execute('CREATE TABLE preferences(id INTEGER PRIMARY KEY,name TEXT,value TEXT)')
+                connection.execute("INSERT INTO preferences VALUES(2,'SyncedNeedsChangedAtUpdate','1')")
+                for table in ('activities','metadata_agent_providers','metadata_agent_provider_groups','metadata_agent_provider_group_items','plugin_prefixes','plugins'):
+                    connection.execute(f'CREATE TABLE {table}(id INTEGER PRIMARY KEY)')
                 connection.execute('CREATE TABLE devices(id INTEGER PRIMARY KEY, name TEXT)')
                 connection.execute('INSERT INTO devices VALUES(15192,?)', ('imported',))
                 for table in ('media_parts', 'media_items', 'metadata_item_settings', 'tags'):
@@ -273,6 +279,126 @@ def exercise(image, native_image=None):
                 connection.execute('PRAGMA journal_mode=WAL')
             hashes = [digest(source), digest(blob_source)]
             import_env = {'SQLITE_DB': str(source), 'LOG_DIR': str(temp / 'logs')}
+            seed_file = ROOT / 'schema/seed_data.sql'
+            shell('migration_psql -1 -q -f "$SEED_FILE"', extra={'SEED_FILE': str(seed_file)})
+            seeded_tables = ['accounts','activities','devices','metadata_agent_providers','metadata_agent_provider_groups',
+                             'metadata_agent_provider_group_items','plugin_prefixes','plugins','preferences','tags']
+            assert sql('SELECT count(*) FROM plex.schema_migrations') == '445'
+            assert sum(int(sql(f'SELECT count(*) FROM plex.{table}')) for table in seeded_tables) == 31
+            def seed_rows():
+                return sql(' '.join(f'SELECT row_to_json(t) FROM plex.{table} t ORDER BY id;' for table in seeded_tables))
+            def seed_structure():
+                return sql("SELECT conname||pg_get_constraintdef(oid) FROM pg_constraint WHERE connamespace='plex'::regnamespace ORDER BY conname; "
+                           "SELECT tgname||pg_get_triggerdef(t.oid) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='plex' ORDER BY c.relname,tgname;")
+            seed_before = seed_rows()
+            structure_before = seed_structure()
+            shell('destination_has_data; test "$?" = 1')
+            shell('destination_guard_sql | migration_psql -1 -q')
+            mutations = [
+                ("UPDATE plex.accounts SET name='custom administrator' WHERE id=1", "UPDATE plex.accounts SET name='Administrator' WHERE id=1"),
+                ("UPDATE plex.preferences SET value='1' WHERE id=2", "UPDATE plex.preferences SET value='0' WHERE id=2"),
+                ("UPDATE plex.plugins SET access_count=42 WHERE id=1", "UPDATE plex.plugins SET access_count=NULL WHERE id=1"),
+                ("UPDATE plex.plugin_prefixes SET prefs=0 WHERE id=3", "UPDATE plex.plugin_prefixes SET prefs=1 WHERE id=3"),
+                ("UPDATE plex.devices SET name='actual user device' WHERE id=1", "UPDATE plex.devices SET name='' WHERE id=1"),
+                ("UPDATE plex.activities SET subtitle='actual activity' WHERE id=1", "UPDATE plex.activities SET subtitle='' WHERE id=1"),
+                ("UPDATE plex.metadata_agent_providers SET online=0 WHERE id=1", "UPDATE plex.metadata_agent_providers SET online=1 WHERE id=1"),
+                ("UPDATE plex.metadata_agent_provider_groups SET title='custom title' WHERE id=1", "UPDATE plex.metadata_agent_provider_groups SET title='Plex Movie' WHERE id=1"),
+                ("UPDATE plex.metadata_agent_provider_group_items SET \"order\"=12 WHERE id=1", "UPDATE plex.metadata_agent_provider_group_items SET \"order\"=1000 WHERE id=1"),
+                ("UPDATE plex.tags SET extra_data='custom data' WHERE id=1", ""),
+            ]
+            tag_original = sql('SELECT extra_data FROM plex.tags WHERE id=1')
+            mutations[-1] = (mutations[-1][0], "UPDATE plex.tags SET extra_data='" + tag_original.replace("'", "''") + "' WHERE id=1")
+            for change, restore in mutations:
+                sql(change)
+                changed_before = seed_rows()
+                shell('destination_has_data; test "$?" = 0')
+                shell('destination_guard_sql | migration_psql -1 -q', ok=False)
+                shell('migrate_sqlite_to_pg', ok=False, extra=import_env)
+                assert changed_before == seed_rows()
+                assert structure_before == seed_structure()
+                assert hashes == [digest(source),digest(blob_source)]
+                sql(restore)
+                assert seed_before == seed_rows()
+            for insert, cleanup, table in (
+                ("INSERT INTO plex.accounts(id,name) VALUES(999,'real additional account')", 'DELETE FROM plex.accounts WHERE id=999', 'accounts'),
+                ("INSERT INTO plex.preferences(id,name,value) VALUES(999,'actual user preference','custom')", 'DELETE FROM plex.preferences WHERE id=999', 'preferences'),
+            ):
+                sql(insert)
+                changed_before = seed_rows()
+                shell('destination_has_data; test "$?" = 0')
+                shell('destination_guard_sql | migration_psql -1 -q', ok=False)
+                shell('migrate_sqlite_to_pg', ok=False, extra=import_env)
+                assert changed_before == seed_rows()
+                assert structure_before == seed_structure()
+                assert hashes == [digest(source),digest(blob_source)]
+                sql(cleanup)
+            sql("ALTER TABLE plex.tags DISABLE TRIGGER tags_search_update; UPDATE plex.tags SET search_vector=to_tsvector('simple','custom vector') WHERE id=1; ALTER TABLE plex.tags ENABLE TRIGGER tags_search_update;")
+            changed_before = seed_rows()
+            shell('destination_has_data; test "$?" = 0')
+            shell('destination_guard_sql | migration_psql -1 -q', ok=False)
+            assert changed_before == seed_rows()
+            sql('UPDATE plex.tags SET tag=tag WHERE id=1')
+            assert seed_before == seed_rows()
+            # Verify the activation guard sees a writer committed while it waits
+            # for its destination locks, rather than retaining a stale snapshot.
+            guard_file = temp / 'locked-bootstrap-guard.sql'
+            guard_file.write_text(shell('destination_guard_sql').stdout + '\nDELETE FROM plex.accounts;\n')
+            writer = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'], env=env, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            guard = None
+            try:
+                writer.stdin.write("BEGIN; LOCK TABLE plex.accounts IN ACCESS EXCLUSIVE MODE; UPDATE plex.preferences SET value='1' WHERE id=2;\n\\echo WRITER_READY\n")
+                writer.stdin.flush()
+                ready = selectors.DefaultSelector()
+                ready.register(writer.stdout,selectors.EVENT_READ)
+                assert ready.select(timeout=5), 'writer did not acquire bootstrap lock'
+                assert writer.stdout.readline().strip() == 'WRITER_READY'
+                ready.close()
+                guard = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1','-1','-f',str(guard_file)],
+                                         env=dict(env,PGAPPNAME='issue24-activation-guard'),stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                deadline = time.monotonic()+5
+                while sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='issue24-activation-guard' AND wait_event_type='Lock'") != '1':
+                    assert time.monotonic() < deadline, 'activation did not wait on writer lock'
+                    time.sleep(.02)
+                writer.stdin.write('COMMIT;\n\\q\n')
+                writer.stdin.flush()
+                writer.communicate(timeout=5)
+                _, errors = guard.communicate(timeout=5)
+                assert guard.returncode != 0 and 'Destination changed or contains data: preferences' in errors, errors
+                assert sql('SELECT count(*) FROM plex.accounts') == '1'
+                assert sql('SELECT value FROM plex.preferences WHERE id=2') == '1'
+            finally:
+                for process in (guard,writer):
+                    if process is not None and process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=5)
+            sql("UPDATE plex.preferences SET value='0' WHERE id=2")
+            assert seed_rows() == seed_before
+            checks.append('issue24 exact full31-row/10-table repository bootstrap accepted; changed field in each table rejects without changing rows/constraints/triggers/source hashes')
+            checks.append('issue24 locked activation catches concurrent writer commit and preserves its preference plus Administrator')
+            # Reproduce the report's exact account/preferences-only initialized
+            # destination and prove a complete source import, not only detection.
+            sql('CREATE DATABASE issue24_subset')
+            env.update(PGDATABASE='issue24_subset',PG_DATABASE='issue24_subset')
+            shell('load_pg_schema_file "$SHIM_DIR/../schema/plex_schema.sql" "$SHIM_DIR/../schema/sqlite_column_types.sql"')
+            sql('CREATE TABLE plex.preference_boolean_test(id INTEGER PRIMARY KEY,enabled BOOLEAN,active BOOLEAN,nullable BOOLEAN)')
+            subset = ''
+            pending = ''
+            for line in seed_file.read_text().splitlines(keepends=True):
+                pending += line
+                if sqlite3.complete_statement(pending):
+                    statement = re.sub(r'(?m)^\s*--[^\n]*','',pending).strip()
+                    pending = ''
+                    if re.match(r'^INSERT INTO plex\.(accounts|preferences)\b',statement):
+                        subset += statement + '\n'
+            sql(subset)
+            assert sql("SELECT (SELECT count(*) FROM plex.accounts)||','||(SELECT count(*) FROM plex.preferences)||','||(SELECT count(*) FROM plex.schema_migrations)") == '1,1,445'
+            shell('check_and_migrate', extra=import_env)
+            assert sql('SELECT count(*) FROM plex.metadata_items') == '1'
+            assert sql('SELECT value FROM plex.preferences WHERE id=2') == '1'
+            assert hashes == [digest(source),digest(blob_source)]
+            env.update(PGDATABASE='postgres',PG_DATABASE='postgres')
+            checks.append('issue24 accounts1/preferences1/schema_migrations445 subset imports successfully on actual full PG schema and keeps source hashes')
             shell('check_and_migrate', extra=import_env)
             assert hashes == [digest(source), digest(blob_source)]
             values = json.loads(sql('SELECT json_build_array(title,guid,extra_data) FROM plex.metadata_items WHERE id=71'))
@@ -309,7 +435,7 @@ def exercise(image, native_image=None):
             assert database_before == sql('SELECT row_to_json(t) FROM plex.metadata_items t ORDER BY id')
             assert hashes == [digest(source), digest(blob_source)]
             checks.append('full import: >255/8KB Unicode text, JSON, blobs, exact immutable source hashes, imported sequence, populated destination preservation')
-            sql('TRUNCATE plex.metadata_items, plex.devices, plex.blobs, plex.accounts, plex.preference_boolean_test')
+            sql('TRUNCATE plex.metadata_items, plex.devices, plex.blobs, plex.accounts, plex.preferences, plex.preference_boolean_test')
             for table, field, invalid_value in (('accounts','auto_select_subtitle','arbitrary text'),
                                                 ('accounts','auto_select_audio',.5),
                                                 ('preference_boolean_test','active',2),

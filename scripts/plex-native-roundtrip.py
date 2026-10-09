@@ -23,13 +23,16 @@ LIBRARY = "com.plexapp.plugins.library.db"
 BLOBS = "com.plexapp.plugins.library.blobs.db"
 MEDIA = "/config/runtime-fixture-media/Big Buck Bunny (2008).m4v"
 API_CODE = '''
-import json, sys, urllib.request, urllib.parse, xml.etree.ElementTree as ET
+import json, sys, urllib.request, urllib.parse, urllib.error, xml.etree.ElementTree as ET
 path, method, params = sys.argv[1:4]
 params = json.loads(params)
 url = "http://127.0.0.1:32400" + path
 if params: url += "?" + urllib.parse.urlencode(params)
-with urllib.request.urlopen(urllib.request.Request(url, method=method), timeout=60) as response:
-    body = response.read(8*1024*1024+1)
+try:
+    with urllib.request.urlopen(urllib.request.Request(url, method=method), timeout=60) as response:
+        body = response.read(8*1024*1024+1)
+except urllib.error.HTTPError as error:
+    raise RuntimeError("Plex API " + method + " " + path + " returned HTTP " + str(error.code)) from None
 if len(body) > 8*1024*1024: raise RuntimeError("Oversized Plex API response")
 root = ET.fromstring(body) if body.strip() else None
 print(json.dumps({"root": dict(root.attrib) if root is not None else {},
@@ -59,9 +62,32 @@ class Roundtrip:
     def command(self, *args, input=None, timeout=300):
         result = subprocess.run(["docker", *map(str, args)], input=input,
                                 text=True, capture_output=True, timeout=timeout)
-        # Docker run arguments contain fixture passwords. Never echo commands.
-        require(result.returncode == 0, "Docker operation failed: " + str(args[0]))
+        # Keep arguments private, but retain bounded diagnostics from the child
+        # so an HTTP failure is distinguishable from Docker or Python errors.
+        if result.returncode != 0:
+            diagnostic = result.stderr
+            secrets = [getattr(self, "pg_env", {}).get("PLEX_PG_PASSWORD", "")]
+            for arg in args:
+                text = str(arg)
+                if text.startswith(("PLEX_PG_PASSWORD=", "PGPASSWORD=")):
+                    secrets.append(text.split("=", 1)[1])
+            diagnostic = self.sanitize_diagnostic(diagnostic, secrets, limit=4096)
+            failure = {"operation": str(args[0]), "returncode": result.returncode,
+                       "stderr": diagnostic}
+            failures = self.evidence.setdefault("command_failures", [])
+            failures.append(failure)
+            del failures[:-10]
+            raise RuntimeError("Docker operation failed: " + str(args[0]) + " (exit "
+                               + str(result.returncode) + "): " + (diagnostic or "no stderr"))
         return result.stdout
+
+    def sanitize_diagnostic(self, text, secrets=(), limit=65536):
+        for secret in [getattr(self, "pg_env", {}).get("PLEX_PG_PASSWORD", ""), *secrets]:
+            if secret:
+                text = text.replace(secret, "[redacted-fixture-password]")
+        text = re.sub(r"(?i)((?:x-plex-token|plexonlinetoken|access_token)[=:\s]+[\"']?)[^\s&\"'<>]+",
+                      r"\1[redacted-token]", text)
+        return text[-limit:].strip()
 
     def inspect(self, kind, name):
         return json.loads(self.command(kind, "inspect", name))[0]
@@ -344,6 +370,9 @@ for p in [Path('/config'),*Path('/config').rglob('*')]:
         self.api(source, source_volume, "/:/scrobble", params={"key": key, "identifier": "com.plexapp.plugins.library"})
         original = self.media_identity(source, source_volume, section)
         self.evidence["source_media_identity"] = original
+        # Run exactly the same routes and parameters on unmodified native Plex
+        # to distinguish an endpoint contract change from a PostgreSQL failure.
+        self.search("source", source, source_volume, key)
         self.crashes(source_volume)
         self.command("stop", "--time", "30", source)
         hashes = self.source_hashes(source_volume)
@@ -398,21 +427,43 @@ for p in [Path('/config'),*Path('/config').rglob('*')]:
         # destroying disposable resources. Commands can contain fixture secrets.
         diagnostics = self.args.evidence_dir / "diagnostics"
         diagnostics.mkdir(exist_ok=True)
-        password = getattr(self, "pg_env", {}).get("PLEX_PG_PASSWORD", "")
-        for name in self.containers:
+        for name in dict.fromkeys(self.containers):
             probe = subprocess.run(["docker", "container", "inspect", name], capture_output=True)
             if probe.returncode != 0:
                 continue
             try:
                 info = self.owned("container", name)
                 (diagnostics / (name + "-state.json")).write_text(json.dumps(info["State"], indent=2))
-                logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
-                text = logs.stdout + logs.stderr
-                if password:
-                    text = text.replace(password, "[redacted-fixture-password]")
-                (diagnostics / (name + ".log")).write_text(text)
+                logs = subprocess.run(["docker", "logs", "--tail", "500", name],
+                                      capture_output=True, text=True, timeout=30)
+                (diagnostics / (name + ".log")).write_text(
+                    self.sanitize_diagnostic(logs.stdout + logs.stderr))
+                volume = name + "-config"
+                if not self.evidence["passed"] and volume in self.volumes:
+                    self.owned("volume", volume)
+                    native_log = self.helper(volume, "-c", '''
+from pathlib import Path
+log=Path('/config/Library/Application Support/Plex Media Server/Logs/Plex Media Server.log')
+if log.is_file():
+    with log.open('rb') as source:
+        source.seek(max(0,log.stat().st_size-65536))
+        print(source.read(65536).decode(errors='replace'))
+else:
+    print('Native Plex Media Server.log is absent')
+''', timeout=30)
+                    (diagnostics / (name + "-native-pms.log")).write_text(
+                        self.sanitize_diagnostic(native_log))
             except (RuntimeError, OSError, subprocess.SubprocessError):
                 errors.append("diagnostics:" + name)
+        if not self.evidence["passed"] and self.database_created:
+            try:
+                self.owned("container", self.args.postgres)
+                pg_logs = subprocess.run(["docker", "logs", "--tail", "200", self.args.postgres],
+                                         capture_output=True, text=True, timeout=30)
+                (diagnostics / "postgres.log").write_text(
+                    self.sanitize_diagnostic(pg_logs.stdout + pg_logs.stderr))
+            except (RuntimeError, OSError, subprocess.SubprocessError):
+                errors.append("diagnostics:postgres")
         for kind, names in (("container", self.containers), ("volume", self.volumes), ("network", self.networks)):
             for name in reversed(names):
                 try:
