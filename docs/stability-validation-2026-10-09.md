@@ -308,6 +308,52 @@ Repository-wide `cargo fmt --check` reports existing formatting differences
 outside this continuation's driver edit. The edited driver passes its direct
 `rustfmt --check`; unrelated formatting was not changed.
 
+### FTS startup fixes and real movie/TV acceptance
+
+The next remote matrix on `d5ed103`,
+`https://github.com/cgnl/plex-postgresql/actions/runs/37933684483`, passed build
+and shared-shim runtime checks but failed fresh Plex startup. Plex's SQLite FTS
+rebuild attempted to write missing `title_sort` columns through PostgreSQL FTS
+views. Those views expose source metadata: allowing their DELETE/INSERT rebuilds
+would corrupt library rows. Logical FTS maintenance is now a no-op; searches and
+ordinary metadata writes remain on PostgreSQL. Skipped spellfix statements use
+dummy shadow prepares, and temporary tokenizer cleanup stays on SQLite.
+
+The updated Rust suite passed **1,050 tests** (two existing ignored tests),
+Clippy passed, and the real shared-shim runner passed all **15 requested cases**,
+including reconnect and the new FTS data-preservation regression.
+
+The local native PlexInc/arm64/PG18 acceptance run completed in
+`/tmp/plex-real-library-native-4/result.json`, using Plex
+`1.43.4.10903-e5521bd8c` and candidate image ID
+`sha256:753f4b6f8104ded5e9691b9ff65320a095cb6993d381957c6e2d3b1392c25d83`.
+It verifies:
+
+- Real Big Buck Bunny movie and The Beverly Hillbillies S01E01/S01E02 TV scans,
+  with PostgreSQL show/season/episode hierarchy and no TV parts in shadow SQLite.
+- Full byte-identical Plex HTTP delivery, exact byte-range seeks and complete
+  H.264/AAC decoding: 14,316 movie frames, 35,787 episode-1 frames and 35,832
+  episode-2 frames, with successful decoder exits and end-of-stream progress.
+- All three complete audio/video checks again after live PostgreSQL recovery,
+  without a PMS restart. Twenty-second HTTP sample decodes also passed offline.
+- One container restart, watched/unwatched persistence, artwork, four concurrent
+  short-fixture readers, and a requested 10-second soak (11 seconds measured).
+- Startup refusal while PostgreSQL was unavailable, followed by fresh recovery.
+
+The host verifies pinned fixture SHA256s; the container bootstraps official
+build-matched H.264/AAC codecs with official SHA256 verification before removing
+its temporary outbound network. Provenance and decoder logs are preserved.
+No source media is committed or uploaded in evidence artifacts.
+
+This local run intentionally exits `1` at
+`workload-smoke-complete-certification-incomplete`, with both
+`real_movie_and_tv_playback_verified` and `real_media_full_decode_verified` true
+and `promotion_allowed` false. It proves neither 100 restarts nor a 5h50 soak.
+The final eight-lane remote matrix must still run. The soak prerequisite now
+requires full real-media evidence from its exact prior candidate; soak setup,
+recovery and iterations use short HTTP samples to preserve the six-hour budget.
+Browser playback and server-side transcoding remain unverified.
+
 ## Release decision and limits
 
 **Release/promotion remains blocked.** Both native results explicitly require
