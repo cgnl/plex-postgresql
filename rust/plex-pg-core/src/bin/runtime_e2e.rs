@@ -356,7 +356,29 @@ fn run() -> Result<()> {
         &'static str,
         fn(&Api, &Db<'_>, &Db<'_>, &mut Client) -> Result<()>,
     );
-    let cases: [Case; 12] = [
+    let cases: [Case; 13] = [
+        ("sqlite_fts_internals", |_, first, _, observer| {
+            first.exec("CREATE VIRTUAL TABLE fts4_metadata_titles USING fts4(title)")?;
+            require(
+                first.scalar("SELECT COUNT(*) FROM 'main'.'fts4_metadata_titles_content'")? == 0,
+                "unexpected SQLite FTS content rows",
+            )?;
+            require(
+                observer
+                    .query_one(
+                        "SELECT to_regclass('runtime_e2e.fts4_metadata_titles_content') IS NULL",
+                        &[],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .get::<_, bool>(0),
+                "SQLite FTS backing table leaked to PostgreSQL",
+            )?;
+            observer.batch_execute("CREATE TABLE runtime_e2e.fts4_metadata_titles (id BIGINT); INSERT INTO runtime_e2e.fts4_metadata_titles VALUES (123)").map_err(|error| error.to_string())?;
+            require(
+                first.scalar("SELECT id FROM fts4_metadata_titles")? == 123,
+                "logical library FTS query incorrectly bypassed PostgreSQL",
+            )
+        }),
         ("sqlite_rtree_internals", |_, first, _, observer| {
             first.exec("CREATE VIRTUAL TABLE locations USING rtree(id, lat_min, lat_max, lon_min, lon_max)")?;
             require(

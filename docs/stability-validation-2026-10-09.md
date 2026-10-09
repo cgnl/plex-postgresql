@@ -286,6 +286,24 @@ Windows Docker Desktop itself. CLI checks of the soak prerequisite program accep
 complete fixture evidence and reject insufficient cycle counts, missing live
 recovery and architecture mismatch; those contract fixtures are not native runs.
 
+### First GitHub matrix and corrections
+
+The first remote run on `5573fc1`,
+`https://github.com/cgnl/plex-postgresql/actions/runs/37928322012`, failed its
+preconditions and did not start any 5h50 soak. Both GNU/Linux runtime jobs tried
+to link the bundled-SQLite compatibility harness with interpose exports because
+the Makefile static-library recipe built all binaries. The recipe now explicitly
+builds only `--lib --features interpose`.
+
+All eight native artifacts failed at fresh startup before completing any restart
+cycle. Their logs identify internal SQLite FTS `_content` DDL incorrectly routed
+to PostgreSQL. Backing tables with FTS3/FTS4 prefixes and engine suffixes now stay
+on SQLite/the invoking thread; logical FTS base views still use PostgreSQL.
+A new real-shim FTS E2E case verifies both sides of that boundary. The corrected
+macOS run passed all 14 requested cases (`/tmp/plex-ci-fts-macos.log`), and Clippy
+passed (`/tmp/plex-ci-fts-clippy.log`). Native remote results require a rerun;
+these local checks do not convert the failed first matrix into passing evidence.
+
 Repository-wide `cargo fmt --check` reports existing formatting differences
 outside this continuation's driver edit. The edited driver passes its direct
 `rustfmt --check`; unrelated formatting was not changed.

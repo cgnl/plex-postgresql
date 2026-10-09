@@ -55,6 +55,20 @@ pub(crate) fn should_redirect_str(filename: &str, passthrough: bool) -> bool {
 /// These statements configure SQLite's internal runtime (tokenizers, collations,
 /// extensions) and are invisible to PG. The shim should not register a PgStmt
 /// for them — prepare and step go directly through the real SQLite.
+pub(crate) fn is_sqlite_fts_internal_sql(sql: &str) -> bool {
+    sql.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|name| {
+            let prefix = name.get(..5).unwrap_or("");
+            (prefix.eq_ignore_ascii_case("fts3_") || prefix.eq_ignore_ascii_case("fts4_"))
+                && ["_content", "_segments", "_segdir", "_docsize", "_stat"]
+                    .iter()
+                    .any(|suffix| {
+                        name.get(name.len().saturating_sub(suffix.len())..)
+                            .is_some_and(|ending| ending.eq_ignore_ascii_case(suffix))
+                    })
+        })
+}
+
 pub(crate) fn is_sqlite_passthrough_str(sql: &str) -> bool {
     if crate::pg_client::transaction::is_transaction_sql(sql) {
         return false;
@@ -82,6 +96,7 @@ pub(crate) fn is_sqlite_passthrough_str(sql: &str) -> bool {
     lower.starts_with("icu_load_collation")
         || lower.starts_with("create virtual table ")
         || sqlite_fts_ddl
+        || is_sqlite_fts_internal_sql(sql)
         || lower.starts_with("fts3_tokenizer")
         || lower.starts_with("select load_extension")
         || lower.starts_with("select fts3_tokenizer")

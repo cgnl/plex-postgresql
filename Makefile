@@ -72,7 +72,7 @@ ffi-header-check:
 
 # Build Rust plex-pg-core static library
 $(RUST_TRANSLATOR_LIB):
-	cd $(RUST_TRANSLATOR_DIR) && cargo build --release --features interpose
+	cd $(RUST_TRANSLATOR_DIR) && cargo build --release --lib --features interpose
 
 # Build the shim library (auto-detect platform) - uses modular approach
 $(TARGET): $(RUST_TRANSLATOR_LIB)

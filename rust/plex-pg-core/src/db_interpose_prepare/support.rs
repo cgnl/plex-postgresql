@@ -55,6 +55,10 @@ pub(super) fn should_bypass_worker_delegation(sql: *const c_char) -> bool {
         || contains_icase_ptr(sql, "locations_node")
         || contains_icase_ptr(sql, "locations_parent")
         || contains_icase_ptr(sql, "locations_rowid")
+        || (!sql.is_null()
+            && crate::pg_config::is_sqlite_fts_internal_sql(
+                unsafe { CStr::from_ptr(sql) }.to_str().unwrap_or(""),
+            ))
 }
 
 pub(super) fn detect_query_loop(sql: *const c_char) -> bool {
