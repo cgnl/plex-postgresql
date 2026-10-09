@@ -738,6 +738,7 @@ fn run() -> Result<()> {
         ("prepared_fts_search", |api, first, _, _| {
             for sql in [
                 "SELECT rowid FROM fts4_metadata_titles_icu WHERE title_sort MATCH ?",
+                "SELECT rowid FROM fts4_metadata_titles_icu WHERE title_sort MATCH ? AND rowid=456",
                 "SELECT rowid FROM fts4_metadata_titles_icu WHERE fts4_metadata_titles_icu MATCH ?",
             ] {
                 let stmt = first.prepare(sql)?;
@@ -759,7 +760,10 @@ fn run() -> Result<()> {
                     "prepared FTS prefix lost source match",
                 )?;
             }
-            Ok(())
+            require(
+                first.scalar("SELECT rowid FROM fts4_metadata_titles_icu WHERE title_sort MATCH 'Keep*' AND rowid=456")? == 456,
+                "literal FTS prefix swallowed trailing filter",
+            )
         }),
         ("sqlite_fts_internals", |_, first, _, observer| {
             first.exec("CREATE VIRTUAL TABLE fts4_metadata_titles USING fts4(title)")?;

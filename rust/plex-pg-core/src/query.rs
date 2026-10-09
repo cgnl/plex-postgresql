@@ -715,7 +715,7 @@ fn is_distinct_incompatible_expr(expr: &Expr) -> bool {
     }
 }
 
-fn is_aggregate_expr(expr: &Expr) -> bool {
+pub(crate) fn is_aggregate_expr(expr: &Expr) -> bool {
     const AGGREGATES: &[&str] = &[
         "count",
         "sum",
@@ -1271,6 +1271,23 @@ fn fix_int_text_mismatch(mut left: Expr, op: BinaryOperator, mut right: Expr) ->
 /// For the four known Plex FTS views, use their combined title_fts vector instead
 /// of passing a PostgreSQL composite record to to_tsvector.
 fn transform_fts_match(left: Expr, right: Expr) -> Expr {
+    // sqlparser's SQLite MATCH handler parses its RHS with parse_expr(),
+    // consuming following AND/OR predicates. SQLite binds MATCH above both.
+    // Restore that boundary before converting the term; explicit nesting stays intact.
+    if let Expr::BinaryOp {
+        left: term,
+        op: op @ (BinaryOperator::And | BinaryOperator::Or),
+        right: mut predicate,
+    } = right
+    {
+        transform_expr(&mut predicate);
+        return Expr::BinaryOp {
+            left: Box::new(transform_fts_match(left, *term)),
+            op,
+            right: predicate,
+        };
+    }
+
     // Build: to_tsvector('simple', col)
     let make_fn = |fn_name: &str, col: Expr| -> Expr {
         Expr::Function(Function {
