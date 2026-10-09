@@ -95,6 +95,10 @@ pub(crate) fn is_sqlite_passthrough_str(sql: &str) -> bool {
     });
     lower.starts_with("icu_load_collation")
         || lower.starts_with("create virtual table ")
+        // Plex's temporary FTS tokenizer is created on SQLite above, so its
+        // cleanup must use the same engine rather than PG's nonexistent temp schema.
+        || matches!(lower.trim_end_matches(';').trim_end(),
+            "drop table temp.tokenizer" | "drop table if exists temp.tokenizer")
         || sqlite_fts_ddl
         || is_sqlite_fts_internal_sql(sql)
         || lower.starts_with("fts3_tokenizer")
@@ -129,6 +133,31 @@ pub(crate) fn should_skip_sql_str(sql: &str) -> bool {
     }
 
     let lower = trimmed.to_lowercase();
+
+    // FTS indexes are views over metadata in PG. Plex's SQLite index rebuilds
+    // must never DELETE/UPDATE their source rows or INSERT duplicate metadata.
+    static FTS_WRITE: OnceLock<regex::Regex> = OnceLock::new();
+    let fts_write = FTS_WRITE.get_or_init(|| {
+        regex::Regex::new(
+            r#"^(?:insert(?:\s+or\s+(?:replace|ignore|abort|fail|rollback))?\s+into|replace\s+into|delete\s+from|update(?:\s+or\s+(?:replace|ignore|abort|fail|rollback))?)\s+([a-z0-9_.\"`\[\]]+)"#,
+        ).expect("valid FTS maintenance pattern")
+    });
+    if let Some(target) = fts_write.captures(&lower) {
+        let table = target[1]
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .trim_matches(['"', '`', '[', ']']);
+        if matches!(
+            table,
+            "fts4_metadata_titles"
+                | "fts4_metadata_titles_icu"
+                | "fts4_tag_titles"
+                | "fts4_tag_titles_icu"
+        ) {
+            return true;
+        }
+    }
 
     // A) PREFIX patterns (case-insensitive, after stripping leading whitespace)
     const PREFIX_PATTERNS: &[&str] = &[
@@ -569,6 +598,30 @@ mod tests {
     }
 
     // ── should_skip_sql ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fts_index_maintenance_does_not_write_through_metadata_views() {
+        for sql in [
+            "DELETE FROM fts4_metadata_titles_icu",
+            "INSERT INTO fts4_metadata_titles_icu (rowid, title, title_sort, original_title) SELECT id, title, title_sort, original_title FROM metadata_items",
+            "/* rebuild */ INSERT OR REPLACE INTO main.\"fts4_tag_titles_icu\" (docid, tag) VALUES (?, ?)",
+            "UPDATE fts4_metadata_titles SET title = ? WHERE rowid = ?",
+            "REPLACE INTO fts4_tag_titles (docid, tag) VALUES (?, ?)",
+        ] {
+            assert!(should_skip_sql_str(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT rowid FROM fts4_metadata_titles_icu WHERE title MATCH 'test'",
+            "DELETE FROM metadata_items WHERE id IN (SELECT rowid FROM fts4_metadata_titles)",
+            "INSERT INTO metadata_items (title) VALUES ('fts4_metadata_titles')",
+            "DELETE FROM fts4_metadata_titles_archive",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+        ] {
+            assert!(!should_skip_sql_str(sql), "{sql}");
+        }
+    }
 
     #[test]
     fn skip_null_returns_false() {

@@ -356,7 +356,44 @@ fn run() -> Result<()> {
         &'static str,
         fn(&Api, &Db<'_>, &Db<'_>, &mut Client) -> Result<()>,
     );
-    let cases: [Case; 13] = [
+    let cases: [Case; 14] = [
+        ("fts_rebuild_preserves_metadata", |_, first, _, observer| {
+            first.exec("CREATE VIRTUAL TABLE temp.tokenizer USING fts4(title)")?;
+            first.exec("DROP TABLE temp.tokenizer")?;
+            // spellfix1 is unavailable in the shadow SQLite. Skipped index
+            // maintenance must prepare successfully without a real table.
+            first.exec("DELETE FROM spellfix_metadata_titles")?;
+            first.exec("INSERT INTO spellfix_metadata_titles (word) VALUES ('Keep')")?;
+            observer.batch_execute("CREATE TABLE runtime_e2e.metadata_items (id BIGINT PRIMARY KEY, title TEXT, title_sort TEXT, original_title TEXT); INSERT INTO runtime_e2e.metadata_items VALUES (456, 'Keep me', 'Keep me', 'Original'); CREATE VIEW runtime_e2e.fts4_metadata_titles_icu AS SELECT id AS rowid, title FROM runtime_e2e.metadata_items").map_err(|error| error.to_string())?;
+            first.exec("BEGIN")?;
+            first.exec("DELETE FROM fts4_metadata_titles_icu")?;
+            first.exec("INSERT INTO fts4_metadata_titles_icu (rowid, title, title_sort, original_title) SELECT id, title, title_sort, original_title FROM metadata_items")?;
+            first.exec("COMMIT")?;
+            first.exec_abi("DELETE FROM fts4_metadata_titles_icu")?;
+            first.exec_abi("INSERT INTO fts4_metadata_titles_icu (rowid, title, title_sort, original_title) SELECT id, title, title_sort, original_title FROM metadata_items")?;
+            require(
+                first.scalar("SELECT rowid FROM fts4_metadata_titles_icu")? == 456,
+                "FTS rebuild deleted or duplicated source metadata",
+            )?;
+            require(
+                first.scalar(
+                    "SELECT rowid FROM fts4_metadata_titles_icu WHERE title MATCH 'Keep'",
+                )? == 456,
+                "FTS search must still read PostgreSQL metadata after rebuild",
+            )?;
+            first.exec("UPDATE metadata_items SET title='Updated' WHERE id=456")?;
+            require(
+                observer
+                    .query_one(
+                        "SELECT title FROM runtime_e2e.metadata_items WHERE id=456",
+                        &[],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .get::<_, String>(0)
+                    == "Updated",
+                "normal metadata writes must still reach PostgreSQL",
+            )
+        }),
         ("sqlite_fts_internals", |_, first, _, observer| {
             first.exec("CREATE VIRTUAL TABLE fts4_metadata_titles USING fts4(title)")?;
             require(

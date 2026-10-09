@@ -56,12 +56,13 @@ fn should_route_via_pg(pg_conn: *mut PgConnection, is_read: bool, is_write: bool
 
 pub(super) unsafe fn should_use_dummy_shadow(
     pg_conn: *mut PgConnection,
-    z_sql: *const c_char,
+    _z_sql: *const c_char,
     is_read: bool,
     is_write: bool,
 ) -> bool {
+    // No-op index maintenance must not validate missing virtual tables in
+    // shadow SQLite. Registration marks these statements is_pg=3 below.
     should_route_via_pg(pg_conn, is_read, is_write)
-        && crate::pg_config::pg_config_should_skip_sql(z_sql) == 0
 }
 
 unsafe fn translated_sql_for_pg_stmt(
