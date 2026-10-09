@@ -120,7 +120,7 @@ fn value_double_from_number_parses() -> Result<()> {
     assert_eq!(step_rc, ffi::SQLITE_ROW);
     let val = unsafe { ffi::sqlite3_column_value(stmt, 0) };
     let d = unsafe { ffi::sqlite3_value_double(val) };
-    assert!(d > 3.14 && d < 3.15);
+    assert!((d - std::f64::consts::PI).abs() < 0.00001);
     unsafe { ffi::sqlite3_finalize(stmt) };
     Ok(())
 }

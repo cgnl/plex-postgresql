@@ -15,10 +15,7 @@ fn connect() -> Option<Client> {
         }
     }
 
-    match cfg.connect(NoTls) {
-        Ok(client) => Some(client),
-        Err(_) => None,
-    }
+    cfg.connect(NoTls).ok()
 }
 
 fn bench_libpq(c: &mut Criterion) {

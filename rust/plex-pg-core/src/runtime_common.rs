@@ -98,7 +98,10 @@ thread_local! {
     static IN_EXCEPTION_HANDLER: UnsafeCell<c_int> = UnsafeCell::new(0);
 }
 
-#[cfg_attr(all(target_os = "linux", not(feature = "exception-hook")), allow(dead_code))]
+#[cfg_attr(
+    all(target_os = "linux", not(feature = "exception-hook")),
+    allow(dead_code)
+)]
 pub(crate) fn handle_exception_with_tls(
     thrown_exception: *mut c_void,
     tinfo: *mut c_void,

@@ -108,8 +108,10 @@ pub(super) fn column_decltype_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *co
         return result;
     }
 
-    let col_name =
-        crate::db_interpose_helpers::rust_pg_result_col_name(helpers_result_ptr(pg_stmt.result), idx);
+    let col_name = crate::db_interpose_helpers::rust_pg_result_col_name(
+        helpers_result_ptr(pg_stmt.result),
+        idx,
+    );
 
     let cached_type = unsafe { lookup_cached_decltype(pg_stmt, idx, col_name) };
     if !cached_type.is_null() {

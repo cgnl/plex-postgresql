@@ -8,6 +8,12 @@ use super::{
 use libc::{c_void, RTLD_DEFAULT, RTLD_LAZY};
 use std::ffi::{CStr, CString};
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+
+// These tests reset process-wide counters and inspect returned tracker pointers.
+// Hold the test lock across reset, lookup and assertions so another test cannot
+// reset or overwrite the tracker while a pointer is being inspected.
+static EXCEPTION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn call_replace(input: Option<&str>, old: Option<&str>, new_str: Option<&str>) -> Option<String> {
     let input_cs = input.map(|s| CString::new(s).unwrap());
@@ -131,6 +137,7 @@ fn common_helpers_simple_str_replace_sql_transform() {
 
 #[test]
 fn exception_tracker_increments_for_same_type() {
+    let _guard = EXCEPTION_TEST_LOCK.lock().unwrap();
     rust_reset_exception_tracking();
     let name = CString::new("TestException").unwrap();
 
@@ -145,6 +152,7 @@ fn exception_tracker_increments_for_same_type() {
 
 #[test]
 fn exception_tracking_reset_clears_counts() {
+    let _guard = EXCEPTION_TEST_LOCK.lock().unwrap();
     rust_reset_exception_tracking();
     let name = CString::new("ResetException").unwrap();
     let t1 = rust_get_exception_tracker(name.as_ptr());
@@ -157,6 +165,7 @@ fn exception_tracking_reset_clears_counts() {
 
 #[test]
 fn common_handle_exception_increments_total_count() {
+    let _guard = EXCEPTION_TEST_LOCK.lock().unwrap();
     rust_reset_exception_tracking();
     unsafe {
         *tls_column_type_calls_ptr() = 1;

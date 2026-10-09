@@ -8,6 +8,19 @@ type Handle = *mut c_void;
 type Result<T> = std::result::Result<T, String>;
 const ROW: i32 = 100;
 const DONE: i32 = 101;
+static DESTRUCTOR_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DESTRUCTOR_POINTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "C" fn owned_text_destructor(pointer: *mut c_void) {
+    if pointer as usize == DESTRUCTOR_POINTER.load(std::sync::atomic::Ordering::SeqCst) {
+        DESTRUCTOR_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        libc::free(pointer);
+    } else {
+        // Preserve failure evidence without freeing an allocation that was not
+        // transferred by this fixture.
+        DESTRUCTOR_CALLS.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 struct Api {
     exec: unsafe extern "C" fn(
@@ -42,6 +55,25 @@ struct Api {
         c_int,
         Option<unsafe extern "C" fn(*mut c_void)>,
     ) -> c_int,
+    bind_text: unsafe extern "C" fn(
+        Handle,
+        c_int,
+        *const c_char,
+        c_int,
+        Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> c_int,
+    bind_text64: unsafe extern "C" fn(
+        Handle,
+        c_int,
+        *const c_char,
+        u64,
+        Option<unsafe extern "C" fn(*mut c_void)>,
+        u8,
+    ) -> c_int,
+    column_count: unsafe extern "C" fn(Handle) -> c_int,
+    column_name: unsafe extern "C" fn(Handle, c_int) -> *const c_char,
+    column_decltype: unsafe extern "C" fn(Handle, c_int) -> *const c_char,
+    column_text: unsafe extern "C" fn(Handle, c_int) -> *const u8,
     column_int: unsafe extern "C" fn(Handle, c_int) -> i64,
     column_int32: unsafe extern "C" fn(Handle, c_int) -> c_int,
     column_double: unsafe extern "C" fn(Handle, c_int) -> f64,
@@ -97,6 +129,12 @@ impl Api {
             bind_int: load!("bind_int64"),
             bind_null: load!("bind_null"),
             bind_blob: load!("bind_blob"),
+            bind_text: load!("bind_text"),
+            bind_text64: load!("bind_text64"),
+            column_count: load!("column_count"),
+            column_name: load!("column_name"),
+            column_decltype: load!("column_decltype"),
+            column_text: load!("column_text"),
             column_int: load!("column_int64"),
             column_int32: load!("column_int"),
             column_double: load!("column_double"),
@@ -348,6 +386,11 @@ fn run() -> Result<()> {
     )?;
     observer.batch_execute("CREATE SCHEMA runtime_e2e; SET search_path TO runtime_e2e; CREATE TABLE runtime_items (id BIGSERIAL PRIMARY KEY, unique_value BIGINT NOT NULL UNIQUE, nullable_value BIGINT, integer_value BIGINT, blob_value BYTEA, flag BOOLEAN); CREATE TABLE runtime_child (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES runtime_items(id));").map_err(|error| error.to_string())?;
     let api = unsafe { Api::load(&args[2])? };
+    let support = root.join("support");
+    std::fs::create_dir_all(support.join("Plex Media Server")).map_err(|e| e.to_string())?;
+    std::fs::write(support.join("Plex Media Server/Preferences.xml"),
+        "<Preferences AnonymousMachineIdentifier=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" MachineIdentifier=\"53cfd87b-f8b2-4db2-af2d-6aaa373b2b34\" />").map_err(|e| e.to_string())?;
+    std::env::set_var("PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR", &support);
     let path = root.join("com.plexapp.plugins.library.db");
     let path = path.to_str().ok_or("invalid fixture path")?;
     let first = api.open(path)?;
@@ -356,7 +399,305 @@ fn run() -> Result<()> {
         &'static str,
         fn(&Api, &Db<'_>, &Db<'_>, &mut Client) -> Result<()>,
     );
-    let cases: [Case; 14] = [
+    let cases: [Case; 20] = [
+        (
+            "native_uuid_binding_ownership",
+            |api, first, _, observer| {
+                observer.batch_execute("CREATE TABLE runtime_e2e.devices (id BIGINT PRIMARY KEY, identifier UUID, name TEXT); INSERT INTO runtime_e2e.devices VALUES (15192, '53cfd87b-f8b2-4db2-af2d-6aaa373b2b34', 'Owned fixture')").map_err(|e| e.to_string())?;
+                let empty = CString::new("").unwrap();
+                for wide in [false, true] {
+                    for custom in [false, true] {
+                        let stmt = first.prepare("SELECT id FROM devices WHERE identifier=?")?;
+                        for _ in 0..4 {
+                            DESTRUCTOR_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+                            let pointer = if custom {
+                                let ptr = unsafe { libc::malloc(1) }.cast::<c_char>();
+                                require(!ptr.is_null(), "callback fixture allocation failed")?;
+                                unsafe {
+                                    *ptr = 0;
+                                }
+                                DESTRUCTOR_POINTER
+                                    .store(ptr as usize, std::sync::atomic::Ordering::SeqCst);
+                                ptr.cast_const()
+                            } else {
+                                empty.as_ptr()
+                            };
+                            let destructor = custom.then_some(
+                                owned_text_destructor as unsafe extern "C" fn(*mut c_void),
+                            );
+                            let rc = unsafe {
+                                if wide {
+                                    (api.bind_text64)(stmt.handle, 1, pointer, 0, destructor, 1)
+                                } else {
+                                    (api.bind_text)(stmt.handle, 1, pointer, 0, destructor)
+                                }
+                            };
+                            api.check(first.handle, rc, 0, "bind replacement UUID")?;
+                            api.check(
+                                first.handle,
+                                unsafe { (api.step)(stmt.handle) },
+                                ROW,
+                                "step UUID replacement",
+                            )?;
+                            require(
+                                unsafe { (api.column_int)(stmt.handle, 0) } == 15192,
+                                "UUID replacement did not preserve server identity",
+                            )?;
+                            api.check(
+                                first.handle,
+                                unsafe { (api.step)(stmt.handle) },
+                                DONE,
+                                "exhaust UUID query",
+                            )?;
+                            api.check(
+                                first.handle,
+                                unsafe { (api.reset)(stmt.handle) },
+                                0,
+                                "reset UUID",
+                            )?;
+                            api.check(
+                                first.handle,
+                                unsafe { (api.clear)(stmt.handle) },
+                                0,
+                                "clear UUID",
+                            )?;
+                            if custom {
+                                require(
+                                    DESTRUCTOR_CALLS.load(std::sync::atomic::Ordering::SeqCst) == 1,
+                                    "original UUID destructor did not run once",
+                                )?;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            },
+        ),
+        (
+            "plugin_join_metadata_lifetimes",
+            |api, first, _, observer| {
+                observer.batch_execute("CREATE TABLE runtime_e2e.plugins (id INTEGER PRIMARY KEY, identifier TEXT, framework_version INTEGER, access_count INTEGER, installed_at BIGINT, accessed_at BIGINT, modified_at BIGINT); CREATE TABLE runtime_e2e.plugin_prefixes (id INTEGER PRIMARY KEY, plugin_id INTEGER, name TEXT, prefix TEXT, art_url TEXT, thumb_url TEXT, titlebar_url TEXT, share INTEGER, has_store_services INTEGER, prefs INTEGER); INSERT INTO runtime_e2e.plugins VALUES (1,'plugin-with-prefix',2,3,1790000000,1790000001,1790000002),(2,'plugin-with-null-prefix',2,4,1790000003,1790000004,1790000005); INSERT INTO runtime_e2e.plugin_prefixes VALUES (11,1,'Fixture','/fixture',NULL,'thumb',NULL,1,0,1)").map_err(|e| e.to_string())?;
+                let sql = "SELECT plugins.id AS plugins_id, plugins.identifier AS plugins_identifier, plugins.framework_version AS plugins_framework_version, plugins.access_count AS plugins_access_count, plugins.installed_at AS plugins_installed_at, plugins.accessed_at AS plugins_accessed_at, plugins.modified_at AS plugins_modified_at, plugin_prefixes.id AS plugin_prefixes_id, plugin_prefixes.name AS plugin_prefixes_name, plugin_prefixes.plugin_id AS plugin_prefixes_plugin_id, plugin_prefixes.prefix AS plugin_prefixes_prefix, plugin_prefixes.art_url AS plugin_prefixes_art_url, plugin_prefixes.thumb_url AS plugin_prefixes_thumb_url, plugin_prefixes.titlebar_url AS plugin_prefixes_titlebar_url, plugin_prefixes.share AS plugin_prefixes_share, plugin_prefixes.has_store_services AS plugin_prefixes_has_store_services, plugin_prefixes.prefs AS plugin_prefixes_prefs FROM plugins LEFT JOIN plugin_prefixes ON plugin_prefixes.plugin_id=plugins.id ORDER BY plugins.id";
+                for _ in 0..20 {
+                    let stmt = first.prepare(sql)?;
+                    require(
+                        unsafe { (api.column_count)(stmt.handle) } == 17,
+                        "plugin metadata before step has wrong column count",
+                    )?;
+                    let name = unsafe { (api.column_name)(stmt.handle, 16) };
+                    require(
+                        !name.is_null()
+                            && unsafe { CStr::from_ptr(name) }.to_bytes()
+                                == b"plugin_prefixes_prefs",
+                        "plugin metadata name mismatch",
+                    )?;
+                    let _ = unsafe { (api.column_decltype)(stmt.handle, 16) };
+                    for _ in 0..3 {
+                        api.check(
+                            first.handle,
+                            unsafe { (api.step)(stmt.handle) },
+                            ROW,
+                            "plugin joined row",
+                        )?;
+                        require(
+                            unsafe { (api.column_type)(stmt.handle, 16) } == 1
+                                && unsafe { (api.column_int)(stmt.handle, 16) } == 1,
+                            "plugin boolean prefs ABI mismatch",
+                        )?;
+                        require(
+                            unsafe { (api.column_int)(stmt.handle, 4) } == 1790000000,
+                            "plugin datetime/int64 ABI mismatch",
+                        )?;
+                        require(
+                            unsafe { (api.column_type)(stmt.handle, 11) } == 5,
+                            "plugin NULL artwork ABI mismatch",
+                        )?;
+                        let text = unsafe { (api.column_text)(stmt.handle, 1) };
+                        require(
+                            !text.is_null()
+                                && unsafe { CStr::from_ptr(text.cast()) }.to_bytes()
+                                    == b"plugin-with-prefix",
+                            "plugin identifier lifetime mismatch",
+                        )?;
+                        api.check(
+                            first.handle,
+                            unsafe { (api.step)(stmt.handle) },
+                            ROW,
+                            "plugin NULL-prefix row",
+                        )?;
+                        for column in 7..17 {
+                            require(
+                                unsafe { (api.column_type)(stmt.handle, column) } == 5,
+                                "unmatched plugin prefix did not remain SQL NULL",
+                            )?;
+                        }
+                        api.check(
+                            first.handle,
+                            unsafe { (api.step)(stmt.handle) },
+                            DONE,
+                            "exhaust plugin join",
+                        )?;
+                        api.check(
+                            first.handle,
+                            unsafe { (api.reset)(stmt.handle) },
+                            0,
+                            "reset plugin join",
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        ),
+        (
+            "sqlite_natural_constraint_parity",
+            |_, first, _, observer| {
+                observer.batch_execute("CREATE TABLE runtime_e2e.metadata_item_settings (id BIGSERIAL PRIMARY KEY, account_id INTEGER, guid TEXT, view_count INTEGER); CREATE TABLE runtime_e2e.statistics_bandwidth (id BIGSERIAL PRIMARY KEY, account_id INTEGER, device_id INTEGER, timespan INTEGER, at BIGINT, lan INTEGER)").map_err(|e| e.to_string())?;
+                first.exec("INSERT INTO metadata_item_settings (account_id,guid,view_count) VALUES (7,'same',1)")?;
+                first.exec("INSERT INTO metadata_item_settings (account_id,guid,view_count) VALUES (7,'same',2)")?;
+                require(first.scalar("SELECT count(*) FROM metadata_item_settings WHERE account_id=7 AND guid='same'")? == 2, "plain INSERT silently replaced source-valid rows")?;
+                first.exec("INSERT INTO statistics_bandwidth (account_id,device_id,timespan,at,lan) VALUES (7,8,9,10,1)")?;
+                first.exec("INSERT INTO statistics_bandwidth (account_id,device_id,timespan,at,lan) VALUES (7,8,9,10,1)")?;
+                require(
+                    first.scalar("SELECT count(*) FROM statistics_bandwidth")? == 2,
+                    "statistics INSERT incorrectly became UPSERT",
+                )?;
+                require(first.exec("INSERT INTO metadata_item_settings (id,account_id,guid) VALUES (1,8,'other')").is_err(), "genuine duplicate PK did not raise constraint error")?;
+                Ok(())
+            },
+        ),
+        ("native_rowid_edge_cases", |api, first, _, _| {
+            let db = api.open(":memory:")?;
+            require(
+                unsafe { (api.rowid)(db.handle) } == 0,
+                "unmanaged handle leaked another rowid",
+            )?;
+            db.exec("CREATE TABLE unmanaged_items (id INTEGER PRIMARY KEY, value TEXT UNIQUE)")?;
+            db.exec("INSERT INTO unmanaged_items VALUES (88,'first')")?;
+            require(
+                unsafe { (api.rowid)(db.handle) } == 88,
+                "original SQLite rowid fallback missing",
+            )?;
+            require(
+                db.exec("INSERT INTO unmanaged_items VALUES (89,'first')")
+                    .is_err(),
+                "SQLite UNIQUE failure unexpectedly succeeded",
+            )?;
+            require(
+                unsafe { (api.rowid)(db.handle) } == 88,
+                "failed unmanaged write changed rowid",
+            )?;
+            let previous = unsafe { (api.rowid)(first.handle) };
+            first.exec("INSERT OR IGNORE INTO metadata_item_settings (id,account_id,guid) VALUES (1,8,'ignored')")?;
+            require(
+                unsafe { (api.rowid)(first.handle) } == previous,
+                "ignored managed insert changed rowid",
+            )?;
+            Ok(())
+        }),
+        (
+            "replace_guard_transactions_and_concurrency",
+            |api, first, _, observer| {
+                observer.batch_execute("ALTER TABLE runtime_e2e.metadata_item_settings ADD CONSTRAINT fixture_nonnegative_views CHECK (view_count>=0)").map_err(|e| e.to_string())?;
+                first.exec("BEGIN")?;
+                first.exec("INSERT INTO metadata_item_settings (id,account_id,guid,view_count) VALUES (100,9,'earlier-caller-work',1)")?;
+                first.exec("INSERT OR REPLACE INTO metadata_item_settings (id,account_id,guid,view_count) VALUES (1,7,'replacement',8)")?;
+                require(
+                    unsafe { (api.rowid)(first.handle) } == 1,
+                    "replacement rowid not published after savepoint release",
+                )?;
+                require(first.exec("INSERT OR REPLACE INTO metadata_item_settings (id,account_id,guid,view_count) VALUES (1,7,'invalid',-1)").is_err(),"replacement ignored genuine CHECK failure")?;
+                require(
+                    first.scalar("SELECT view_count FROM metadata_item_settings WHERE id=1")? == 8,
+                    "failed replacement erased prior row",
+                )?;
+                require(
+                    first.scalar("SELECT count(*) FROM metadata_item_settings WHERE id=100")? == 1,
+                    "replacement failure discarded earlier caller work",
+                )?;
+                first.exec("COMMIT")?;
+                first.exec_abi("REPLACE INTO metadata_item_settings (id,account_id,guid,view_count) VALUES (1000,9,'direct-replace',7)")?;
+                require(
+                    unsafe { (api.rowid)(first.handle) } == 1000,
+                    "direct replacement rowid incorrect",
+                )?;
+                for id in [0, -1] {
+                    first.exec(&format!("INSERT OR REPLACE INTO metadata_item_settings (id,account_id,guid,view_count) VALUES ({id},9,'signed-regular',7)"))?;
+                    require(
+                        unsafe { (api.rowid)(first.handle) } == id,
+                        "regular replacement did not publish signed rowid",
+                    )?;
+                }
+                let signed=first.prepare("INSERT OR REPLACE INTO metadata_item_settings (id,account_id,guid,view_count) VALUES (?,9,'signed-cached',7)")?;
+                for id in [88, 0, -1] {
+                    api.check(
+                        first.handle,
+                        unsafe { (api.bind_int)(signed.handle, 1, id) },
+                        0,
+                        "bind signed cached rowid",
+                    )?;
+                    api.check(
+                        first.handle,
+                        unsafe { (api.step)(signed.handle) },
+                        DONE,
+                        "step signed cached rowid",
+                    )?;
+                    require(
+                        unsafe { (api.rowid)(first.handle) } == id,
+                        "cached replacement did not publish signed rowid",
+                    )?;
+                    api.check(
+                        first.handle,
+                        unsafe { (api.reset)(signed.handle) },
+                        0,
+                        "reset signed replacement",
+                    )?;
+                }
+                for id in [88, 0, -1] {
+                    first.exec_abi(&format!("REPLACE INTO metadata_item_settings (id,account_id,guid,view_count) VALUES ({id},9,'signed-direct',7)"))?;
+                    require(
+                        unsafe { (api.rowid)(first.handle) } == id,
+                        "direct replacement did not publish signed rowid",
+                    )?;
+                }
+                let path =
+                    PathBuf::from(env("RUNTIME_E2E_DIR")?).join("com.plexapp.plugins.library.db");
+                std::thread::scope(|scope| -> Result<()> {
+                    let handles: Vec<_> = (0..4).map(|client| {
+                    let path = &path;
+                    scope.spawn(move || -> Result<()> {
+                        let db=api.open(path.to_str().ok_or("invalid concurrent fixture path")?)?;
+                        let stmt=db.prepare("INSERT OR REPLACE INTO metadata_item_settings (id,account_id,guid,view_count) VALUES (1,7,?,?)")?;
+                        for iteration in 0..10 {
+                            let guid=CString::new(format!("client-{client}")).unwrap();
+                            api.check(db.handle,unsafe { (api.bind_text)(stmt.handle,1,guid.as_ptr(),guid.as_bytes().len() as i32,None) },0,"bind cached replacement")?;
+                            api.check(db.handle,unsafe { (api.bind_int)(stmt.handle,2,iteration) },0,"bind cached replacement count")?;
+                            api.check(db.handle,unsafe { (api.step)(stmt.handle) },DONE,"concurrent cached replacement")?;
+                            require(unsafe { (api.rowid)(db.handle) }==1,"concurrent replacement leaked rowid")?;
+                            api.check(db.handle,unsafe { (api.reset)(stmt.handle) },0,"reset concurrent replacement")?;
+                        }
+                        Ok(())
+                    })
+                }).collect();
+                    for handle in handles {
+                        handle
+                            .join()
+                            .map_err(|_| "concurrent replacement thread panicked")??;
+                    }
+                    Ok(())
+                })?;
+                require(
+                    first.scalar("SELECT count(*) FROM metadata_item_settings WHERE id=1")? == 1,
+                    "concurrent replacement lost or duplicated row",
+                )?;
+                let before = first.scalar("SELECT count(*) FROM metadata_item_settings")?;
+                require(first.exec("INSERT OR REPLACE INTO metadata_item_settings (id,guid) VALUES (2000,'a'),(2001,'b')").is_err(),"unsupported replacement silently wrote shadow SQLite")?;
+                require(
+                    first.scalar("SELECT count(*) FROM metadata_item_settings")? == before,
+                    "rejected replacement mutated PostgreSQL",
+                )?;
+                Ok(())
+            },
+        ),
         ("fts_rebuild_preserves_metadata", |_, first, _, observer| {
             first.exec("CREATE VIRTUAL TABLE temp.tokenizer USING fts4(title)")?;
             first.exec("DROP TABLE temp.tokenizer")?;
@@ -364,7 +705,7 @@ fn run() -> Result<()> {
             // maintenance must prepare successfully without a real table.
             first.exec("DELETE FROM spellfix_metadata_titles")?;
             first.exec("INSERT INTO spellfix_metadata_titles (word) VALUES ('Keep')")?;
-            observer.batch_execute("CREATE TABLE runtime_e2e.metadata_items (id BIGINT PRIMARY KEY, title TEXT, title_sort TEXT, original_title TEXT); INSERT INTO runtime_e2e.metadata_items VALUES (456, 'Keep me', 'Keep me', 'Original'); CREATE VIEW runtime_e2e.fts4_metadata_titles_icu AS SELECT id AS rowid, title FROM runtime_e2e.metadata_items").map_err(|error| error.to_string())?;
+            observer.batch_execute("CREATE TABLE runtime_e2e.metadata_items (id BIGINT PRIMARY KEY, title TEXT, title_sort TEXT, original_title TEXT); INSERT INTO runtime_e2e.metadata_items VALUES (456, 'Keep me', 'Keep me', 'Original'); CREATE VIEW runtime_e2e.fts4_metadata_titles_icu AS SELECT id AS rowid, title, to_tsvector('simple',coalesce(title,'') || ' ' || coalesce(title_sort,'') || ' ' || coalesce(original_title,'')) AS title_fts, title_sort, original_title FROM runtime_e2e.metadata_items").map_err(|error| error.to_string())?;
             first.exec("BEGIN")?;
             first.exec("DELETE FROM fts4_metadata_titles_icu")?;
             first.exec("INSERT INTO fts4_metadata_titles_icu (rowid, title, title_sort, original_title) SELECT id, title, title_sort, original_title FROM metadata_items")?;
@@ -393,6 +734,32 @@ fn run() -> Result<()> {
                     == "Updated",
                 "normal metadata writes must still reach PostgreSQL",
             )
+        }),
+        ("prepared_fts_search", |api, first, _, _| {
+            for sql in [
+                "SELECT rowid FROM fts4_metadata_titles_icu WHERE title_sort MATCH ?",
+                "SELECT rowid FROM fts4_metadata_titles_icu WHERE fts4_metadata_titles_icu MATCH ?",
+            ] {
+                let stmt = first.prepare(sql)?;
+                let query = CString::new("Keep*").unwrap();
+                api.check(
+                    first.handle,
+                    unsafe { (api.bind_text)(stmt.handle, 1, query.as_ptr(), 5, None) },
+                    0,
+                    "bind FTS prefix",
+                )?;
+                api.check(
+                    first.handle,
+                    unsafe { (api.step)(stmt.handle) },
+                    ROW,
+                    "step prepared FTS",
+                )?;
+                require(
+                    unsafe { (api.column_int)(stmt.handle, 0) } == 456,
+                    "prepared FTS prefix lost source match",
+                )?;
+            }
+            Ok(())
         }),
         ("sqlite_fts_internals", |_, first, _, observer| {
             first.exec("CREATE VIRTUAL TABLE fts4_metadata_titles USING fts4(title)")?;

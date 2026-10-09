@@ -6,21 +6,6 @@ const DECLTYPE_REAL: &[u8] = b"REAL\0";
 const DECLTYPE_BLOB: &[u8] = b"BLOB\0";
 const DECLTYPE_TEXT: &[u8] = b"TEXT\0";
 
-const ON_CONFLICT_CLAUSE: &str = " ON CONFLICT (account_id, guid) DO UPDATE SET \
-rating = COALESCE(EXCLUDED.rating, plex.metadata_item_settings.rating), \
-view_offset = EXCLUDED.view_offset, \
-view_count = CASE WHEN plex.metadata_item_settings.view_count > 0 AND EXCLUDED.view_count = 0 \
-THEN 0 ELSE GREATEST(EXCLUDED.view_count, plex.metadata_item_settings.view_count, 1) END, \
-last_viewed_at = CASE WHEN plex.metadata_item_settings.view_count > 0 AND EXCLUDED.view_count = 0 \
-THEN NULL ELSE COALESCE(EXCLUDED.last_viewed_at, EXTRACT(EPOCH FROM NOW())::bigint) END, \
-updated_at = COALESCE(EXCLUDED.updated_at, EXTRACT(EPOCH FROM NOW())::bigint), \
-skip_count = EXCLUDED.skip_count, \
-last_skipped_at = EXCLUDED.last_skipped_at, \
-changed_at = COALESCE(EXCLUDED.changed_at, EXTRACT(EPOCH FROM NOW())::bigint), \
-extra_data = COALESCE(EXCLUDED.extra_data, plex.metadata_item_settings.extra_data), \
-last_rated_at = COALESCE(EXCLUDED.last_rated_at, plex.metadata_item_settings.last_rated_at) \
-RETURNING id";
-
 pub(crate) fn oid_to_sqlite_type(oid: u32) -> i32 {
     match oid {
         16 | 20 | 21 | 23 | 26 => super::SQLITE_INTEGER,
@@ -41,21 +26,11 @@ pub(crate) fn oid_to_sqlite_decltype(oid: u32) -> &'static CStr {
     unsafe { CStr::from_bytes_with_nul_unchecked(bytes) }
 }
 
-pub(crate) fn convert_metadata_settings_upsert(sql: &str) -> Option<String> {
-    let lower = sql.to_lowercase();
-    if !lower.contains("insert into") {
-        return None;
-    }
-    if !lower.contains("metadata_item_settings") {
-        return None;
-    }
-    if lower.contains("on conflict") {
-        return None;
-    }
-    if lower.contains("returning") {
-        return None;
-    }
-    Some(format!("{}{}", sql, ON_CONFLICT_CLAUSE))
+// Keep this compatibility helper for the existing FFI entry point. SQLite has
+// no UNIQUE(account_id, guid) constraint, so an ordinary INSERT must neither
+// merge watch state nor silently replace a row with the same natural key.
+pub(crate) fn convert_metadata_settings_upsert(_sql: &str) -> Option<String> {
+    None
 }
 
 pub(crate) fn extract_metadata_id(sql: &str) -> i64 {

@@ -56,7 +56,7 @@ pub extern "C" fn str_replace_nocase(
 
         let prefix_len = unsafe { match_ptr.offset_from(p) as usize };
         if prefix_len > 0 {
-            let prefix = unsafe { std::slice::from_raw_parts(p as *const u8, prefix_len) };
+            let prefix = unsafe { std::slice::from_raw_parts(p.cast::<u8>(), prefix_len) };
             out.extend_from_slice(prefix);
         }
 

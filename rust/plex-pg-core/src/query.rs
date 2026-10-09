@@ -1266,18 +1266,10 @@ fn fix_int_text_mismatch(mut left: Expr, op: BinaryOperator, mut right: Expr) ->
 
 /// Transform `col MATCH 'term'` → `to_tsvector('simple', col) @@ to_tsquery('simple', E'converted_term')`
 ///
-/// The old strategy of appending `_fts` to the column name (e.g. `title_sort` →
-/// `title_sort_fts`) created nonexistent column references.  The PostgreSQL FTS
-/// views (`fts4_metadata_titles`, `fts4_metadata_titles_icu`) expose the source
-/// text columns (`title`, `title_sort`, `original_title`) but only a single
-/// pre-computed tsvector column (`title_fts`).  Columns like `title_sort` have
-/// no corresponding `title_sort_fts` tsvector column, so the `_fts` suffix
-/// approach fails.
-///
-/// The correct approach is to wrap the source column with `to_tsvector` at
-/// query time.  This works for any column name, matches the `'simple'`
-/// dictionary used by the schema's tsvector triggers, and does not require a
-/// pre-computed tsvector column to exist.
+/// Column MATCH uses the source text, including title_sort, original_title and tag.
+/// SQLite's table-wide MATCH names the virtual table rather than a text column.
+/// For the four known Plex FTS views, use their combined title_fts vector instead
+/// of passing a PostgreSQL composite record to to_tsvector.
 fn transform_fts_match(left: Expr, right: Expr) -> Expr {
     // Build: to_tsvector('simple', col)
     let make_fn = |fn_name: &str, col: Expr| -> Expr {
@@ -1303,7 +1295,24 @@ fn transform_fts_match(left: Expr, right: Expr) -> Expr {
         })
     };
 
-    let tsvector_call = make_fn("to_tsvector", left);
+    let table_ident = match &left {
+        Expr::Identifier(ident) => Some(ident),
+        _ => None,
+    };
+    let tsvector_call = match table_ident {
+        Some(ident)
+            if matches!(
+                ident.value.to_ascii_lowercase().as_str(),
+                "fts4_metadata_titles"
+                    | "fts4_metadata_titles_icu"
+                    | "fts4_tag_titles"
+                    | "fts4_tag_titles_icu"
+            ) =>
+        {
+            Expr::CompoundIdentifier(vec![ident.clone(), Ident::new("title_fts")])
+        }
+        _ => make_fn("to_tsvector", left),
+    };
 
     // Convert the match term to tsquery syntax
     let term_str = match &right {
@@ -1311,6 +1320,17 @@ fn transform_fts_match(left: Expr, right: Expr) -> Expr {
             value: Value::SingleQuotedString(s),
             ..
         }) => convert_fts_term(s),
+        Expr::Value(ValueWithSpan {
+            value: Value::Placeholder(_),
+            ..
+        }) => {
+            // Bind normalization converts only a proven, exclusive MATCH parameter.
+            return Expr::BinaryOp {
+                left: Box::new(tsvector_call),
+                op: BinaryOperator::AtAt,
+                right: Box::new(make_fn("to_tsquery", right)),
+            };
+        }
         _ => {
             return Expr::BinaryOp {
                 left: Box::new(tsvector_call),
@@ -1352,23 +1372,131 @@ fn transform_fts_match(left: Expr, right: Expr) -> Expr {
     }
 }
 
+/// Prove the original SQLite parameter index is used exclusively as a direct
+/// MATCH RHS on a Plex FTS view. Reusing it outside MATCH or extending the RHS
+/// with an expression is explicitly unsupported, because changing that value
+/// would also change a regular predicate. Quoted strings/comments are tokens,
+/// not parameter occurrences. Named and numbered SQLite indexes retain their
+/// original numbering independently of the PostgreSQL placeholder mapping.
+pub(crate) fn fts_match_parameter(sql: &str, index: i32) -> Result<bool, &'static str> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let dialect = sqlparser::dialect::SQLiteDialect {};
+    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() else {
+        return Ok(false);
+    };
+    let tokens: Vec<_> = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    let word = |token: &Token, expected: &str| matches!(token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(expected));
+    let known_fts = |token: &Token| {
+        matches!(token, Token::Word(w) if matches!(w.value.to_ascii_lowercase().as_str(),
+        "fts4_metadata_titles" | "fts4_metadata_titles_icu" | "fts4_tag_titles" | "fts4_tag_titles_icu"))
+    };
+    let has_fts_source = tokens.iter().enumerate().any(|(i, token)| {
+        (word(token, "from") || word(token, "join"))
+            && (tokens.get(i + 1).is_some_and(known_fts)
+                || (tokens.get(i + 2) == Some(&Token::Period)
+                    && tokens.get(i + 3).is_some_and(known_fts)))
+    });
+    if !has_fts_source || index <= 0 {
+        return Ok(false);
+    }
+    let mut next_index = 0;
+    let mut names = std::collections::HashMap::new();
+    let mut matches = 0;
+    let mut ordinary = 0;
+    let mut unsupported = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        let (parameter, consumed) = match &tokens[i] {
+            Token::Placeholder(p) => (Some(p.clone()), 1),
+            Token::Colon | Token::AtSign if matches!(tokens.get(i + 1), Some(Token::Word(_))) => {
+                (Some(format!("{}{}", tokens[i], tokens[i + 1])), 2)
+            }
+            _ => (None, 1),
+        };
+        if let Some(parameter) = parameter {
+            let parameter_index = if parameter == "?" {
+                next_index + 1
+            } else if let Some(number) = parameter.strip_prefix('?') {
+                number
+                    .parse::<i32>()
+                    .map_err(|_| "invalid parameter index")?
+            } else {
+                *names.entry(parameter).or_insert(next_index + 1)
+            };
+            next_index = next_index.max(parameter_index);
+            if parameter_index == index {
+                let mut rhs_start = i;
+                while rhs_start > 0 && tokens[rhs_start - 1] == Token::LParen {
+                    rhs_start -= 1;
+                }
+                if rhs_start < i && rhs_start > 0 && word(&tokens[rhs_start - 1], "match") {
+                    matches += 1;
+                    unsupported = true;
+                    i += consumed;
+                    continue;
+                }
+                let direct_match = i >= 2
+                    && word(&tokens[i - 1], "match")
+                    && matches!(&tokens[i - 2], Token::Word(w) if matches!(w.value.to_ascii_lowercase().as_str(),
+                        "title" | "title_sort" | "original_title" | "tag" | "fts4_metadata_titles"
+                        | "fts4_metadata_titles_icu" | "fts4_tag_titles" | "fts4_tag_titles_icu"));
+                if direct_match {
+                    matches += 1;
+                    unsupported |= tokens.get(i + consumed).is_some_and(|next| {
+                        !matches!(next, Token::RParen | Token::SemiColon)
+                            && ![
+                                "and", "or", "order", "group", "having", "limit", "offset", "union",
+                            ]
+                            .iter()
+                            .any(|keyword| word(next, keyword))
+                    });
+                } else {
+                    ordinary += 1;
+                }
+            }
+        }
+        i += consumed;
+    }
+    if matches == 0 {
+        return Ok(false);
+    }
+    if ordinary > 0
+        || unsupported
+        || tokens
+            .iter()
+            .enumerate()
+            .any(|(i, t)| *t == Token::SemiColon && i + 1 < tokens.len())
+    {
+        return Err("MATCH parameter reused outside MATCH or used in a compound RHS");
+    }
+    Ok(true)
+}
+
 /// Convert SQLite FTS term syntax to PostgreSQL tsquery syntax.
 ///
 /// | SQLite         | PostgreSQL tsquery |
 /// |----------------|-------------------|
 /// | `term`         | `term`            |
 /// | `term1 term2`  | `term1 & term2`   |
+/// | `term*`        | `term:*`          |
 /// | `-term`        | `!term`           |
 /// | `term1 OR term2`| `term1 | term2`  |
-/// | `"exact phrase"`| `exact <-> phrase`|
+/// | `"exact phrase"`| same-column weighted phrase alternatives |
 /// | `'` (quote)    | stripped           |
-fn convert_fts_term(input: &str) -> String {
+pub(crate) fn convert_fts_term(input: &str) -> String {
     let mut result = String::new();
     let mut chars = input.chars().peekable();
     let mut need_and = false;
 
     while let Some(&c) = chars.peek() {
         match c {
+            '*' => {
+                result.push_str(":*");
+                chars.next();
+            }
             // Negation
             '-' => {
                 if need_and {
@@ -1394,8 +1522,25 @@ fn convert_fts_term(input: &str) -> String {
                     chars.next();
                 }
                 let words: Vec<&str> = phrase.split_whitespace().collect();
-                result.push_str(&words.join(" <-> "));
-                need_and = true;
+                if !words.is_empty() {
+                    // Metadata view fields use distinct A/B/C weights; ordinary
+                    // single-column vectors use D. Every phrase must stay inside
+                    // one field, while unquoted terms may span multiple fields.
+                    let alternatives: Vec<String> = ['A', 'B', 'C', 'D']
+                        .iter()
+                        .map(|weight| {
+                            words
+                                .iter()
+                                .map(|word| format!("{word}:{weight}"))
+                                .collect::<Vec<_>>()
+                                .join(" <-> ")
+                        })
+                        .collect();
+                    result.push('(');
+                    result.push_str(&alternatives.join(" | "));
+                    result.push(')');
+                    need_and = true;
+                }
             }
             // Single quote — strip (not valid in tsquery)
             '\'' => {
@@ -1415,8 +1560,8 @@ fn convert_fts_term(input: &str) -> String {
                 // Check for OR keyword
                 if chars.peek() == Some(&'O') || chars.peek() == Some(&'o') {
                     let rest: String = chars.clone().take(3).collect();
-                    if rest.to_uppercase().starts_with("OR ")
-                        || (rest.len() >= 2 && rest[..2].to_uppercase() == "OR" && rest.len() == 2)
+                    if rest.to_ascii_uppercase().starts_with("OR ")
+                        || rest.eq_ignore_ascii_case("OR")
                     {
                         chars.next(); // O
                         chars.next(); // R
@@ -1684,10 +1829,319 @@ mod tests {
             translate("SELECT rowid FROM fts4_metadata_titles WHERE title MATCH 'War*'").unwrap();
         let sql = r.sql.to_lowercase();
         assert!(
-            sql.contains("war:*") || sql.contains("war"),
+            sql.contains("war:*"),
             "Expected prefix tsquery token, got: {}",
             r.sql
         );
+    }
+}
+
+#[cfg(test)]
+mod fts_view_parity_tests {
+    use crate::translate;
+
+    const FIXTURES: &str = "INSERT INTO metadata_items (id,title,title_sort,original_title) VALUES
+        (1,'Keep Big','Zebra','Bunny'),(2,NULL,'Sort Only',NULL),
+        (3,'München',NULL,NULL),(4,NULL,NULL,NULL);
+        INSERT INTO tags (id,tag) VALUES (1,'Adventure'),(2,NULL),(3,'München');";
+
+    fn sqlite_oracle() -> rusqlite::Connection {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE metadata_items(id integer,title text,title_sort text,original_title text);
+            CREATE TABLE tags(id integer,tag text);").unwrap();
+        db.execute_batch(FIXTURES).unwrap();
+        for table in ["fts4_metadata_titles", "fts4_metadata_titles_icu"] {
+            db.execute_batch(&format!("CREATE VIRTUAL TABLE {table} USING fts4(title,title_sort,original_title,tokenize=unicode61 'remove_diacritics=0');
+                INSERT INTO {table}(rowid,title,title_sort,original_title) SELECT id,title,title_sort,original_title FROM metadata_items;")).unwrap();
+        }
+        for table in ["fts4_tag_titles", "fts4_tag_titles_icu"] {
+            db.execute_batch(&format!("CREATE VIRTUAL TABLE {table} USING fts4(tag,tokenize=unicode61 'remove_diacritics=0');
+                INSERT INTO {table}(rowid,tag) SELECT id,tag FROM tags;")).unwrap();
+        }
+        db
+    }
+
+    fn cases() -> Vec<(String, Vec<i32>)> {
+        let mut cases = Vec::new();
+        for table in ["fts4_metadata_titles", "fts4_metadata_titles_icu"] {
+            for (column, term, expected) in [
+                ("title", "KEEP*", vec![1]),
+                ("title_sort", "Zeb*", vec![1]),
+                ("title_sort", "sort*", vec![2]),
+                ("original_title", "bun*", vec![1]),
+                (table, "BUN*", vec![1]),
+                (table, "mün*", vec![3]),
+                (table, "absent", vec![]),
+            ] {
+                cases.push((format!("SELECT rowid FROM {table} WHERE \"{column}\" MATCH '{term}' ORDER BY rowid"), expected));
+            }
+        }
+        for table in ["fts4_tag_titles", "fts4_tag_titles_icu"] {
+            for (column, term, expected) in [("tag", "ADVEN*", vec![1]), (table, "mün*", vec![3])]
+            {
+                cases.push((format!("SELECT rowid FROM {table} WHERE \"{column}\" MATCH '{term}' ORDER BY rowid"), expected));
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn prepared_match_parameter_indexes_are_proven_and_exclusive() {
+        use super::fts_match_parameter;
+        for (sql, idx) in [
+            ("SELECT rowid FROM fts4_metadata_titles WHERE title MATCH ?", 1),
+            ("SELECT rowid FROM fts4_metadata_titles WHERE rowid=? AND title_sort MATCH ?", 2),
+            ("SELECT rowid FROM fts4_metadata_titles WHERE original_title MATCH ?3", 3),
+            ("SELECT rowid FROM fts4_metadata_titles WHERE title MATCH :term", 1),
+            ("SELECT rowid FROM fts4_metadata_titles WHERE rowid=:id AND title MATCH :term", 2),
+            ("SELECT rowid FROM fts4_metadata_titles WHERE title MATCH @term", 1),
+            ("SELECT rowid FROM fts4_metadata_titles WHERE title MATCH $term", 1),
+            ("SELECT rowid FROM fts4_metadata_titles WHERE title MATCH ?1 OR title_sort MATCH ?1", 1),
+            ("SELECT rowid FROM fts4_metadata_titles WHERE title MATCH ? /* ? ignored */ ORDER BY rowid", 1),
+        ] { assert_eq!(fts_match_parameter(sql, idx), Ok(true), "{sql}"); }
+        for (sql, idx) in [
+            (
+                "SELECT rowid FROM fts4_metadata_titles WHERE title MATCH 'Keep' AND rowid=?",
+                1,
+            ),
+            (
+                "SELECT rowid FROM fts4_metadata_titles WHERE rowid=? AND title MATCH ?",
+                1,
+            ),
+            ("SELECT '?' FROM ordinary WHERE title MATCH ?", 1),
+            (
+                "SELECT rowid FROM fts4_metadata_titles WHERE title=? /* MATCH ? */",
+                1,
+            ),
+        ] {
+            assert_eq!(fts_match_parameter(sql, idx), Ok(false), "{sql}");
+        }
+        for sql in [
+            "SELECT rowid FROM fts4_metadata_titles WHERE title MATCH ?1 AND title=?1",
+            "SELECT :term FROM fts4_metadata_titles WHERE title MATCH :term",
+            "SELECT rowid FROM fts4_metadata_titles WHERE title MATCH ? || '*'",
+            "SELECT rowid FROM fts4_metadata_titles WHERE title MATCH (?)",
+            "SELECT rowid FROM fts4_metadata_titles WHERE title MATCH ?; SELECT ?",
+        ] {
+            assert!(fts_match_parameter(sql, 1).is_err(), "{sql}");
+        }
+        let translated =
+            translate("SELECT rowid FROM fts4_metadata_titles WHERE title_sort MATCH ?")
+                .unwrap()
+                .sql;
+        assert!(
+            translated.contains("to_tsquery('simple', $1)"),
+            "{translated}"
+        );
+    }
+
+    #[test]
+    fn table_wide_match_uses_known_aggregate_vector() {
+        let sqlite = sqlite_oracle();
+        for (sql, expected) in cases() {
+            let rows = sqlite
+                .prepare(&sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, i32>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(rows, expected, "SQLite oracle: {sql}");
+            let translated = translate(&sql).unwrap().sql;
+            if sql.contains("WHERE \"fts4_") {
+                assert!(translated.contains(".title_fts @@"), "{translated}");
+                assert!(!translated.contains("to_tsvector("), "{translated}");
+            } else {
+                assert!(translated.contains("to_tsvector("), "{translated}");
+            }
+        }
+        // A similarly named column remains a text column; no generic alias guessing.
+        let sql = translate("SELECT * FROM t WHERE other_fts MATCH 'Keep'")
+            .unwrap()
+            .sql;
+        assert!(sql.contains("to_tsvector('simple', other_fts)"), "{sql}");
+    }
+
+    #[test]
+    #[ignore = "requires isolated PostgreSQL via TEST_FTS_PG_URL"]
+    fn postgres_fts_views_match_sqlite_and_upgrade_in_place() {
+        let sqlite = sqlite_oracle();
+        let mut pg = postgres::Client::connect(
+            &std::env::var("TEST_FTS_PG_URL").expect("TEST_FTS_PG_URL"),
+            postgres::NoTls,
+        )
+        .unwrap();
+        let mut tx = pg.transaction().unwrap();
+        let long_unicode = "München 東京 🐇 d'été ".repeat(2048);
+        let literal_sql = format!(
+            "SELECT '{}' AS \"日本語\" ORDER BY \"日本語\"",
+            long_unicode.replace('\'', "''")
+        );
+        let oracle_text: String = sqlite
+            .query_row(&literal_sql, [], |row| row.get(0))
+            .unwrap();
+        let translated_literal = translate(&literal_sql).unwrap().sql;
+        let pg_text: String = tx.query_one(&translated_literal, &[]).unwrap().get(0);
+        assert_eq!(pg_text, oracle_text);
+        assert_eq!(pg_text, long_unicode);
+        tx.batch_execute("CREATE SCHEMA plex; SET LOCAL search_path TO plex;
+            CREATE TABLE metadata_items(id integer,title text,title_sort text,original_title text,search_vector tsvector,title_fts tsvector);
+            CREATE TABLE tags(id integer,tag text,search_vector tsvector);
+            CREATE VIEW fts4_metadata_titles AS SELECT id AS rowid,title,title_fts FROM metadata_items;
+            CREATE VIEW fts4_metadata_titles_icu AS SELECT id AS rowid,title,title_fts FROM metadata_items;
+            CREATE VIEW fts4_tag_titles AS SELECT id AS rowid,tag AS title,search_vector AS title_fts FROM tags;
+            CREATE VIEW fts4_tag_titles_icu AS SELECT id AS rowid,tag AS title,search_vector AS title_fts FROM tags;").unwrap();
+        let upgrade = include_str!("../../../schema/fts_view_parity_upgrade.sql")
+            .replace("BEGIN;", "")
+            .replace("COMMIT;", "");
+        tx.batch_execute(&upgrade).unwrap();
+        tx.batch_execute(&upgrade).unwrap();
+        tx.batch_execute(FIXTURES).unwrap();
+        for (sql, expected) in cases() {
+            let oracle = sqlite
+                .prepare(&sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, i32>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(oracle, expected);
+            let translated = translate(&sql).unwrap().sql;
+            let actual: Vec<i32> = tx
+                .query(&translated, &[])
+                .unwrap_or_else(|e| panic!("{translated}: {e}"))
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(actual, oracle, "{translated}");
+        }
+        let columns: Vec<String> = tx.query("SELECT column_name::text FROM information_schema.columns WHERE table_schema='plex' AND table_name='fts4_metadata_titles' ORDER BY ordinal_position", &[])
+            .unwrap().iter().map(|row| row.get(0)).collect();
+        assert_eq!(
+            columns,
+            [
+                "rowid",
+                "title",
+                "title_fts",
+                "title_sort",
+                "original_title"
+            ]
+        );
+        // Exercise the actual schema triggers after validating imported NULL vectors.
+        let schema = include_str!("../../../schema/plex_schema.sql");
+        for function in ["metadata_items_search_trigger", "tags_search_trigger"] {
+            let start = schema
+                .find(&format!("CREATE FUNCTION plex.{function}()"))
+                .unwrap();
+            let end = start + schema[start..].find("$$;").unwrap() + 3;
+            tx.batch_execute(&schema[start..end]).unwrap();
+        }
+        tx.batch_execute("CREATE TRIGGER metadata_items_search_update BEFORE INSERT OR UPDATE ON plex.metadata_items FOR EACH ROW EXECUTE FUNCTION plex.metadata_items_search_trigger();
+            CREATE TRIGGER tags_search_update BEFORE INSERT OR UPDATE ON plex.tags FOR EACH ROW EXECUTE FUNCTION plex.tags_search_trigger();
+            UPDATE metadata_items SET title=title; UPDATE tags SET tag=tag;").unwrap();
+        for (sql, expected) in cases() {
+            let actual: Vec<i32> = tx
+                .query(&translate(&sql).unwrap().sql, &[])
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(actual, expected, "populated vector: {sql}");
+        }
+        // Phrases must stay within one SQLite FTS source column. Bare terms
+        // may span columns, and separate phrases may match different columns.
+        let phrase_rows = "(1,'Big','Bunny',NULL),(2,'Big Bunny','Trail',NULL),
+            (3,NULL,'Big','Bunny'),(4,NULL,'Big Bunny','Trail'),
+            (5,NULL,'Big','Bunny Trail'),(6,'Only',NULL,'Big Bunny'),
+            (7,'Big Bunny','Bunny Trail','Original Title'),(8,'Big Bunny','The Original','Trail')";
+        let phrase_sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        phrase_sqlite.execute_batch(&format!("CREATE VIRTUAL TABLE fts4_metadata_titles USING fts4(title,title_sort,original_title);
+            INSERT INTO fts4_metadata_titles(rowid,title,title_sort,original_title) VALUES {phrase_rows};")).unwrap();
+        tx.batch_execute(&format!(
+            "DELETE FROM metadata_items;
+            INSERT INTO metadata_items(id,title,title_sort,original_title) VALUES {phrase_rows};"
+        ))
+        .unwrap();
+        let phrase_cases = [
+            ("fts4_metadata_titles", "\"Big Bunny\"", vec![2, 4, 6, 7, 8]),
+            (
+                "fts4_metadata_titles",
+                "Big Bunny",
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            (
+                "fts4_metadata_titles",
+                "\"Big Bunny\" Trail",
+                vec![2, 4, 7, 8],
+            ),
+            (
+                "fts4_metadata_titles",
+                "\"Big Bunny\" \"Bunny Trail\"",
+                vec![7],
+            ),
+            (
+                "fts4_metadata_titles",
+                "\"Big Bunny\" OR \"Bunny Trail\"",
+                vec![2, 4, 5, 6, 7, 8],
+            ),
+            (
+                "fts4_metadata_titles",
+                "\"Big Bunny\" \"Original Title\"",
+                vec![7],
+            ),
+            ("title_sort", "\"Big Bunny\"", vec![4]),
+            ("original_title", "\"Big Bunny\"", vec![6]),
+            ("fts4_metadata_titles", "\"Bunny Trail\"", vec![5, 7]),
+            ("fts4_metadata_titles", "\"Bunny The\"", vec![]),
+        ];
+        for populated in [false, true] {
+            tx.batch_execute(
+                "ALTER TABLE metadata_items DISABLE TRIGGER metadata_items_search_update;",
+            )
+            .unwrap();
+            if populated {
+                tx.batch_execute("ALTER TABLE metadata_items ENABLE TRIGGER metadata_items_search_update; UPDATE metadata_items SET title=title;").unwrap();
+            } else {
+                tx.batch_execute("UPDATE metadata_items SET search_vector=NULL;")
+                    .unwrap();
+            }
+            for (column, term, expected) in &phrase_cases {
+                let sql = format!("SELECT rowid FROM fts4_metadata_titles WHERE {column} MATCH '{term}' ORDER BY rowid");
+                let oracle: Vec<i32> = phrase_sqlite
+                    .prepare(&sql)
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert_eq!(&oracle, expected, "SQLite phrase oracle: {sql}");
+                let translated = translate(&sql).unwrap().sql;
+                let actual: Vec<i32> = tx
+                    .query(&translated, &[])
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                assert_eq!(
+                    actual, oracle,
+                    "literal, populated={populated}: {translated}"
+                );
+                let prepared_sql = sql.replace(&format!("'{term}'"), "?");
+                let prepared = tx.prepare(&translate(&prepared_sql).unwrap().sql).unwrap();
+                let normalized = super::convert_fts_term(term);
+                let actual: Vec<i32> = tx
+                    .query(&prepared, &[&normalized])
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                assert_eq!(
+                    actual, oracle,
+                    "prepared, populated={populated}: {prepared_sql}, {term}"
+                );
+            }
+        }
+        tx.rollback().unwrap();
     }
 }
 

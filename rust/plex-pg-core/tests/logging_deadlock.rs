@@ -22,7 +22,7 @@ fn logging_concurrency_completes() {
         std::thread::spawn(move || {
             let msg = CString::new(format!("[T{}] log message", tid)).unwrap();
             while RUNNING.load(Ordering::Acquire) && start.elapsed() < duration {
-                unsafe { rust_logging_write(2, msg.as_ptr()) };
+                rust_logging_write(2, msg.as_ptr());
                 MSGS.fetch_add(1, Ordering::Relaxed);
             }
             let _ = tx.send(());
@@ -47,18 +47,10 @@ fn column_type_verbose_is_not_log_info() {
     }
 
     let content = std::fs::read_to_string(&path).expect("read db_interpose_column.rs");
-    let mut found = 0usize;
     for (idx, line) in content.lines().enumerate() {
-        if line.contains("COLUMN_TYPE_VERBOSE") {
-            found += 1;
-            if line.contains("log_info") {
-                panic!("COLUMN_TYPE_VERBOSE uses log_info at line {}", idx + 1);
-            }
+        if line.contains("COLUMN_TYPE_VERBOSE") && line.contains("log_info") {
+            panic!("COLUMN_TYPE_VERBOSE uses log_info at line {}", idx + 1);
         }
-    }
-
-    if found == 0 {
-        return;
     }
 }
 

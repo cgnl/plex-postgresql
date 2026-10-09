@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::db_interpose_conn_utils::{log_debug, log_error};
 use crate::db_interpose_helpers::cstr_to_str_or_empty;
@@ -21,6 +21,22 @@ pub fn rust_stmt_ref(pg_stmt: *mut PgStmt) {
     }
 }
 
+// Use the compare-exchange primitive supported by both the minimum compiler and
+// newer Rust versions where fetch_update has been renamed to try_update.
+fn decrement_ref_count(count: &AtomicI32) -> Result<i32, i32> {
+    let mut current = count.load(Ordering::Acquire);
+    loop {
+        if current <= 0 {
+            return Err(current);
+        }
+        match count.compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 pub fn rust_stmt_unref(pg_stmt: *mut PgStmt) {
     if pg_stmt.is_null() {
         return;
@@ -29,14 +45,7 @@ pub fn rust_stmt_unref(pg_stmt: *mut PgStmt) {
     // Atomically decrement, rejecting any transition that would go below 0.
     let result = unsafe {
         let stmt = &*pg_stmt;
-        stmt.ref_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                if current <= 0 {
-                    None // reject: already at 0 or below
-                } else {
-                    Some(current - 1)
-                }
-            })
+        decrement_ref_count(&stmt.ref_count)
     };
 
     let old = match result {
@@ -181,4 +190,45 @@ pub fn rust_stmt_is_ours(pg_stmt: usize) -> i32 {
 pub fn rust_stmt_registry_count() -> usize {
     let reg = rwlock_read(&REGISTRY);
     reg.len()
+}
+
+#[cfg(test)]
+mod refcount_tests {
+    use super::decrement_ref_count;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn guarded_decrement_rejects_zero_and_negative_counts() {
+        for initial in [0, -1, i32::MIN] {
+            let count = AtomicI32::new(initial);
+            assert_eq!(decrement_ref_count(&count), Err(initial));
+            assert_eq!(count.load(Ordering::Acquire), initial);
+        }
+        let count = AtomicI32::new(1);
+        assert_eq!(decrement_ref_count(&count), Ok(1));
+        assert_eq!(decrement_ref_count(&count), Err(0));
+    }
+
+    #[test]
+    fn concurrent_decrements_have_one_last_owner() {
+        const REFERENCES: i32 = 32;
+        let count = Arc::new(AtomicI32::new(REFERENCES));
+        let start = Arc::new(Barrier::new(REFERENCES as usize));
+        let threads: Vec<_> = (0..REFERENCES)
+            .map(|_| {
+                let count = Arc::clone(&count);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    decrement_ref_count(&count).unwrap()
+                })
+            })
+            .collect();
+        let mut observed: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        observed.sort_unstable();
+        assert_eq!(observed, (1..=REFERENCES).collect::<Vec<_>>());
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        assert_eq!(decrement_ref_count(&count), Err(0));
+    }
 }

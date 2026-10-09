@@ -1,6 +1,5 @@
 use super::support::{
-    is_duplicate_prepared_stmt, is_stale_prepared_stmt, malloc_cstring,
-    parse_positive_returning_rowid,
+    is_duplicate_prepared_stmt, is_stale_prepared_stmt, malloc_cstring, parse_returning_rowid,
 };
 use super::*;
 use crate::log_info_lazy;
@@ -149,84 +148,98 @@ pub(crate) fn exec_via_postgres(
 
                 let normalized =
                     crate::db_interpose_helpers::rust_normalize_sql_literals(exec_pg_sql);
-                let res: *mut PGresult = if !normalized.is_null() {
-                    let norm = &*normalized;
-                    let norm_hash = crate::pg_client::rust_hash_sql(norm.normalized_sql);
-                    let mut cached_stmt_name: *const c_char = std::ptr::null();
+                let replacement =
+                    crate::db_interpose_exec::replace_guard::is_replacement(exec_pg_sql);
+                let res: *mut PGresult = crate::db_interpose_exec::replace_guard::execute_locked(
+                    pg_conn,
+                    exec_pg_sql,
+                    || {
+                        if !normalized.is_null() {
+                            let norm = &*normalized;
+                            let norm_hash = crate::pg_client::rust_hash_sql(norm.normalized_sql);
+                            let mut cached_stmt_name: *const c_char = std::ptr::null();
 
-                    if crate::pg_client::rust_stmt_cache_lookup(
-                        pg_conn as *mut c_void,
-                        norm_hash,
-                        &mut cached_stmt_name,
-                    ) != 0
-                    {
-                        crate::libpq_helpers::rust_pq_exec_prepared(
-                            pg.conn,
-                            cached_stmt_name,
-                            norm.param_count,
-                            norm.param_values as *const *const c_char,
-                            std::ptr::null(),
-                            std::ptr::null(),
-                            0,
-                        )
-                    } else {
-                        let stmt_name = format!("nx_{:x}", norm_hash);
-                        let stmt_name_c =
-                            CString::new(stmt_name).unwrap_or_else(|_| CString::new("").unwrap());
-                        let prep_res = crate::libpq_helpers::rust_pq_prepare(
-                            pg.conn,
-                            stmt_name_c.as_ptr(),
-                            norm.normalized_sql,
-                            0,
-                            std::ptr::null(),
-                        );
-                        let ok = crate::libpq_helpers::rust_pq_result_status(prep_res)
-                            == PGRES_COMMAND_OK
-                            || is_duplicate_prepared_stmt(prep_res);
-                        if ok {
-                            crate::pg_client::rust_stmt_cache_add(
+                            if crate::pg_client::rust_stmt_cache_lookup(
                                 pg_conn as *mut c_void,
                                 norm_hash,
-                                stmt_name_c.as_ptr(),
-                                norm.param_count,
-                            );
-                            crate::libpq_helpers::rust_pq_clear(prep_res);
-                            crate::libpq_helpers::rust_pq_exec_prepared(
-                                pg.conn,
-                                stmt_name_c.as_ptr(),
-                                norm.param_count,
-                                norm.param_values as *const *const c_char,
-                                std::ptr::null(),
-                                std::ptr::null(),
-                                0,
-                            )
+                                &mut cached_stmt_name,
+                            ) != 0
+                            {
+                                crate::libpq_helpers::rust_pq_exec_prepared(
+                                    pg.conn,
+                                    cached_stmt_name,
+                                    norm.param_count,
+                                    norm.param_values as *const *const c_char,
+                                    std::ptr::null(),
+                                    std::ptr::null(),
+                                    0,
+                                )
+                            } else {
+                                let stmt_name = format!("nx_{:x}", norm_hash);
+                                let stmt_name_c = CString::new(stmt_name)
+                                    .unwrap_or_else(|_| CString::new("").unwrap());
+                                let prep_res = crate::libpq_helpers::rust_pq_prepare(
+                                    pg.conn,
+                                    stmt_name_c.as_ptr(),
+                                    norm.normalized_sql,
+                                    0,
+                                    std::ptr::null(),
+                                );
+                                if replacement
+                                    && crate::libpq_helpers::rust_pq_result_status(prep_res)
+                                        != PGRES_COMMAND_OK
+                                {
+                                    return prep_res;
+                                }
+                                let ok = crate::libpq_helpers::rust_pq_result_status(prep_res)
+                                    == PGRES_COMMAND_OK
+                                    || is_duplicate_prepared_stmt(prep_res);
+                                if ok {
+                                    crate::pg_client::rust_stmt_cache_add(
+                                        pg_conn as *mut c_void,
+                                        norm_hash,
+                                        stmt_name_c.as_ptr(),
+                                        norm.param_count,
+                                    );
+                                    crate::libpq_helpers::rust_pq_clear(prep_res);
+                                    crate::libpq_helpers::rust_pq_exec_prepared(
+                                        pg.conn,
+                                        stmt_name_c.as_ptr(),
+                                        norm.param_count,
+                                        norm.param_values as *const *const c_char,
+                                        std::ptr::null(),
+                                        std::ptr::null(),
+                                        0,
+                                    )
+                                } else {
+                                    crate::libpq_helpers::rust_pq_clear(prep_res);
+                                    crate::libpq_helpers::rust_pq_exec(pg.conn, exec_pg_sql)
+                                }
+                            }
                         } else {
-                            crate::libpq_helpers::rust_pq_clear(prep_res);
-                            crate::libpq_helpers::rust_pq_exec(pg.conn, exec_pg_sql)
+                            let sql_hash = crate::pg_client::rust_hash_sql(exec_pg_sql);
+                            let mut cached_stmt_name: *const c_char = std::ptr::null();
+                            if crate::pg_client::rust_stmt_cache_lookup(
+                                pg_conn as *mut c_void,
+                                sql_hash,
+                                &mut cached_stmt_name,
+                            ) != 0
+                            {
+                                crate::libpq_helpers::rust_pq_exec_prepared(
+                                    pg.conn,
+                                    cached_stmt_name,
+                                    0,
+                                    std::ptr::null(),
+                                    std::ptr::null(),
+                                    std::ptr::null(),
+                                    0,
+                                )
+                            } else {
+                                crate::libpq_helpers::rust_pq_exec(pg.conn, exec_pg_sql)
+                            }
                         }
-                    }
-                } else {
-                    let sql_hash = crate::pg_client::rust_hash_sql(exec_pg_sql);
-                    let mut cached_stmt_name: *const c_char = std::ptr::null();
-                    if crate::pg_client::rust_stmt_cache_lookup(
-                        pg_conn as *mut c_void,
-                        sql_hash,
-                        &mut cached_stmt_name,
-                    ) != 0
-                    {
-                        crate::libpq_helpers::rust_pq_exec_prepared(
-                            pg.conn,
-                            cached_stmt_name,
-                            0,
-                            std::ptr::null(),
-                            std::ptr::null(),
-                            std::ptr::null(),
-                            0,
-                        )
-                    } else {
-                        crate::libpq_helpers::rust_pq_exec(pg.conn, exec_pg_sql)
-                    }
-                };
+                    },
+                );
 
                 if !normalized.is_null() {
                     crate::db_interpose_helpers::rust_free_normalized_sql(normalized);
@@ -243,7 +256,7 @@ pub(crate) fn exec_via_postgres(
                     };
                     pg.last_changes = crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
 
-                    if starts_with_icase_bytes(sql_bytes, b"INSERT")
+                    if (starts_with_icase_bytes(sql_bytes, b"INSERT") || replacement)
                         && status == PGRES_TUPLES_OK
                         && crate::libpq_helpers::rust_pq_ntuples(res) > 0
                     {
@@ -260,7 +273,7 @@ pub(crate) fn exec_via_postgres(
                             id_str = id_buf.as_ptr();
                         }
                         if !id_str.is_null() && !CStr::from_ptr(id_str).to_bytes().is_empty() {
-                            if let Some(rowid) = parse_positive_returning_rowid(id_str) {
+                            if let Some(rowid) = parse_returning_rowid(id_str) {
                                 pg.last_insert_rowid = rowid;
                                 if !handle_conn.is_null() {
                                     (*handle_conn).last_insert_rowid = rowid;

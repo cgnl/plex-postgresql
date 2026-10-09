@@ -90,7 +90,7 @@ unsafe fn write_cached_text_output(
 
         let copy_len = str_len.min(TEXT_BUFFER_SIZE - 1);
         if copy_len > 0 {
-            ptr::copy_nonoverlapping(state.source_value as *const u8, buf.as_mut_ptr(), copy_len);
+            ptr::copy_nonoverlapping(state.source_value.cast::<u8>(), buf.as_mut_ptr(), copy_len);
         }
         buf[copy_len] = 0;
         out_ptr = buf.as_ptr();
