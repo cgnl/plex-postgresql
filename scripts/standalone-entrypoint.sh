@@ -133,6 +133,8 @@ init_schema() {
     fi
 
     validate_pg_schema_file "$schema_file" || return 1
+    apply_sqlite_schema_parity_upgrades "$SHIM_DIR/sqlite_constraint_parity_upgrade.sql" \
+        "$SHIM_DIR/fts_view_parity_upgrade.sql" || return 1
 
     # Ensure PostgreSQL compatibility helper functions exist.
     if [ -f "$compat_file" ]; then

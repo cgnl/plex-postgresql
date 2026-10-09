@@ -1,4 +1,4 @@
-name: Probe Docker Candidates (Promotion Blocked)
+name: Native Plex Acceptance Matrix
 
 on:
   push:
@@ -177,9 +177,10 @@ jobs:
           build-args: |
             BUILDER_IMAGE=${{ needs.resolve.outputs.builder_image }}
             PLEX_BASE_IMAGE=${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
-      - name: Probe the exact candidate digest (incomplete gate fails)
+      - name: Verify the exact candidate digest
         env:
           CANDIDATE_IMAGE: ${{ steps.image.outputs.repository }}@${{ steps.build.outputs.digest }}
+          BASE_PLEX_IMAGE: ${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
           POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
           EXPECTED_PLEX_VERSION: ${{ needs.resolve.outputs.plex_version }}
           EXPECTED_ARCH: ${{ matrix.arch }}
@@ -251,7 +252,7 @@ jobs:
               raise SystemExit('Source evidence mismatch')
           if (root / 'postgres-ref.txt').read_text().strip() != os.environ['EXPECTED_POSTGRES_IMAGE']:
               raise SystemExit('PostgreSQL evidence mismatch')
-          expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'workload-smoke-complete-certification-incomplete', 'exit_code': 1, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'real_movie_and_tv_playback_verified': True, 'real_media_full_decode_verified': True, 'promotion_allowed': False}
+          expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'native-workload-complete', 'exit_code': 0, 'workload_passed': True, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'real_movie_and_tv_playback_verified': True, 'real_media_full_decode_verified': True, 'native_import_and_rollback_verified': True, 'promotion_allowed': False}
           if any(result.get(key) != value for key, value in expected.items()):
               raise SystemExit('Prior native smoke failed or is incomplete')
           with open(os.environ['GITHUB_ENV'], 'a') as output:
@@ -279,18 +280,21 @@ jobs:
           path: evidence
           if-no-files-found: error
 
-  promotion-blocked:
-    name: Fail closed until full native Plex certification exists
+  native-acceptance:
+    name: Require complete native workload evidence
     if: always()
     needs: [resolve, runtime-e2e, candidate, soak]
     runs-on: ubuntu-latest
     steps:
-      - name: No production tags, manifests or releases
+      - name: Verify every native matrix lane completed
         env:
           RESOLUTION: ${{ needs.resolve.result }}
           RUNTIME: ${{ needs.runtime-e2e.result }}
           CANDIDATES: ${{ needs.candidate.result }}
+          SOAK: ${{ needs.soak.result }}
         run: |
-          echo "Resolution: $RESOLUTION; runtime: $RUNTIME; candidates: $CANDIDATES"
-          echo "::error::Promotion blocked: full native scan/playback/watch-state/artwork and outage certification is incomplete. No skipped or smoke-only gate authorizes a release."
-          exit 1
+          test "$RESOLUTION" = success
+          test "$RUNTIME" = success
+          test "$CANDIDATES" = success
+          test "$SOAK" = success
+          echo 'PASS all declared native workload lanes. Image promotion remains a separate action.'

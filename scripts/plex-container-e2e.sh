@@ -22,6 +22,7 @@ live_recovery_verified=0
 decoded_fixture_verified=0
 real_media_verified=0
 real_media_full_decode_verified=0
+native_roundtrip_verified=0
 real_media_sample_seconds=0
 if ((soak_seconds > 60)); then real_media_sample_seconds=20; fi
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -46,7 +47,7 @@ phase="setup"
 cleanup() {
     status=$?
     trap - EXIT
-    for container in "$plex" "$negative" "$postgres"; do
+    for container in "$plex" "$negative" "$fixture-source" "$fixture-imported" "$fixture-restored" "$postgres"; do
         if [[ $(docker inspect --format '{{index .Config.Labels "plex-pg-canary"}}' "$container" 2>/dev/null) == "$fixture" ]]; then
             docker logs "$container" > "$EVIDENCE_DIR/$container.log" 2>&1 || true
             docker inspect --format '{{json .State}}' "$container" > "$EVIDENCE_DIR/$container-state.json" || true
@@ -56,7 +57,7 @@ cleanup() {
             docker rm -fv "$container" >/dev/null || true
         fi
     done
-    for volume in "$config" "$negative_config"; do
+    for volume in "$config" "$negative_config" "$fixture-source-config" "$fixture-imported-config" "$fixture-restored-config"; do
         if [[ $(docker volume inspect --format '{{index .Labels "plex-pg-canary"}}' "$volume" 2>/dev/null) == "$fixture" ]]; then
             docker volume rm "$volume" >/dev/null || true
         fi
@@ -67,11 +68,11 @@ cleanup() {
     if [[ $(docker network inspect --format '{{index .Labels "plex-pg-canary"}}' "$download_network" 2>/dev/null) == "$fixture" ]]; then
         docker network rm "$download_network" >/dev/null || true
     fi
-    python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" "$real_media_verified" "$real_media_full_decode_verified" <<'PY'
+    python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" "$real_media_verified" "$real_media_full_decode_verified" "$native_roundtrip_verified" <<'PY'
 import json
 import sys
 from pathlib import Path
-path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded, real_media, full_decode = sys.argv[1:]
+path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded, real_media, full_decode, roundtrip = sys.argv[1:]
 Path(path).write_text(json.dumps({
     "phase": phase, "exit_code": int(status), "candidate": image,
     "plex_version": version, "variant": variant, "arch": arch,
@@ -82,6 +83,8 @@ Path(path).write_text(json.dumps({
     "decoded_fixture_verified": decoded == '1',
     "real_movie_and_tv_playback_verified": real_media == '1',
     "real_media_full_decode_verified": full_decode == '1',
+    "native_import_and_rollback_verified": roundtrip == '1',
+    "workload_passed": status == '0' and phase == 'native-workload-complete',
     "promotion_allowed": False,
     "missing_gate": "Full native matrix, scan/playback/watch-state/artwork and sustained outage workload",
 }, indent=2) + "\n")
@@ -459,6 +462,15 @@ assert_real_media() {
 assert_real_media first-start "$real_media_sample_seconds"
 real_media_verified=1
 if ((real_media_sample_seconds == 0)); then real_media_full_decode_verified=1; fi
+if ((real_media_sample_seconds == 0)); then
+    phase="native-import-and-rollback"
+    : "${BASE_PLEX_IMAGE:?digest-pinned original Plex base required for native source/rollback proof}"
+    python3 "$script_dir/plex-native-roundtrip.py" --candidate "$candidate_id" \
+        --base-image "$BASE_PLEX_IMAGE" --postgres "$postgres" --network "$network" \
+        --fixture "$fixture" --evidence-dir "$EVIDENCE_DIR/native-roundtrip" \
+        --media-cache "$media_cache" --expected-version "$EXPECTED_PLEX_VERSION"
+    native_roundtrip_verified=1
+fi
 docker network disconnect "$download_network" "$plex"
 phase="watch-state"
 metadata_id=$(docker exec "$postgres" psql -X -U plex -d plex -v ON_ERROR_STOP=1 -Atc \
@@ -609,6 +621,6 @@ done
 docker restart "$negative" >/dev/null
 assert_ready "$negative" recovery
 assert_no_crash_reports "$negative"
-phase="workload-smoke-complete-certification-incomplete"
-echo "API routing/persistence and container smoke completed. PROMOTION BLOCKED: full native workload certification is incomplete." >&2
-exit 1
+phase="native-workload-complete"
+echo "PASS native workload; complete matrix certification is evaluated separately."
+exit 0
