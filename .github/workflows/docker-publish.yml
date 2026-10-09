@@ -252,7 +252,7 @@ jobs:
               raise SystemExit('Source evidence mismatch')
           if (root / 'postgres-ref.txt').read_text().strip() != os.environ['EXPECTED_POSTGRES_IMAGE']:
               raise SystemExit('PostgreSQL evidence mismatch')
-          expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'native-workload-complete', 'exit_code': 0, 'workload_passed': True, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'real_movie_and_tv_playback_verified': True, 'real_media_full_decode_verified': True, 'native_import_and_rollback_verified': True, 'promotion_allowed': False}
+          expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'native-workload-complete', 'exit_code': 0, 'workload_passed': True, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'real_movie_and_tv_playback_verified': True, 'real_media_full_decode_verified': True, 'native_import_and_rollback_verified': True, 'four_concurrent_real_media_clients_verified': True, 'promotion_allowed': False}
           if any(result.get(key) != value for key, value in expected.items()):
               raise SystemExit('Prior native smoke failed or is incomplete')
           with open(os.environ['GITHUB_ENV'], 'a') as output:
@@ -283,7 +283,7 @@ jobs:
   native-acceptance:
     name: Require complete native workload evidence
     if: always()
-    needs: [resolve, runtime-e2e, candidate, soak]
+    needs: [resolve, runtime-e2e, candidate, soak, native-bundle-install]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every native matrix lane completed
@@ -292,9 +292,73 @@ jobs:
           RUNTIME: ${{ needs.runtime-e2e.result }}
           CANDIDATES: ${{ needs.candidate.result }}
           SOAK: ${{ needs.soak.result }}
+          BUNDLES: ${{ needs.native-bundle-install.result }}
         run: |
           test "$RESOLUTION" = success
           test "$RUNTIME" = success
           test "$CANDIDATES" = success
           test "$SOAK" = success
+          test "$BUNDLES" = success
           echo 'PASS all declared native workload lanes. Image promotion remains a separate action.'
+
+  native-bundle-install:
+    name: Native ZIP / ${{ matrix.variant }} / ${{ matrix.arch }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: linuxserver
+            arch: amd64
+            bundle_arch: x86_64
+            runner: ubuntu-24.04
+          - variant: linuxserver
+            arch: arm64
+            bundle_arch: aarch64
+            runner: ubuntu-24.04-arm
+          - variant: plexinc
+            arch: amd64
+            bundle_arch: x86_64
+            runner: ubuntu-24.04
+          - variant: plexinc
+            arch: arm64
+            bundle_arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the matching native release payload
+        env:
+          BUILDER_IMAGE: ${{ needs.resolve.outputs.builder_image }}
+          BUNDLE_ARCH: ${{ matrix.bundle_arch }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          docker buildx build --platform "linux/$ARCH" --target builder \
+            --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
+            --output type=local,dest=bundle-root .
+          mkdir -p "bundle/libs/$BUNDLE_ARCH" bundle/scripts bundle/schema
+          cp "bundle-root/libs/db_interpose_pg.so" "bundle/db_interpose_pg-linux-$BUNDLE_ARCH.so"
+          cp -L bundle-root/libs/*.so* "bundle/libs/$BUNDLE_ARCH/"
+          rm "bundle/libs/$BUNDLE_ARCH/db_interpose_pg.so"
+          cp scripts/install_wrappers_linux.sh scripts/migrate_lib.sh bundle/scripts/
+          cp schema/*.sql bundle/schema/
+          (cd bundle && zip -r ../native-bundle.zip .)
+      - name: Verify the ZIP on the unmodified pinned Plex image
+        env:
+          BASE_PLEX_IMAGE: ${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          EVIDENCE_DIR: evidence/native-bundle
+        run: bash scripts/test-native-linux-bundle.sh native-bundle.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-bundle-${{ matrix.variant }}-${{ matrix.arch }}
+          path: evidence/native-bundle
+          if-no-files-found: error

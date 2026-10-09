@@ -8,13 +8,19 @@ A small shim library that catches Plex SQLite calls and sends them to PostgreSQL
 
 ## Current validation status
 
-**v1.3.21 is a regular release.** The complete native matrix and 5h50 soak
-remain unfinished; publication does not claim full runtime certification.
-Local PlexInc/arm64/PG18 movie and TV playback/recovery passed, along with
-1,050 Rust tests and 15 shared-shim runtime E2E cases. Some GitHub runners could
-not download the real-media fixtures (HTTP 403). Browser playback and
-server-side transcoding remain unverified. Docker production promotion stays
-gated on complete native evidence.
+**v1.3.21 is a regular release.** v1.3.22 is being prepared from the follow-up fixes in draft [PR #31](https://github.com/cgnl/plex-postgresql/pull/31)
+are still undergoing final certification. The complete native matrix and 5h50
+soak remain pending. Native PlexInc/arm64/PG18 now passes genuine SQLite import,
+normal restart, both search routes, export and restoration into vanilla Plex,
+with watched state, server/media identity and source hashes preserved. The two
+observed search HTTP 500 causes have regressions and PostgreSQL 15/18 result
+parity. Browser playback and server-side transcoding remain unverified.
+
+The published v1.3.21 Linux ZIP includes both shim architectures but only ARM64
+`libpq`; it is not a complete native AMD64 installation bundle. The next bundle
+packages matched dependencies per architecture and validates its installation
+on the native runners. Docker production promotion remains gated on all native
+workload and ZIP-installation evidence.
 
 The acceptance matrix is **LinuxServer and PlexInc × native amd64 and arm64 ×
 PostgreSQL 15 and 18** (eight combinations), with 100 restart cycles per lane
@@ -31,7 +37,7 @@ fixes, plus real movie/TV acceptance tooling. See [the changelog](CHANGELOG.md).
 
 **100% Rust shim runtime** — the entire interpose layer is now pure Rust. All C runtime code has been eliminated. The shim compiles to a single static library linked into the dylib/so.
 
-- 🆕 **Full Rust runtime:** all interpose, column access, step execution, and connection management in Rust — eliminating memory leaks, buffer overflows, and use-after-free bugs by design
+- 🆕 **Rust runtime:** interpose, column access, execution and connection management use Rust with an explicit SQLite C ABI; native ownership and compatibility are verified separately
 - 🆕 **Module architecture:** monolithic files split into focused submodules for maintainability
 - 🔧 **Deadlock fixes:** recursive connection mutex, reduced lock hold times, lock-free logging fallback
 - 🔧 **Stack safety:** heap-allocated thread-local buffers for Plex's 544K worker thread stacks
@@ -60,14 +66,11 @@ pkill -f "Plex Media Server" 2>/dev/null || true
 ./scripts/install_wrappers.sh
 ```
 
-**Linux (x86_64):**
-```bash
-sudo curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.21/plex-postgresql-v1.3.21-linux.zip \
-  -o /tmp/plex-postgresql-linux.zip
-sudo unzip -j /tmp/plex-postgresql-linux.zip db_interpose_pg-linux-x86_64.so -d /usr/local/lib
-sudo mv /usr/local/lib/db_interpose_pg-linux-x86_64.so /usr/local/lib/db_interpose_pg.so
-# Then configure LD_PRELOAD in systemd service
-```
+**Linux:** use the architecture-aware installer from the corrected bundle.
+Keep its `libs/`, `scripts/` and `schema/` directories together. The published
+v1.3.21 ZIP lacks a complete matched dependency set; see the
+[Linux installation instructions](INSTALL.md#-linux-native) for the bundle format
+and validation status.
 
 **Docker:**
 ```bash
@@ -83,8 +86,8 @@ See detailed installation instructions below for each platform.
 | Platform | Architecture | Status |
 |----------|-------------|---------|
 | macOS | ARM64 (M1/M2/M3/M4) | ✅ Production tested |
-| Linux | x86_64 | ✅ Pre-compiled binary |
-| Linux | ARM64 | ✅ Pre-compiled binary |
+| Linux | x86_64 | Corrected native bundle under validation |
+| Linux | ARM64 | Native bundle install/load verified; matrix pending |
 | Docker | x86_64 + ARM64 | ✅ Multi-arch support |
 
 ## Why PostgreSQL?
@@ -288,21 +291,18 @@ pkill -f "Plex Media Server" 2>/dev/null || true
 
 ## Quick Start (Linux Native)
 
-Use the latest Linux zip and install the binary for your CPU.
+The corrected bundle contains both named shims and `libs/x86_64/` plus
+`libs/aarch64/` runtime dependencies. This format is part of the follow-up work;
+the already published v1.3.21 ZIP does not contain it.
+
+Extract a corrected bundle without flattening its directories. The installer
+selects and validates the matching shim, dependencies and Plex loader before
+changing Plex files:
 
 ```bash
-curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.21/plex-postgresql-v1.3.21-linux.zip -o /tmp/plex-pg-linux.zip
 mkdir -p /tmp/plex-pg-linux
+unzip /path/to/corrected-linux-bundle.zip -d /tmp/plex-pg-linux
 cd /tmp/plex-pg-linux
-unzip /tmp/plex-pg-linux.zip
-
-sudo mkdir -p /usr/local/lib/plex-postgresql
-if [ "$(uname -m)" = "x86_64" ]; then
-  sudo install -m 755 db_interpose_pg-linux-x86_64.so /usr/local/lib/plex-postgresql/db_interpose_pg.so
-else
-  sudo install -m 755 db_interpose_pg-linux-aarch64.so /usr/local/lib/plex-postgresql/db_interpose_pg.so
-fi
-
 sudo systemctl stop plexmediaserver
 sudo ./scripts/install_wrappers_linux.sh
 sudo systemctl start plexmediaserver

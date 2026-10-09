@@ -61,17 +61,20 @@ jobs:
           set -eux
           cp "out/${{ matrix.arch }}/libs/db_interpose_pg.so" "dist/${{ matrix.out_name }}"
 
-      - name: Collect libpq (arm64 only)
-        if: matrix.arch == 'aarch64'
+      - name: Collect matching runtime libraries
         run: |
           set -eux
-          cp "out/${{ matrix.arch }}/libs/libpq.so.5" "dist/libpq.so.5"
+          mkdir -p "dist/libs/${{ matrix.arch }}"
+          cp -L out/${{ matrix.arch }}/libs/*.so* "dist/libs/${{ matrix.arch }}/"
+          rm "dist/libs/${{ matrix.arch }}/db_interpose_pg.so"
+          test -s "dist/libs/${{ matrix.arch }}/libpq.so.5"
+          test -s "dist/libs/${{ matrix.arch }}/libgcc_s.so.1"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
-          path: dist/*
+          path: dist/
           if-no-files-found: error
 
   package-linux-zip:
@@ -109,7 +112,9 @@ jobs:
 
           cp release-assets/linux-x86_64/db_interpose_pg-linux-x86_64.so "$STAGE/"
           cp release-assets/linux-aarch64/db_interpose_pg-linux-aarch64.so "$STAGE/"
-          cp release-assets/linux-aarch64/libpq.so.5 "$STAGE/"
+          mkdir -p "$STAGE/libs"
+          cp -R release-assets/linux-x86_64/libs/x86_64 "$STAGE/libs/"
+          cp -R release-assets/linux-aarch64/libs/aarch64 "$STAGE/libs/"
 
           cp README.md CHANGELOG.md INSTALL.md LICENSE THIRD_PARTY_LICENSES "$STAGE/"
           cp -R scripts/* "$STAGE/scripts/"
@@ -144,4 +149,4 @@ jobs:
           files: |
             release-assets/linux-release-zip/plex-postgresql-*-linux.zip
             release-assets/linux-release-zip/plex-postgresql-*-linux.zip.sha256
-          overwrite_files: true
+          overwrite_files: false

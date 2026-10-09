@@ -137,4 +137,4 @@ jobs:
           files: |
             release-assets/macos-release-zip/plex-postgresql-*-macos.zip
             release-assets/macos-release-zip/plex-postgresql-*-macos.zip.sha256
-          overwrite_files: true
+          overwrite_files: false

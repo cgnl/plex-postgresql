@@ -23,6 +23,7 @@ decoded_fixture_verified=0
 real_media_verified=0
 real_media_full_decode_verified=0
 native_roundtrip_verified=0
+concurrent_real_media_verified=0
 real_media_sample_seconds=0
 if ((soak_seconds > 60)); then real_media_sample_seconds=20; fi
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -68,11 +69,11 @@ cleanup() {
     if [[ $(docker network inspect --format '{{index .Labels "plex-pg-canary"}}' "$download_network" 2>/dev/null) == "$fixture" ]]; then
         docker network rm "$download_network" >/dev/null || true
     fi
-    python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" "$real_media_verified" "$real_media_full_decode_verified" "$native_roundtrip_verified" <<'PY'
+    python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" "$real_media_verified" "$real_media_full_decode_verified" "$native_roundtrip_verified" "$concurrent_real_media_verified" <<'PY'
 import json
 import sys
 from pathlib import Path
-path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded, real_media, full_decode, roundtrip = sys.argv[1:]
+path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded, real_media, full_decode, roundtrip, concurrent = sys.argv[1:]
 Path(path).write_text(json.dumps({
     "phase": phase, "exit_code": int(status), "candidate": image,
     "plex_version": version, "variant": variant, "arch": arch,
@@ -84,6 +85,7 @@ Path(path).write_text(json.dumps({
     "real_movie_and_tv_playback_verified": real_media == '1',
     "real_media_full_decode_verified": full_decode == '1',
     "native_import_and_rollback_verified": roundtrip == '1',
+    "four_concurrent_real_media_clients_verified": concurrent == '1',
     "workload_passed": status == '0' and phase == 'native-workload-complete',
     "promotion_allowed": False,
     "missing_gate": "Full native matrix, scan/playback/watch-state/artwork and sustained outage workload",
@@ -459,6 +461,197 @@ assert_real_media() {
     [[ $(cat "$EVIDENCE_DIR/$stage-tv-shadow.txt") == 0 ]] || { echo "TV metadata leaked to SQLite" >&2; return 1; }
     assert_no_crash_reports "$plex"
 }
+assert_concurrent_real_media() {
+    local stage="$1" output="/tmp/concurrent-real-media-$1" status=0
+    docker exec -i "$plex" python3 - "$section_id" "$tv_section_id" "$bbb_file" \
+        "$tv_season/The Beverly Hillbillies - S01E01 - The Clampetts Strike Oil.mp4" \
+        "$tv_season/The Beverly Hillbillies - S01E02 - Getting Settled.mp4" "$output" <<'PY' || status=1
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+movie_section, tv_section, movie, episode1, episode2, destination = sys.argv[1:]
+output = Path(destination)
+output.mkdir(parents=True, exist_ok=False)
+gate = output / "start"
+result = {"passed": False, "clients_requested": 4, "sample_seconds": 20, "decoder_input_rate": "realtime",
+          "browser_playback_verified": False, "server_transcoding_verified": False,
+          "workload": [], "postgres_sessions": []}
+clients = []
+logs = []
+workload_errors = []
+done = threading.Event()
+base = "http://127.0.0.1:32400"
+
+def request(path, params=None):
+    url = base + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=10) as response:
+        body = response.read(8 * 1024 * 1024 + 1)
+    if len(body) > 8 * 1024 * 1024:
+        raise RuntimeError("Oversized workload metadata response")
+    return body
+
+def mixed_workload(key):
+    try:
+        started = time.monotonic()
+        request("/library/sections/" + tv_section + "/refresh", {"force": 1})
+        result["workload"].append({"action": "tv_rescan", "start": started,
+                                   "end": time.monotonic(), "passed": True})
+        for iteration in range(60):
+            if done.is_set():
+                break
+            if iteration in (5, 20, 40):
+                started = time.monotonic()
+                request("/library/sections/" + tv_section + "/refresh", {"force": 1})
+                result["workload"].append({"action": "tv_rescan", "start": started,
+                                           "end": time.monotonic(), "passed": True})
+            started = time.monotonic()
+            root = ET.fromstring(request("/library/metadata/" + key))
+            if not any(video.get("ratingKey") == key for video in root.iter("Video")):
+                raise RuntimeError("Concurrent metadata read lost real movie identity")
+            action = "scrobble" if iteration % 2 == 0 else "unscrobble"
+            request("/:/" + action, {"key": key, "identifier": "com.plexapp.plugins.library"})
+            watched = list(ET.fromstring(request("/library/metadata/" + key)).iter("Video"))
+            if len(watched) != 1 or (int(watched[0].get("viewCount", "0")) > 0) != (action == "scrobble"):
+                raise RuntimeError("Concurrent real-media watch write was not visible through Plex API")
+            result["workload"].append({"action": "metadata_read_and_" + action,
+                                       "start": started, "end": time.monotonic(), "passed": True})
+            done.wait(0.1)
+    except Exception as error:
+        workload_errors.append(str(error))
+
+# Record the real native decoder process interval, excluding metadata setup
+# and codec version checks. Its input is the Plex HTTP original-file route.
+client_code = r'''
+import json, os, runpy, subprocess, sys, time
+from pathlib import Path
+gate, output, *arguments = sys.argv[1:]
+deadline = time.monotonic() + 15
+while not Path(gate).exists():
+    if time.monotonic() > deadline: raise RuntimeError("Concurrent client start gate timed out")
+    time.sleep(0.01)
+original_run = subprocess.run
+def timed_run(command, *args, **kwargs):
+    if "-progress" not in command:
+        return original_run(command, *args, **kwargs)
+    # Read HTTP media at playback speed to sustain a meaningful bounded load
+    # rather than racing four decoders through the sample as fast as possible.
+    command = list(command)
+    command.insert(command.index("-i"), "-re")
+    started = time.monotonic()
+    try:
+        return original_run(command, *args, **kwargs)
+    finally:
+        Path(output, "decoder-interval.json").write_text(json.dumps({"start": started, "end": time.monotonic()}))
+subprocess.run = timed_run
+sys.argv = ["/tmp/verify-bbb-playback.py", *arguments]
+runpy.run_path(sys.argv[0], run_name="__main__")
+'''
+pg_environment = os.environ.copy()
+for name in ("HOST", "PORT", "DATABASE", "USER", "PASSWORD"):
+    pg_environment["PG" + name] = os.environ["PLEX_PG_" + name]
+workload = None
+try:
+    listing = ET.fromstring(request("/library/sections/" + movie_section + "/all"))
+    movies = [video for video in listing.iter("Video")
+              if any(part.get("file") == movie for part in video.iter("Part"))]
+    if len(movies) != 1:
+        raise RuntimeError("Concurrent burst lacks unique genuine BBB metadata")
+    key = movies[0].get("ratingKey")
+    fixtures = [(movie_section, movie, []),
+                (tv_section, episode1, ["--kind", "episode", "--season", "1", "--episode", "1"]),
+                (tv_section, episode2, ["--kind", "episode", "--season", "1", "--episode", "2"]),
+                (movie_section, movie, [])]
+    for index, (section, media, options) in enumerate(fixtures, 1):
+        directory = output / ("client-" + str(index))
+        directory.mkdir()
+        log = (directory / "client.log").open("wb")
+        logs.append(log)
+        clients.append(subprocess.Popen([sys.executable, "-c", client_code, str(gate), str(directory),
+                                         section, media, str(directory), *options, "--sample-seconds", "20"],
+                                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True))
+    gate.touch()
+    workload = threading.Thread(target=mixed_workload, args=(key,), daemon=True)
+    workload.start()
+    deadline = time.monotonic() + 180
+    while any(client.poll() is None for client in clients):
+        if time.monotonic() > deadline:
+            raise RuntimeError("Concurrent real-media burst exceeded 180 seconds")
+        count = subprocess.run(["psql", "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c",
+                                "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
+                                "AND client_addr IS NOT NULL AND pid<>pg_backend_pid()"],
+                               env=pg_environment, capture_output=True, text=True, timeout=10, check=True)
+        result["postgres_sessions"].append({"time": time.monotonic(), "count": int(count.stdout.strip())})
+        time.sleep(0.1)
+    done.set()
+    workload.join(timeout=25)
+    if workload.is_alive() or workload_errors:
+        raise RuntimeError("Concurrent metadata/watch workload failed: " + "; ".join(workload_errors))
+    if any(client.returncode != 0 for client in clients):
+        raise RuntimeError("Concurrent real-media client failed; see client logs")
+    results = []
+    for index in range(1, 5):
+        directory = output / ("client-" + str(index))
+        playback = json.loads((directory / "bbb-playback.json").read_text())
+        interval = json.loads((directory / "decoder-interval.json").read_text())
+        if not (playback.get("passed") and playback["decode"]["completed"]
+                and playback["decode"]["input"] == "plex_http"
+                and playback["delivery"]["sample_seconds"] == 20):
+            raise RuntimeError("Concurrent client did not complete real HTTP audio/video decoding")
+        results.append({"client": index, "interval": interval, "media": playback["media"],
+                        "passed": True, "playback_evidence": "client-" + str(index) + "/bbb-playback.json"})
+    overlap_start = max(item["interval"]["start"] for item in results)
+    overlap_end = min(item["interval"]["end"] for item in results)
+    result["clients"] = results
+    result["four_client_overlap_seconds"] = max(0, overlap_end - overlap_start)
+    if overlap_end <= overlap_start:
+        raise RuntimeError("Four real HTTP decoder processes did not overlap")
+    mixed_overlap = [event for event in result["workload"]
+                     if event["start"] < overlap_end and event["end"] > overlap_start]
+    if not any(event["action"].startswith("metadata_read_and_") for event in mixed_overlap):
+        raise RuntimeError("Metadata/watch workload did not overlap all four HTTP clients")
+    if not any(event["action"] == "tv_rescan" for event in mixed_overlap):
+        raise RuntimeError("Real TV rescan did not overlap all four HTTP clients")
+    if not any(sample["count"] > 0 and overlap_start <= sample["time"] <= overlap_end
+               for sample in result["postgres_sessions"]):
+        raise RuntimeError("No PostgreSQL session observation during four-client overlap")
+    result["mixed_workload_overlap_events"] = len(mixed_overlap)
+    result["passed"] = True
+    print("PASS four overlapping real H264/audio HTTP clients with TV scan and metadata/watch workload")
+except Exception as error:
+    result["error"] = str(error)
+    print("FAIL concurrent real-media burst: " + str(error), file=sys.stderr)
+finally:
+    done.set()
+    for client in clients:
+        if client.poll() is None:
+            os.killpg(client.pid, signal.SIGTERM)
+            try:
+                client.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(client.pid, signal.SIGKILL)
+                client.wait(timeout=5)
+    for log in logs:
+        log.close()
+    (output / "concurrent-playback.json").write_text(json.dumps(result, indent=2) + "\n")
+sys.exit(0 if result["passed"] else 1)
+PY
+    mkdir -p "$EVIDENCE_DIR/$stage-concurrent-real-media"
+    docker cp "$plex:$output/." "$EVIDENCE_DIR/$stage-concurrent-real-media/" || status=1
+    ((status == 0)) || return 1
+    assert_no_crash_reports "$plex"
+}
+
 assert_real_media first-start "$real_media_sample_seconds"
 real_media_verified=1
 if ((real_media_sample_seconds == 0)); then real_media_full_decode_verified=1; fi
@@ -511,6 +704,11 @@ PY
 }
 set_watch_state scrobble
 assert_watch_state watched 1
+phase="concurrent-real-media"
+assert_concurrent_real_media smoke
+concurrent_real_media_verified=1
+set_watch_state scrobble
+assert_watch_state concurrent-smoke-watched 1
 phase="restart"
 for ((cycle=1; cycle<=restart_cycles; cycle++)); do
     stage=restart
@@ -543,6 +741,7 @@ if ((soak_seconds > 0)); then
         done
         ((reader_failure == 0)) || { echo "Concurrent soak reader failed" >&2; exit 1; }
         assert_real_media "$stage" 20
+        assert_concurrent_real_media "$stage"
         set_watch_state unscrobble
         assert_watch_state "$stage-unwatched" 0
         set_watch_state scrobble

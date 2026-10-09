@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.22]
+
 ### Fixed
 - Preserve the SQLite MATCH boundary before following AND/OR filters and retain grouping for tag ranking by `count(*)`, fixing both observed native `/hubs/search` HTTP 500 errors.
 - Recognize exact repository bootstrap rows, including Administrator and preferences, before migration; reject modified defaults and preserve existing library data under destination locks.
@@ -17,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Import from private SQLite snapshots, retain source hashes, native Boolean-affinity values and the source migration history, and apply startup schema upgrades atomically.
 - Require a genuine matching companion database template for native export, preserving its full Plex schema and non-blob contents while replacing current blob data.
 - Include migration helpers and trusted schema/seed files in Docker images and release bundles.
+- Package Linux runtime dependencies per architecture and validate their Plex loader resolution before installation changes.
+
+### Added
+- Native ZIP installation gates for both image variants and CPU architectures, plus four concurrent real H264/audio clients during scans and metadata/watch updates.
 
 
 ## [1.3.21] - 2026-10-09

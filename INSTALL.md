@@ -331,7 +331,10 @@ curl -s http://localhost:32400/library/sections | head -10
 
 ### Option 1: Pre-compiled ZIP (Recommended)
 
-**Latest Release:** [v1.0.0](https://github.com/cgnl/plex-postgresql/releases/tag/v1.0.0)
+The next Linux bundle includes separate runtime libraries for x86_64 and ARM64.
+The published v1.3.21 ZIP predates this format and lacks the complete native
+runtime dependencies. Use Docker or build from source until a newer bundle is
+published. Select a newer bundle from [Releases](https://github.com/cgnl/plex-postgresql/releases).
 
 **Available architectures:**
 - ✅ x86_64 (Intel/AMD 64-bit) - `db_interpose_pg-linux-x86_64.so`
@@ -358,21 +361,14 @@ sudo -u postgres psql -c "ALTER USER plex PASSWORD 'yourpassword';"
 **2. Download and Install**
 
 ```bash
-# Download latest Linux zip
-curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.0.0/plex-postgresql-v1.0.0-linux.zip -o /tmp/plex-pg-linux.zip
+# Choose a newer release that includes libs/x86_64 and libs/aarch64.
+RELEASE_TAG=vX.Y.Z
+curl -fL "https://github.com/cgnl/plex-postgresql/releases/download/$RELEASE_TAG/plex-postgresql-$RELEASE_TAG-linux.zip" -o /tmp/plex-pg-linux.zip
 
 # Extract
 mkdir -p /tmp/plex-pg-linux
 cd /tmp/plex-pg-linux
 unzip /tmp/plex-pg-linux.zip
-
-# Install shim binary
-sudo mkdir -p /usr/local/lib/plex-postgresql
-if [ "$(uname -m)" = "x86_64" ]; then
-  sudo install -m 755 db_interpose_pg-linux-x86_64.so /usr/local/lib/plex-postgresql/db_interpose_pg.so
-else
-  sudo install -m 755 db_interpose_pg-linux-aarch64.so /usr/local/lib/plex-postgresql/db_interpose_pg.so
-fi
 
 # Stop Plex and install wrappers
 sudo systemctl stop plexmediaserver
@@ -380,7 +376,8 @@ sudo ./scripts/install_wrappers_linux.sh
 ```
 
 **What the installer does:**
-- ✅ Checks the Plex installation
+- ✅ Checks the Plex installation and library compatibility before replacing binaries
+- ✅ Installs the shim and runtime libraries matching your CPU
 - ✅ Backs up original binaries
 - ✅ Migrates SQLite to PostgreSQL
 - ✅ Installs wrapper scripts to `/usr/lib/plexmediaserver/`

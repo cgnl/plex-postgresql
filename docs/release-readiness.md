@@ -25,6 +25,23 @@ watch state. These are different intermediate artifacts; the final frozen
 candidate's complete native matrix and soak remain pending. See
 [validation evidence](stability-validation-2026-10-09.md).
 
+## Follow-up evidence
+
+[The checked-in local evidence summary](evidence/backlog-native-arm64-20261009.json)
+records native PlexInc/ARM64/PostgreSQL 18 source import, restart, both search
+routes, export and vanilla restoration with the same 442 migration markers in
+both databases. Source hashes, watched state and server/media identity survive.
+The full real movie/TV workload, PostgreSQL recovery without a PMS restart and
+four overlapping 20-second native decoder clients pass in the local smoke.
+The four-client common overlap is 19.60 seconds, with 61 mixed workload events.
+Browser playback and server transcoding are not claimed.
+
+The native Linux ZIP audit found that the published v1.3.21 bundle ships an
+AMD64 shim but only ARM64 libpq. The corrected architecture-specific bundle
+and loader preflight pass native ARM64 tests. Both variants and architectures
+are now required installation gates. Published v1.3.21 artifacts remain intact.
+The final frozen matrix, 100 restarts and 5h50 soak are still pending.
+
 ## Issue ledger
 
 Each row must acquire a sanitized reproducer, its observed failure signature,
@@ -36,14 +53,14 @@ prove identical causes.
 | --- | --- | --- |
 | [#1](https://github.com/cgnl/plex-postgresql/issues/1): Docker build | Both native architectures build cleanly from the pinned inputs and boot the resulting artifacts. | ARM64 build evidence exists; native amd64 acceptance remains. |
 | [#2](https://github.com/cgnl/plex-postgresql/issues/2): shim/type exceptions | Real SQLite ABI storage classes, integer/datetime decltypes and native device queries agree; no swallowed native exception. | Runtime type E2E passes; exact historical native failure signature needs regression coverage. |
-| [#4](https://github.com/cgnl/plex-postgresql/issues/4): export/rollback | Consistent library/blob snapshot, failure-safe export, then native Plex opens exported databases and preserves media/watch state/search/artwork. | Export E2E exists; exported data is not yet a certified native rollback. |
-| [#5](https://github.com/cgnl/plex-postgresql/issues/5): inline/ABI loading | Both variants/architectures resolve their actual runtime dependencies; preload is limited to intended Plex processes; no OpenSSL/glibc/musl symbol mismatch. | Bundled libpq and child filtering reduce exposure; full native ABI matrix is required. |
+| [#4](https://github.com/cgnl/plex-postgresql/issues/4): export/rollback | Consistent library/blob snapshot, failure-safe export, then native Plex opens exported databases and preserves media/watch state/search/artwork. | Genuine native ARM64 source/import/export/vanilla restoration passes with a matching companion template; complete native matrix certification remains. |
+| [#5](https://github.com/cgnl/plex-postgresql/issues/5): inline/ABI loading | Both variants/architectures resolve their actual runtime dependencies; preload is limited to intended Plex processes; no OpenSSL/glibc/musl symbol mismatch. | Native ARM64 corrected ZIP installer and both executable loader checks pass; both-variant/architecture CI gates and full workload matrix remain. |
 | [#6](https://github.com/cgnl/plex-postgresql/issues/6): Windows quickstart | CRLF checkout/build and Docker Desktop startup follow the documented supported installation path. | Actual Git checkout with core.autocrlf=true preserves LF shell syntax using existing attributes; Windows Docker Desktop acceptance remains unvalidated. |
 | [#8](https://github.com/cgnl/plex-postgresql/issues/8): PostgreSQL restart | An already running Plex serves its library again without restarting Plex; interrupted writes/transactions do not partially commit or replay. | Shim reconnect E2E and native PlexInc ARM64 PG18 read/write recovery with unchanged PMS PID pass; full native matrix still pending. |
-| [#9](https://github.com/cgnl/plex-postgresql/issues/9): load/pool starvation | Concurrent scanning and 3–4 client streams with bounded pool pressure, no unexpected metadata failures, leaked sessions or transaction contamination. | Handle/transaction E2E passes; real sustained mixed load is unvalidated. |
-| [#10](https://github.com/cgnl/plex-postgresql/issues/10): migration/startup | All seven subreports below independently pass. | Native startup remains a blocker; generic runtime passes are insufficient. |
+| [#9](https://github.com/cgnl/plex-postgresql/issues/9): load/pool starvation | Concurrent scanning and 3–4 client streams with bounded pool pressure, no unexpected metadata failures, leaked sessions or transaction contamination. | Four native H264/audio decoder clients overlap for 19.60s during TV rescans and metadata/watch writes; full sustained mixed-load soak remains. |
+| [#10](https://github.com/cgnl/plex-postgresql/issues/10): migration/startup | All seven subreports below independently pass. | Genuine imported native ARM64 startup and restart now pass; all seven subreports still require the final declared matrix evidence. |
 | [#15](https://github.com/cgnl/plex-postgresql/issues/15): maintenance | Documented maintainer responsibility for failed canaries, triage and release approval. | Governance report, not a runtime bug; assigning responsibility is not a code fix. |
-| [#17](https://github.com/cgnl/plex-postgresql/issues/17): native shim crash | Fresh and migrated startup, plugin initialization and preferences reads remain crash-free through repeated cycles on each native lane. | Real candidate still produces a startup crash report. |
+| [#17](https://github.com/cgnl/plex-postgresql/issues/17): native shim crash | Fresh and migrated startup, plugin initialization and preferences reads remain crash-free through repeated cycles on each native lane. | Repaired candidate passes fresh/imported native ARM64 startup, plugin reads and restart; final native lanes and 100-cycle evidence remain. |
 | [#22](https://github.com/cgnl/plex-postgresql/issues/22): STRM/zurg question | Controlled local HTTP/STRM fixture proves the supported scan/stream behavior, or documentation explicitly declares it unsupported. | Synthetic AVI evidence does not establish STRM or remote VPS support. |
 | [#23](https://github.com/cgnl/plex-postgresql/issues/23): PostgreSQL 18 question | PostgreSQL 18 migration plus the actual native workload matrix, not just translation tests. | Linux/musl PG 18 runtime E2E passes; native PG 18 matrix remains pending. |
 | [#24](https://github.com/cgnl/plex-postgresql/issues/24): bootstrap migration | Bootstrap Administrator/preferences rows do not suppress real import; genuine populated destinations are preserved; required shadow extensions are checked. | PostgreSQL 15/18 prove exact full/subset seed imports and preservation of modified rows, including a concurrent-writer race. Full imported-library native acceptance remains; #24 stays open for all three reported failures. |
