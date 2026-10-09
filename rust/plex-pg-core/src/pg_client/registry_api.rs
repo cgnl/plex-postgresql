@@ -1,12 +1,11 @@
-use std::ffi::CString;
 use std::os::raw::c_void;
 
 use crate::ffi_types::{sqlite3, PgConnection};
 
 use super::config::env_nonzero;
-use super::connection_helpers::{conn_db_path, conn_is_pg_active, conn_is_pg_active_ptr};
-use super::pool_lookup::{is_library_db, pool_find_connection_for_db};
-use super::{log_debug, pool, rust_find_any_library_connection, rust_find_registered_connection};
+use super::connection_helpers::{conn_db_path, conn_is_pg_active};
+use super::pool_lookup::is_library_db;
+use super::{pool, rust_find_any_library_connection, rust_find_registered_connection};
 
 /// Register a non-pooled connection using its shadow DB handle.
 #[no_mangle]
@@ -36,6 +35,7 @@ pub extern "C" fn rust_pg_unregister_connection(conn_ptr: *mut PgConnection) {
         return;
     }
     pool().registry.unregister(db as usize);
+    super::transaction::forget_connection(conn_ptr);
 }
 
 /// Find the handle connection for a sqlite3* handle.
@@ -70,21 +70,10 @@ pub extern "C" fn rust_pg_find_connection(db_handle: *const sqlite3) -> *mut PgC
             return std::ptr::null_mut();
         }
 
-        if env_nonzero("PLEX_PG_DISABLE_POOL") {
-            if conn_is_pg_active(handle_ref) {
-                return handle_conn;
-            }
-            return std::ptr::null_mut();
+        if conn_is_pg_active(handle_ref) {
+            super::transaction::ensure_handle_session(handle_conn);
+            return handle_conn;
         }
-
-        if let Ok(cs) = CString::new(path) {
-            let pool_conn = pool_find_connection_for_db(db_handle as usize, cs.as_ptr());
-            if !pool_conn.is_null() && conn_is_pg_active_ptr(pool_conn as *mut PgConnection) {
-                return pool_conn as *mut PgConnection;
-            }
-        }
-
-        log_debug("Pool full for library.db, falling back to SQLite");
         return std::ptr::null_mut();
     }
 

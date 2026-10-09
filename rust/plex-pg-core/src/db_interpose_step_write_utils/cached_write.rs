@@ -100,14 +100,23 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
         if !pg_conn_error_out.is_null() {
             *pg_conn_error_out = 0;
         }
+        if !cached_io.is_null() && !(*cached_io).is_null() && (**cached_io).write_executed < 0 {
+            return STEP_RESULT_ERROR;
+        }
+        let handle_conn = if p_stmt.is_null() {
+            changes_conn
+        } else {
+            crate::pg_client::rust_pg_find_handle_connection(sqlite3_db_handle(p_stmt))
+        };
         if exec_conn.is_null()
             || (&*exec_conn).conn.is_null()
             || orig_sql.is_null()
             || exec_sql.is_null()
         {
-            if !pg_conn_error_out.is_null() {
-                *pg_conn_error_out = 1;
-            }
+            crate::db_interpose_exec::pg_path::set_pg_last_error(
+                handle_conn,
+                "PostgreSQL cached write connection or SQL unavailable",
+            );
             return STEP_RESULT_ERROR;
         }
 
@@ -126,9 +135,10 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
         if ec.conn.is_null() {
             log_error("CACHED EXEC: conn became NULL after lock (TOCTOU race)");
             conn_guard.unlock();
-            if !pg_conn_error_out.is_null() {
-                *pg_conn_error_out = 1;
-            }
+            crate::db_interpose_exec::pg_path::set_pg_last_error(
+                handle_conn,
+                "PostgreSQL cached write connection unavailable",
+            );
             return STEP_RESULT_ERROR;
         }
 
@@ -215,19 +225,19 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                 crate::libpq_helpers::rust_pq_exec(ec.conn, exec_sql)
             }
         };
-        conn_guard.unlock();
-
         let status = crate::libpq_helpers::rust_pq_result_status(res);
         if status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK {
+            crate::db_interpose_exec::pg_path::clear_pg_last_error(exec_conn);
+            crate::db_interpose_exec::pg_path::clear_pg_last_error(changes_conn);
+            let cmd_tuples = crate::libpq_helpers::rust_pq_cmd_tuples(res);
+            let tuples_ptr = if cmd_tuples.is_null() {
+                b"0\0".as_ptr() as *const c_char
+            } else {
+                cmd_tuples
+            };
+            ec.last_changes = crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
             if !changes_conn.is_null() {
-                let cc = &mut *changes_conn;
-                let cmd_tuples = crate::libpq_helpers::rust_pq_cmd_tuples(res);
-                let tuples_ptr = if cmd_tuples.is_null() {
-                    b"1\0".as_ptr() as *const c_char
-                } else {
-                    cmd_tuples
-                };
-                cc.last_changes = crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
+                (*changes_conn).last_changes = ec.last_changes;
             }
 
             if starts_with_icase_bytes(cstr_bytes(orig_sql), b"INSERT")
@@ -247,6 +257,10 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                     id_str = id_buf.as_ptr();
                 }
                 if !id_str.is_null() && !CStr::from_ptr(id_str).to_bytes().is_empty() {
+                    let rowid = crate::db_interpose_helpers::rust_pg_text_to_int64(id_str);
+                    if rowid > 0 && !handle_conn.is_null() {
+                        (*handle_conn).last_insert_rowid = rowid;
+                    }
                     let meta_id = crate::pg_statement::rust_extract_metadata_id(orig_sql);
                     if meta_id > 0 {
                         crate::pg_client::rust_set_global_metadata_id(meta_id);
@@ -254,11 +268,11 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                 }
             }
         } else {
-            let err = if !changes_conn.is_null() && !(&*changes_conn).conn.is_null() {
-                crate::libpq_helpers::rust_pq_error_message((&*changes_conn).conn)
-            } else {
-                b"NULL connection\0".as_ptr() as *const c_char
-            };
+            crate::db_interpose_exec::pg_path::record_pg_result_error(exec_conn, exec_conn, res);
+            ec.last_changes = 0;
+            crate::db_interpose_exec::pg_path::copy_pg_outcome(changes_conn, exec_conn);
+            crate::db_interpose_exec::pg_path::copy_pg_outcome(handle_conn, exec_conn);
+            let err = ec.last_error.as_ptr();
             log_sql_fallback(
                 orig_sql,
                 exec_sql,
@@ -267,15 +281,36 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
             );
             if is_stale_prepared_stmt(res) {
                 crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
-                crate::libpq_helpers::rust_pq_clear(res);
-                if !pg_conn_error_out.is_null() {
-                    *pg_conn_error_out = 1;
-                }
-                return STEP_RESULT_ERROR;
             }
+            crate::libpq_helpers::rust_pq_clear(res);
+            let mut cached = if cached_io.is_null() {
+                std::ptr::null_mut()
+            } else {
+                *cached_io
+            };
+            if cached.is_null() {
+                cached = crate::pg_statement::rust_stmt_create(changes_conn, orig_sql, p_stmt);
+                if !cached.is_null() {
+                    (*cached).is_pg = 1;
+                    (*cached).is_cached = 1;
+                    crate::pg_statement::rust_cached_stmt_register(
+                        p_stmt as usize,
+                        cached as usize,
+                    );
+                    if !cached_io.is_null() {
+                        *cached_io = cached;
+                    }
+                }
+            }
+            if !cached.is_null() {
+                (*cached).write_executed = -1;
+            }
+            conn_guard.unlock();
             crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+            return STEP_RESULT_ERROR;
         }
 
+        crate::db_interpose_exec::pg_path::copy_pg_outcome(handle_conn, exec_conn);
         if !res.is_null() {
             crate::libpq_helpers::rust_pq_clear(res);
         }

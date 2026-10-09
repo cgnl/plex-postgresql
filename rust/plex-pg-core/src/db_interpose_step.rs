@@ -22,7 +22,6 @@ pub(crate) const STEP_RESULT_DONE: c_int = SQLITE_DONE;
 pub(crate) const STEP_RESULT_ROW: c_int = SQLITE_ROW;
 pub(crate) const STEP_RESULT_ERROR: c_int = SQLITE_ERROR;
 
-const PQTRANS_IDLE: c_int = 0;
 const LOADONE_STEP_TRACE_LIMIT: u32 = 5_000;
 static LOADONE_STEP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -175,10 +174,11 @@ pub extern "C" fn rust_my_sqlite3_step(p_stmt: *mut sqlite3_stmt) -> c_int {
 
     let rc = unsafe { my_sqlite3_step_impl(p_stmt) };
 
-    if let Some(retry_rc) = maybe_retry_step(p_stmt, rc) {
-        return retry_rc;
+    let rc = maybe_retry_step(p_stmt, rc).unwrap_or(rc);
+    if rc == SQLITE_ERROR {
+        let handle = crate::pg_client::rust_pg_find_handle_connection(dbg_db);
+        return crate::db_interpose_exec::pg_path::primary_error_code(handle);
     }
-
     rc
 }
 
@@ -187,6 +187,19 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
 
     if *tls_in_resolve_tables_ptr() != 0 {
         return orig_step(p_stmt);
+    }
+
+    let db = call_sqlite3_db_handle(p_stmt);
+    let handle_conn = crate::pg_client::rust_pg_find_handle_connection(db);
+    if !handle_conn.is_null() && (*handle_conn).is_pg_active != 0 {
+        crate::pg_client::transaction::ensure_handle_session(handle_conn);
+        let original_sql = call_sqlite3_sql(p_stmt);
+        let sql = crate::db_interpose_helpers::cstr_to_str_or_empty(original_sql);
+        if !crate::pg_config::is_sqlite_passthrough_str(sql)
+            && !crate::pg_client::transaction::session_ready(handle_conn)
+        {
+            return SQLITE_ERROR;
+        }
     }
 
     let pg_stmt = crate::pg_statement::rust_stmt_find(p_stmt as usize) as *mut PgStmt;
@@ -198,6 +211,22 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
 
     if !pg_stmt.is_null() {
         let s = &*pg_stmt;
+        let original_sql = crate::db_interpose_helpers::cstr_to_str_or_empty(s.sql);
+        if crate::pg_client::transaction::is_transaction_sql(original_sql) {
+            let _stmt_guard = PgStmt::lock_mutex(pg_stmt);
+            if (*pg_stmt).write_executed != 0 {
+                return SQLITE_DONE;
+            }
+            let db = call_sqlite3_db_handle(p_stmt);
+            let conn = crate::pg_client::rust_pg_find_connection(db);
+            let rc = crate::pg_client::transaction::execute_transaction(conn, original_sql)
+                .unwrap_or(SQLITE_ERROR);
+            if rc == 0 {
+                (*pg_stmt).write_executed = 1;
+                return SQLITE_DONE;
+            }
+            return rc;
+        }
         if s.is_pg != 0 && s.is_pg != 3 && s.pg_sql.is_null() {
             let msg = format!(
                 "PG step missing translated SQL: {}",
@@ -209,11 +238,6 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         }
 
         if s.is_pg == 3 {
-            // Transaction control (BEGIN/COMMIT/ROLLBACK/SAVEPOINT) — skip entirely.
-            // PG runs in autocommit mode: each statement commits immediately.
-            // Forwarding transactions is unsound with the connection pool (BEGIN
-            // and COMMIT could land on different connections). Skipping is safe
-            // because DDL is idempotent (IF NOT EXISTS / ON CONFLICT DO NOTHING).
             log_debug_lazy!(
                 "[RACE_DEBUG] STEP_END thread={:p} stmt={:p} rc={} reason=skip",
                 libc::pthread_self() as *mut c_void,
@@ -257,19 +281,6 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                 {
                     if !hc.conn.is_null() {
                         exec_conn = handle_conn;
-                    } else {
-                        let thread_conn =
-                            crate::pg_client::rust_pool_get_connection(hc.db_path.as_ptr())
-                                as *mut PgConnection;
-                        if !thread_conn.is_null() {
-                            let tc = &*thread_conn;
-                            if tc.is_pg_active != 0 && !tc.conn.is_null() {
-                                exec_conn = thread_conn;
-                                crate::pg_client::rust_pool_touch_connection(
-                                    exec_conn as *const c_void,
-                                );
-                            }
-                        }
                     }
                 }
             }
@@ -279,7 +290,7 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
     if !pg_stmt.is_null() && !exec_conn.is_null() {
         let s = &*pg_stmt;
         if !s.pg_sql.is_null() && !(&*exec_conn).conn.is_null() {
-            let (param_values, stmt_is_pg, read_done, has_cached_result, write_executed, pg_sql) = {
+            let (param_values, stmt_is_pg, read_done, has_cached_result, write_executed) = {
                 let _stmt_guard = PgStmt::lock_mutex(pg_stmt);
                 let max_params = s.param_count.max(0) as usize;
                 let max_params = max_params.min(s.param_values.len());
@@ -293,11 +304,13 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                     s.read_done != 0,
                     !s.cached_result.is_null(),
                     s.write_executed != 0,
-                    s.pg_sql,
                 )
             };
 
             if stmt_is_pg == 2 {
+                if (*pg_stmt).read_done < 0 {
+                    return crate::db_interpose_exec::pg_path::primary_error_code(s.conn);
+                }
                 if read_done {
                     return SQLITE_DONE;
                 }
@@ -326,7 +339,11 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                 };
 
                 if read_done {
-                    return SQLITE_DONE;
+                    return if (*pg_stmt).read_done < 0 {
+                        crate::db_interpose_exec::pg_path::primary_error_code(s.conn)
+                    } else {
+                        SQLITE_DONE
+                    };
                 }
 
                 if has_cached_result {
@@ -358,28 +375,11 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                 return first_rc;
             } else if stmt_is_pg == 1 {
                 if write_executed {
-                    return SQLITE_DONE;
-                }
-
-                // Legacy txn terminator check — with current classification, txn control
-                // is is_pg=3 (step returns DONE earlier), so this should never trigger.
-                // Kept as defense-in-depth; can be removed in a future cleanup.
-                let mut txn_state = PQTRANS_IDLE;
-                if crate::db_interpose_step_write_utils::rust_step_pg_write_should_noop(
-                    exec_conn,
-                    pg_sql,
-                    &mut txn_state,
-                ) != 0
-                {
-                    log_debug_lazy!(
-                        "TXN_NOOP: skipping tx terminator in state={} sql={}",
-                        txn_state,
-                        cstr_prefix(pg_sql, 120, "(null)")
-                    );
-                    let _stmt_guard = PgStmt::lock_mutex(pg_stmt);
-                    let s_mut = &mut *pg_stmt;
-                    s_mut.write_executed = 1;
-                    return SQLITE_DONE;
+                    return if (*pg_stmt).write_executed < 0 {
+                        SQLITE_ERROR
+                    } else {
+                        SQLITE_DONE
+                    };
                 }
 
                 crate::db_interpose_step_write_utils::rust_step_write_log_debug_context(
@@ -453,7 +453,11 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
             b"[SQLITE_STEP_ERROR] rc=%d errmsg='%s' sql='%.900s'\n\0".as_ptr() as *const c_char,
             rc,
             errmsg,
-            if sql.is_null() { b"<null>\0".as_ptr() as *const c_char } else { sql },
+            if sql.is_null() {
+                b"<null>\0".as_ptr() as *const c_char
+            } else {
+                sql
+            },
         );
         libc::fflush(stderr_ptr());
     }

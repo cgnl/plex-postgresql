@@ -123,10 +123,19 @@ jobs:
           path: plex-postgresql-*-linux.zip
           if-no-files-found: error
 
+  certification:
+    name: Native Plex certification required (publication blocked)
+    runs-on: ubuntu-latest
+    needs: package-linux-zip
+    steps:
+      - run: |
+          echo 'Publication blocked: the exact Linux artifacts lack a passing native Plex workload matrix.' >&2
+          exit 1
+
   upload-release:
     name: Upload artifacts to GitHub Release
     runs-on: ubuntu-latest
-    needs: package-linux-zip
+    needs: [package-linux-zip, certification]
     steps:
       - name: Download zip artifact
         uses: actions/download-artifact@v4

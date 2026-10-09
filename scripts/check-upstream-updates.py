@@ -1,185 +1,119 @@
 #!/usr/bin/env python3
-import os
-import sys
-import json
-import urllib.request
-import urllib.error
+"""Resolve candidate inputs; never change a release, tag, or compatibility claim."""
+
+import argparse
 import datetime
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
 
-DIGESTS_FILE = ".github/upstream-digests.json"
-VERSION_FILE = "VERSION"
-CHANGELOG_FILE = "CHANGELOG.md"
 
+PLEX_API = "https://plex.tv/api/downloads/5.json"
 IMAGES = {
-    "linuxserver/plex:latest": "linuxserver/plex",
-    "plexinc/pms-docker:latest": "plexinc/pms-docker"
+    "linuxserver": ("linuxserver/plex", "latest"),
+    "plexinc": ("plexinc/pms-docker", "latest"),
+    "builder": ("library/alpine", "3.15"),
+    "postgres": ("library/postgres", "16-bookworm"),
+    "postgres15": ("library/postgres", "15-bookworm"),
+    "postgres18": ("library/postgres", "18-bookworm"),
 }
+ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+])
 
-def get_remote_digest(repo, tag="latest"):
-    try:
-        # Get token
-        token_url = f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"
-        req = urllib.request.Request(token_url)
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode())
-            token = data["token"]
-        
-        # Get digest using HEAD request first
-        manifest_url = f"https://index.docker.io/v2/{repo}/manifests/{tag}"
-        req = urllib.request.Request(manifest_url, method="HEAD")
-        req.add_header("Authorization", f"Bearer {token}")
-        req.add_header("Accept", "application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json")
-        
-        try:
-            with urllib.request.urlopen(req) as response:
-                digest = response.headers.get("Docker-Content-Digest")
-                if digest:
-                    return digest
-        except urllib.error.HTTPError:
-            # Fallback to GET request if HEAD is not allowed/fails
-            pass
 
-        req = urllib.request.Request(manifest_url, method="GET")
-        req.add_header("Authorization", f"Bearer {token}")
-        req.add_header("Accept", "application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json")
-        with urllib.request.urlopen(req) as response:
-            return response.headers.get("Docker-Content-Digest")
+def fetch(url, headers=None):
+    request = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read(), response.headers
 
-    except Exception as e:
-        print(f"Error fetching digest for {repo}:{tag}: {e}", file=sys.stderr)
-        return None
 
-def update_changelog(new_version):
-    if not os.path.exists(CHANGELOG_FILE):
-        print(f"Warning: {CHANGELOG_FILE} not found. Skipping changelog update.")
-        return
+def resolve_image(repo, tag):
+    query = urllib.parse.urlencode({
+        "service": "registry.docker.io", "scope": f"repository:{repo}:pull",
+    })
+    token_body, _ = fetch(f"https://auth.docker.io/token?{query}")
+    token = json.loads(token_body)["token"]
+    body, headers = fetch(
+        f"https://registry-1.docker.io/v2/{repo}/manifests/{tag}",
+        {"Authorization": f"Bearer {token}", "Accept": ACCEPT},
+    )
+    digest = headers.get("Docker-Content-Digest", "")
+    if digest != f"sha256:{hashlib.sha256(body).hexdigest()}":
+        raise ValueError(f"Missing or invalid registry digest for {repo}:{tag}")
+    manifest = json.loads(body)
+    platforms = {}
+    for entry in manifest.get("manifests", []):
+        platform = entry.get("platform", {})
+        arch = platform.get("architecture")
+        if platform.get("os") == "linux" and arch in ("amd64", "arm64"):
+            child_digest = entry.get("digest", "")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", child_digest):
+                raise ValueError(f"Invalid {arch} manifest digest for {repo}:{tag}")
+            if arch in platforms:
+                raise ValueError(f"Ambiguous {arch} platform for {repo}:{tag}")
+            platforms[arch] = child_digest
+    if set(platforms) != {"amd64", "arm64"}:
+        raise ValueError(f"Both native architectures are required for {repo}:{tag}")
+    return {"source": f"{repo}:{tag}", "ref": f"{repo}@{digest}",
+            "digest": digest, "platforms": platforms}
 
-    with open(CHANGELOG_FILE, "r") as f:
-        content = f.read()
-
-    unreleased_marker = "## [Unreleased]"
-    if unreleased_marker not in content:
-        print("Warning: '## [Unreleased]' not found in CHANGELOG.md. Skipping changelog update.")
-        return
-
-    parts = content.split(unreleased_marker, 1)
-    before = parts[0] + unreleased_marker + "\n\n"
-    after = parts[1]
-
-    next_version_index = after.find("## [")
-    if next_version_index != -1:
-        unreleased_notes = after[:next_version_index].strip()
-        rest_of_changelog = after[next_version_index:]
-    else:
-        unreleased_notes = after.strip()
-        rest_of_changelog = ""
-
-    today = datetime.date.today().isoformat()
-    new_version_header = f"## [{new_version}] - {today}"
-    image_update_note = "### Changed\n- Updated upstream base Docker images (linuxserver/plex:latest / plexinc/pms-docker:latest)."
-
-    if unreleased_notes:
-        if "### Changed" in unreleased_notes:
-            changed_parts = unreleased_notes.split("### Changed", 1)
-            new_notes = (
-                changed_parts[0] + 
-                "### Changed\n- Updated upstream base Docker images (linuxserver/plex:latest / plexinc/pms-docker:latest).\n" + 
-                changed_parts[1].lstrip()
-            )
-        else:
-            new_notes = image_update_note + "\n\n" + unreleased_notes
-    else:
-        new_notes = image_update_note
-
-    new_content = before + new_version_header + "\n\n" + new_notes.strip() + "\n\n" + rest_of_changelog
-
-    with open(CHANGELOG_FILE, "w") as f:
-        f.write(new_content)
-
-    print("CHANGELOG.md updated successfully.")
-
-def bump_patch_version(version_str):
-    parts = version_str.strip().split(".")
-    if len(parts) == 3:
-        try:
-            parts[2] = str(int(parts[2]) + 1)
-            return ".".join(parts)
-        except ValueError:
-            pass
-    raise ValueError(f"Invalid version format: '{version_str}'")
 
 def main():
-    if not os.path.exists(DIGESTS_FILE):
-        print(f"Error: {DIGESTS_FILE} not found.", file=sys.stderr)
-        sys.exit(1)
-        
-    if not os.path.exists(VERSION_FILE):
-        print(f"Error: {VERSION_FILE} not found.", file=sys.stderr)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=Path("upstream-candidate.json"))
+    args = parser.parse_args()
+    api_body, _ = fetch(PLEX_API)
+    linux = json.loads(api_body)["computer"]["Linux"]
+    plex_version = linux["version"]
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}-[0-9a-f]+", plex_version):
+        raise ValueError("Official API returned an invalid Linux version")
+    releases = {}
+    for arch, build in (("amd64", "linux-x86_64"), ("arm64", "linux-aarch64")):
+        matches = [release for release in linux["releases"]
+                   if release.get("build") == build and release.get("distro") == "debian"
+                   and release.get("version") == plex_version]
+        if len(matches) != 1:
+            raise ValueError(f"Official API lacks an unambiguous {arch} release")
+        release = matches[0]
+        if urllib.parse.urlparse(release["url"]).hostname != "downloads.plex.tv":
+            raise ValueError("Unexpected official release download host")
+        releases[arch] = {key: release[key] for key in ("url", "checksum", "build")}
+    images = {name: resolve_image(repo, tag) for name, (repo, tag) in IMAGES.items()}
+    baseline_path = Path(".github/upstream-digests.json")
+    baseline = json.loads(baseline_path.read_text()) if baseline_path.exists() else {}
+    updated = any(baseline.get(images[name]["source"]) != images[name]["digest"]
+                  for name in ("linuxserver", "plexinc"))
+    snapshot = {
+        "schema_version": 1,
+        "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "plex_api": PLEX_API, "plex_version": plex_version,
+        "official_releases": releases, "images": images,
+        "upstream_digest_changed": updated,
+        "promotion_allowed": False,
+        "promotion_blocker": "Full native matrix and sustained workload certification are incomplete",
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = args.output.with_suffix(args.output.suffix + ".tmp")
+    temporary.write_text(json.dumps(snapshot, indent=2) + "\n")
+    temporary.replace(args.output)
+    print(json.dumps(snapshot, indent=2))
+    if "GITHUB_OUTPUT" in os.environ:
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write(f"updated={str(updated).lower()}\nplex_version={plex_version}\n")
+            for name, image in images.items():
+                output.write(f"{name}_image={image['ref']}\n")
 
-    with open(DIGESTS_FILE, "r") as f:
-        current_digests = json.load(f)
-
-    new_digests = {}
-    updated = False
-    changes = []
-
-    for key, repo in IMAGES.items():
-        print(f"Checking remote digest for {key}...")
-        remote_digest = get_remote_digest(repo)
-        if not remote_digest:
-            print(f"Could not retrieve digest for {key}. Skipping.", file=sys.stderr)
-            new_digests[key] = current_digests.get(key, "")
-            continue
-            
-        old_digest = current_digests.get(key)
-        new_digests[key] = remote_digest
-        
-        if old_digest != remote_digest:
-            print(f"  -> UPDATE DETECTED for {key}!")
-            print(f"     Old: {old_digest}")
-            print(f"     New: {remote_digest}")
-            updated = True
-            changes.append(f"upstream image {key} updated")
-        else:
-            print(f"  -> Up-to-date ({remote_digest[:15]}...)")
-
-    if updated:
-        with open(VERSION_FILE, "r") as f:
-            old_version = f.read().strip()
-            
-        try:
-            new_version = bump_patch_version(old_version)
-        except ValueError as e:
-            print(f"Error bumping version: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"Bumping version from {old_version} to {new_version}...")
-        
-        with open(VERSION_FILE, "w") as f:
-            f.write(new_version + "\n")
-            
-        with open(DIGESTS_FILE, "w") as f:
-            json.dump(new_digests, f, indent=2)
-            f.write("\n")
-
-        print("Updates saved.")
-        try:
-            update_changelog(new_version)
-        except Exception as e:
-            print(f"Error updating changelog: {e}", file=sys.stderr)
-        
-        # Set GitHub Action outputs
-        if "GITHUB_OUTPUT" in os.environ:
-            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                f.write(f"updated=true\n")
-                f.write(f"version={new_version}\n")
-                f.write(f"changes={'; '.join(changes)}\n")
-    else:
-        print("No updates found.")
-        if "GITHUB_OUTPUT" in os.environ:
-            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                f.write("updated=false\n")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Candidate resolution failed: {error}", file=sys.stderr)
+        sys.exit(1)

@@ -166,6 +166,22 @@ pub(super) unsafe fn prepare_real_sqlite_stmt(
     pp_stmt: *mut *mut sqlite3_stmt,
     pz_tail: *mut *const c_char,
 ) -> c_int {
+    if !z_sql.is_null()
+        && crate::pg_config::is_sqlite_passthrough_str(CStr::from_ptr(z_sql).to_str().unwrap_or(""))
+    {
+        let rc = if let Some(prepare) = shim_sqlite3_prepare_v2 {
+            prepare(db, z_sql, n_byte, pp_stmt, pz_tail)
+        } else {
+            if !pp_stmt.is_null() {
+                *pp_stmt = ptr::null_mut();
+            }
+            SQLITE_ERROR
+        };
+        if rc == SQLITE_OK && !pp_stmt.is_null() && !(*pp_stmt).is_null() {
+            pg_note_stmt_prepare(*pp_stmt, z_sql);
+        }
+        return rc;
+    }
     let mut cleaned_sql: Option<CString> = None;
     let mut sql_for_sqlite = z_sql;
 

@@ -33,7 +33,6 @@ const SQLITE_OK: c_int = 0;
 const SQLITE_ERROR: c_int = 1;
 
 const PGRES_TUPLES_OK: c_int = 2;
-const PGRES_FATAL_ERROR: c_int = 7;
 
 static NOT_AN_ERROR: &[u8] = b"not an error\0";
 

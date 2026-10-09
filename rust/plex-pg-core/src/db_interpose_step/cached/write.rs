@@ -57,7 +57,11 @@ pub(super) unsafe fn handle_cached_write(
     let mut cached = crate::pg_statement::rust_cached_stmt_find(p_stmt as usize) as *mut PgStmt;
     if !cached.is_null() && (&*cached).write_executed != 0 {
         free_expanded_sql(expanded_sql);
-        return STEP_RESULT_DONE;
+        return if (&*cached).write_executed < 0 {
+            STEP_RESULT_ERROR
+        } else {
+            STEP_RESULT_DONE
+        };
     }
 
     let mut cached_exec_conn: *mut PgConnection = std::ptr::null_mut();

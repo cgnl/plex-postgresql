@@ -42,6 +42,18 @@ export PGDATABASE="$PG_DATABASE"
 export PGUSER="$PG_USER"
 export PGPASSWORD="${PLEX_PG_PASSWORD:-plex}"
 
+if [[ ! "$PG_SCHEMA" =~ ^[a-z_][a-z0-9_]*$ ]]; then
+    echo "ERROR: PG_SCHEMA must be a lowercase SQL identifier" >&2
+    exit 1
+fi
+if [[ "$MODE" == check ]]; then
+    export PGOPTIONS="${PGOPTIONS:-} -c default_transaction_read_only=on"
+fi
+
+doctor_psql() {
+    "$PSQL" -X -v ON_ERROR_STOP=1 "$@"
+}
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -53,7 +65,7 @@ echo "PostgreSQL: $PG_USER@$PG_HOST:$PG_PORT/$PG_DATABASE (schema: $PG_SCHEMA)"
 echo ""
 
 # Check connection
-if ! $PSQL -c "SELECT 1" >/dev/null 2>&1; then
+if ! doctor_psql -c "SELECT 1" >/dev/null 2>&1; then
     echo -e "${RED}Cannot connect to PostgreSQL${NC}"
     exit 1
 fi
@@ -67,14 +79,22 @@ check() {
     local check_sql="$2"
     local fix_sql="$3"
 
-    local exists=$($PSQL -t -A -c "$check_sql" 2>/dev/null | tr -d ' ')
+    local exists
+    if ! exists=$(doctor_psql -t -A -c "$check_sql" | tr -d ' '); then
+        printf "  %-50s ${RED}QUERY FAILED${NC}\n" "$name"
+        failed=$((failed + 1))
+        return 0
+    fi
 
     if [[ "$exists" == "t" ]] || [[ "$exists" == "1" ]]; then
         printf "  %-50s ${GREEN}OK${NC}\n" "$name"
         ok=$((ok + 1))
     else
         printf "  %-50s ${YELLOW}MISSING${NC} " "$name"
-        if $PSQL -q -c "$fix_sql" >/dev/null 2>&1; then
+        if [[ "$MODE" == check ]]; then
+            echo "(read-only; not repaired)"
+            failed=$((failed + 1))
+        elif doctor_psql -q -c "$fix_sql" >/dev/null 2>&1; then
             echo -e "→ ${GREEN}FIXED${NC}"
             fixes=$((fixes + 1))
         else
@@ -381,12 +401,19 @@ echo ""
 # Data integrity
 # ============================================================================
 echo ""
+check "all constraints validated" \
+    "SELECT NOT EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE n.nspname = '$PG_SCHEMA' AND NOT c.convalidated);" \
+    "DO \$do\$ DECLARE item record; BEGIN FOR item IN SELECT c.conrelid::regclass AS relation, c.conname FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE n.nspname = '$PG_SCHEMA' AND NOT c.convalidated LOOP EXECUTE format('ALTER TABLE %s VALIDATE CONSTRAINT %I', item.relation, item.conname); END LOOP; END \$do\$;"
+check "all triggers enabled" \
+    "SELECT NOT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '$PG_SCHEMA' AND t.tgenabled NOT IN ('O', 'A'));" \
+    "DO \$do\$ DECLARE item record; BEGIN FOR item IN SELECT c.oid::regclass AS relation, t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '$PG_SCHEMA' AND t.tgenabled NOT IN ('O', 'A') LOOP EXECUTE format('ALTER TABLE %s ENABLE TRIGGER %I', item.relation, item.tgname); END LOOP; END \$do\$;"
+
 echo "Data:"
 
 data_issues=0
 
 # Self-referential parents (parent_id = id)
-self_ref=$($PSQL -t -A -c "SELECT COUNT(*) FROM $PG_SCHEMA.metadata_items WHERE parent_id = id;" 2>/dev/null || echo "0")
+self_ref=$(doctor_psql -t -A -c "SELECT COUNT(*) FROM $PG_SCHEMA.metadata_items WHERE parent_id = id;")
 if [[ "$self_ref" -gt 0 ]]; then
     printf "  %-50s ${YELLOW}%s rows${NC}\n" "self-referential parent_id" "$self_ref"
     data_issues=$((data_issues + 1))
@@ -396,14 +423,14 @@ else
 fi
 
 # Cross-section parents (parent in different library_section)
-cross_section=$($PSQL -t -A -c "
+cross_section=$(doctor_psql -t -A -c "
     SELECT COUNT(*) FROM $PG_SCHEMA.metadata_items m
     JOIN $PG_SCHEMA.metadata_items p ON m.parent_id = p.id
     WHERE m.parent_id IS NOT NULL
     AND m.library_section_id IS NOT NULL
     AND p.library_section_id IS NOT NULL
     AND m.library_section_id != p.library_section_id;
-" 2>/dev/null || echo "0")
+")
 if [[ "$cross_section" -gt 0 ]]; then
     printf "  %-50s ${YELLOW}%s rows${NC}\n" "cross-section parent_id" "$cross_section"
     data_issues=$((data_issues + 1))
@@ -413,10 +440,10 @@ else
 fi
 
 # Orphan seasons (metadata_type=3 with no parent)
-orphan_seasons=$($PSQL -t -A -c "
+orphan_seasons=$(doctor_psql -t -A -c "
     SELECT COUNT(*) FROM $PG_SCHEMA.metadata_items
     WHERE metadata_type = 3 AND parent_id IS NULL;
-" 2>/dev/null || echo "0")
+")
 if [[ "$orphan_seasons" -gt 0 ]]; then
     printf "  %-50s ${YELLOW}%s rows${NC}\n" "orphan seasons (no parent)" "$orphan_seasons"
     data_issues=$((data_issues + 1))
@@ -426,10 +453,10 @@ else
 fi
 
 # Junk metadata_items (both metadata_type and library_section_id NULL)
-junk_items=$($PSQL -t -A -c "
+junk_items=$(doctor_psql -t -A -c "
     SELECT COUNT(*) FROM $PG_SCHEMA.metadata_items
     WHERE metadata_type IS NULL AND library_section_id IS NULL;
-" 2>/dev/null || echo "0")
+")
 if [[ "$junk_items" -gt 0 ]]; then
     printf "  %-50s ${YELLOW}%s rows${NC}\n" "junk metadata_items (no type/library)" "$junk_items"
     data_issues=$((data_issues + 1))
@@ -439,7 +466,7 @@ else
 fi
 
 # Truncated JSON in extra_data (caused by old CSV migration bug)
-truncated_json=$($PSQL -t -A -c "
+truncated_json=$(doctor_psql -t -A -c "
     SELECT sum(cnt)::integer FROM (
         SELECT count(*) AS cnt FROM $PG_SCHEMA.media_parts
         WHERE extra_data IS NOT NULL AND extra_data LIKE '{%'
@@ -457,7 +484,7 @@ truncated_json=$($PSQL -t -A -c "
         WHERE extra_data IS NOT NULL AND extra_data LIKE '{%'
           AND extra_data !~ '}\s*$'
     ) t;
-" 2>/dev/null || echo "0")
+")
 if [[ "$truncated_json" -gt 0 ]]; then
     printf "  %-50s ${YELLOW}%s rows${NC}\n" "truncated extra_data JSON" "$truncated_json"
     data_issues=$((data_issues + 1))
@@ -467,9 +494,9 @@ else
 fi
 
 # Empty statistics rows (at = 0 or NULL)
-empty_stats=$($PSQL -t -A -c "
+empty_stats=$(doctor_psql -t -A -c "
     SELECT COUNT(*) FROM $PG_SCHEMA.statistics_media WHERE at IS NULL OR at = 0;
-" 2>/dev/null || echo "0")
+")
 if [[ "$empty_stats" -gt 0 ]]; then
     printf "  %-50s ${YELLOW}%s rows${NC}\n" "empty statistics_media rows" "$empty_stats"
     data_issues=$((data_issues + 1))
@@ -479,10 +506,10 @@ else
 fi
 
 # Old statistics (> 7 days)
-old_stats=$($PSQL -t -A -c "
+old_stats=$(doctor_psql -t -A -c "
     SELECT COUNT(*) FROM $PG_SCHEMA.statistics_resources
     WHERE at < EXTRACT(EPOCH FROM (NOW() - INTERVAL '7 days'))::BIGINT;
-" 2>/dev/null || echo "0")
+")
 if [[ "$old_stats" -gt 0 ]]; then
     printf "  %-50s ${YELLOW}%s rows${NC}\n" "stale statistics_resources (>7d)" "$old_stats"
     data_issues=$((data_issues + 1))
@@ -513,13 +540,13 @@ if [[ $data_issues -gt 0 ]]; then
             echo ""
             if [[ "$self_ref" -gt 0 ]]; then
                 printf "  fixing self-referential parent_id... "
-                $PSQL -q -c "UPDATE $PG_SCHEMA.metadata_items SET parent_id = NULL WHERE parent_id = id;" 2>/dev/null
+                doctor_psql -q -c "UPDATE $PG_SCHEMA.metadata_items SET parent_id = NULL WHERE parent_id = id;" 2>/dev/null
                 echo -e "${GREEN}$self_ref rows${NC}"
                 fixes=$((fixes + 1))
             fi
             if [[ "$cross_section" -gt 0 ]]; then
                 printf "  fixing cross-section parent_id... "
-                $PSQL -q -c "
+                doctor_psql -q -c "
                     UPDATE $PG_SCHEMA.metadata_items m SET parent_id = NULL
                     FROM $PG_SCHEMA.metadata_items p
                     WHERE m.parent_id = p.id
@@ -532,7 +559,7 @@ if [[ $data_issues -gt 0 ]]; then
             fi
             if [[ "$orphan_seasons" -gt 0 ]]; then
                 printf "  fixing orphan seasons... "
-                fixed=$($PSQL -t -A -c "
+                fixed=$(doctor_psql -t -A -c "
                     WITH fixes AS (
                         UPDATE $PG_SCHEMA.metadata_items season
                         SET parent_id = (
@@ -551,13 +578,13 @@ if [[ $data_issues -gt 0 ]]; then
                         RETURNING 1
                     )
                     SELECT COUNT(*) FROM fixes;
-                " 2>/dev/null || echo "0")
+                ")
                 echo -e "${GREEN}$fixed rows${NC}"
                 fixes=$((fixes + 1))
             fi
             if [[ "$junk_items" -gt 0 ]]; then
                 printf "  deleting junk metadata_items... "
-                $PSQL -q -c "DELETE FROM $PG_SCHEMA.metadata_items WHERE metadata_type IS NULL AND library_section_id IS NULL;" 2>/dev/null
+                doctor_psql -q -c "DELETE FROM $PG_SCHEMA.metadata_items WHERE metadata_type IS NULL AND library_section_id IS NULL;" 2>/dev/null
                 echo -e "${GREEN}$junk_items rows${NC}"
                 fixes=$((fixes + 1))
             fi
@@ -565,7 +592,7 @@ if [[ $data_issues -gt 0 ]]; then
                 printf "  fixing truncated extra_data JSON... "
                 fixed_json=0
                 for repair_table in media_parts media_items metadata_items metadata_item_settings; do
-                    repaired=$($PSQL -t -A -c "
+                    repaired=$(doctor_psql -t -A -c "
                         WITH fixed AS (
                             UPDATE $PG_SCHEMA.$repair_table
                             SET extra_data = left(extra_data, position('\"url\":\"' in extra_data) - 2) || '}'
@@ -574,7 +601,7 @@ if [[ $data_issues -gt 0 ]]; then
                               AND position('\"url\":\"' in extra_data) > 0
                             RETURNING 1
                         ) SELECT count(*) FROM fixed;
-                    " 2>/dev/null || echo "0")
+                    ")
                     fixed_json=$((fixed_json + repaired))
                 done
                 echo -e "${GREEN}$fixed_json rows${NC}"
@@ -582,13 +609,13 @@ if [[ $data_issues -gt 0 ]]; then
             fi
             if [[ "$empty_stats" -gt 0 ]]; then
                 printf "  cleaning empty statistics_media... "
-                $PSQL -q -c "DELETE FROM $PG_SCHEMA.statistics_media WHERE at IS NULL OR at = 0;" 2>/dev/null
+                doctor_psql -q -c "DELETE FROM $PG_SCHEMA.statistics_media WHERE at IS NULL OR at = 0;" 2>/dev/null
                 echo -e "${GREEN}$empty_stats rows${NC}"
                 fixes=$((fixes + 1))
             fi
             if [[ "$old_stats" -gt 0 ]]; then
                 printf "  cleaning stale statistics_resources... "
-                $PSQL -q -c "
+                doctor_psql -q -c "
                     DELETE FROM $PG_SCHEMA.statistics_resources
                     WHERE at < EXTRACT(EPOCH FROM (NOW() - INTERVAL '7 days'))::BIGINT;
                 " 2>/dev/null
@@ -609,4 +636,11 @@ elif [[ $failed -gt 0 ]]; then
     echo -e "  $ok OK, ${RED}$failed failed${NC}"
 else
     echo -e "  ${GREEN}All $ok checks passed${NC}"
+fi
+
+if [[ "$MODE" != check && "$fixes" -gt 0 ]]; then
+    exec bash "$0" --check
+fi
+if [[ "$failed" -gt 0 || "$data_issues" -gt 0 ]]; then
+    exit 1
 fi

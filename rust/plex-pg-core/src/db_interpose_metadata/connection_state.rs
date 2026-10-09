@@ -1,13 +1,28 @@
 use super::*;
 use crate::log_debug_lazy;
 
+fn handle_state(db: *mut sqlite3) -> *mut crate::ffi_types::PgConnection {
+    if crate::db_interpose_common::SHIM_PASSTHROUGH_ONLY.load(std::sync::atomic::Ordering::Acquire)
+        != 0
+        || std::env::var("PLEX_PG_FORCE_SQLITE_LIBRARY")
+            .is_ok_and(|value| !value.is_empty() && value != "0")
+    {
+        return std::ptr::null_mut();
+    }
+    crate::pg_client::rust_pg_find_handle_connection(db)
+}
+
 pub(super) fn changes_impl(db: *mut sqlite3) -> c_int {
     let _guard = match InterposeGuard::try_enter() {
         Some(g) => g,
         None => return 0,
     };
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = handle_state(db);
+    if pg_conn.is_null() {
+        return crate::db_interpose_common::get_orig_sqlite3_changes()
+            .map_or(0, |function| unsafe { function(db) });
+    }
     let mut result = 0;
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
@@ -24,7 +39,11 @@ pub(super) fn changes64_impl(db: *mut sqlite3) -> i64 {
         None => return 0,
     };
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = handle_state(db);
+    if pg_conn.is_null() {
+        return crate::db_interpose_common::get_orig_sqlite3_changes64()
+            .map_or(0, |function| unsafe { function(db) });
+    }
     let mut result: i64 = 0;
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
@@ -45,114 +64,12 @@ pub(super) fn last_insert_rowid_impl(db: *mut sqlite3) -> i64 {
         None => return 0,
     };
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = handle_state(db);
     if pg_conn.is_null() {
-        let global_rowid = crate::pg_client::rust_get_global_last_insert_rowid();
-        log_debug_lazy!(
-            "last_insert_rowid: CALLED db={:p} pg_conn=NULL (no exact match, global={})",
-            db,
-            global_rowid
-        );
-        return if global_rowid > 0 { global_rowid } else { 0 };
+        return crate::db_interpose_common::get_orig_sqlite3_last_insert_rowid()
+            .map_or(0, |function| unsafe { function(db) });
     }
-
-    log_debug_lazy!(
-        "last_insert_rowid: CALLED db={:p} pg_conn={:p} (exact match)",
-        db,
-        pg_conn
-    );
-
-    {
-        let pg = unsafe { &*pg_conn };
-        if pg.last_insert_rowid > 0 {
-            let rowid = pg.last_insert_rowid;
-            log_debug_lazy!("last_insert_rowid: using cached connection rowid={}", rowid);
-            return rowid;
-        }
-    }
-
-    let global_rowid = crate::pg_client::rust_get_global_last_insert_rowid();
-    if global_rowid > 0 {
-        log_debug_lazy!(
-            "last_insert_rowid: using cached global rowid={}",
-            global_rowid
-        );
-        return global_rowid;
-    }
-
-    let mut result: i64 = 0;
-    let pg = unsafe { &mut *pg_conn };
-    unsafe {
-        if !pg_conn.is_null() && pg.is_pg_active != 0 && !pg.conn.is_null() {
-            let mut conn_guard = PthreadMutexGuard::lock(&mut pg.mutex as *mut _);
-            log_debug_lazy!(
-                "last_insert_rowid: EXECUTING lastval() on conn {:p}",
-                pg.conn
-            );
-            let res = crate::libpq_helpers::rust_pq_exec(
-                pg.conn,
-                b"SELECT lastval()\0".as_ptr() as *const c_char,
-            );
-            if res.is_null() {
-                conn_guard.unlock();
-                log_debug("last_insert_rowid: NULL result, RETURNING 0");
-                return 0;
-            }
-
-            let status = crate::libpq_helpers::rust_pq_result_status(res);
-            log_debug_lazy!(
-                "last_insert_rowid: STATUS={} TUPLES={}",
-                status,
-                crate::libpq_helpers::rust_pq_ntuples(res)
-            );
-            if status == PGRES_TUPLES_OK && crate::libpq_helpers::rust_pq_ntuples(res) > 0 {
-                let mut val_buf = [0 as c_char; 64];
-                let mut val_str: *const c_char = b"0\0".as_ptr() as *const c_char;
-                if crate::db_interpose_helpers::rust_pg_result_text_copy(
-                    res as *const crate::db_interpose_helpers::PGresult,
-                    0,
-                    0,
-                    val_buf.as_mut_ptr(),
-                    val_buf.len(),
-                ) >= 0
-                {
-                    val_str = val_buf.as_ptr();
-                }
-                let rowid = crate::db_interpose_helpers::rust_pg_text_to_int64(val_str);
-                log_debug_lazy!(
-                    "last_insert_rowid: GOT VALUE={} rowid={}",
-                    cstr_to_string_or(val_str, "0"),
-                    rowid
-                );
-                crate::libpq_helpers::rust_pq_clear(res);
-                conn_guard.unlock();
-                if rowid > 0 {
-                    log_debug_lazy!("last_insert_rowid: RETURNING rowid={}", rowid);
-                    result = rowid;
-                } else {
-                    log_debug("last_insert_rowid: rowid <= 0, RETURNING 0");
-                }
-            } else {
-                if status == PGRES_FATAL_ERROR {
-                    let err = crate::libpq_helpers::rust_pq_error_message(pg.conn);
-                    log_debug_lazy!(
-                        "last_insert_rowid: FATAL_ERROR: {}",
-                        cstr_to_string_or(err, "(null)")
-                    );
-                } else {
-                    log_debug_lazy!("last_insert_rowid: NON-TUPLES status={}", status);
-                }
-                crate::libpq_helpers::rust_pq_clear(res);
-                conn_guard.unlock();
-                log_debug("last_insert_rowid: RETURNING 0 due to error");
-            }
-        } else {
-            log_debug("last_insert_rowid: NO PG_CONN or not active, RETURNING 0");
-        }
-    }
-
-    log_debug_lazy!("last_insert_rowid: FINAL result={}", result);
-    result
+    unsafe { (*pg_conn).last_insert_rowid }
 }
 
 pub(super) fn errmsg_impl(db: *mut sqlite3) -> *const c_char {
@@ -165,7 +82,7 @@ pub(super) fn errmsg_impl(db: *mut sqlite3) -> *const c_char {
         }
     }
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = handle_state(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         if conn.last_error_code != SQLITE_OK && conn.last_error[0] != 0 {
@@ -198,14 +115,14 @@ pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
         }
     }
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = handle_state(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         log_debug_lazy!(
             "ERRCODE: pg_conn found, returning code={}",
             conn.last_error_code
         );
-        return conn.last_error_code;
+        return conn.last_error_code & 255;
     }
 
     if let Some(f) = get_shim_sqlite3_errcode() {
@@ -218,7 +135,7 @@ pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
 }
 
 pub(super) fn extended_errcode_impl(db: *mut sqlite3) -> c_int {
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = handle_state(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         return conn.last_error_code;
@@ -240,6 +157,21 @@ pub(super) fn get_table_impl(
     if sql.is_null() {
         return match get_orig_sqlite3_get_table() {
             Some(f) => unsafe { f(db, sql, paz_result, pn_row, pn_column, pz_err_msg) },
+            None => SQLITE_ERROR,
+        };
+    }
+
+    let sql_str = unsafe { CStr::from_ptr(sql).to_str().unwrap_or("") };
+    if crate::db_interpose_common::SHIM_PASSTHROUGH_ONLY.load(std::sync::atomic::Ordering::Acquire)
+        != 0
+        || std::env::var("PLEX_PG_FORCE_SQLITE_LIBRARY")
+            .is_ok_and(|value| !value.is_empty() && value != "0")
+        || crate::pg_config::is_sqlite_passthrough_str(sql_str)
+    {
+        return match get_orig_sqlite3_get_table() {
+            Some(function) => unsafe {
+                function(db, sql, paz_result, pn_row, pn_column, pz_err_msg)
+            },
             None => SQLITE_ERROR,
         };
     }
@@ -279,18 +211,62 @@ pub(super) fn get_table_impl(
                             if !pz_err_msg.is_null() {
                                 *pz_err_msg = std::ptr::null_mut();
                             }
+                            crate::db_interpose_exec::pg_path::clear_pg_last_error(pg_conn);
+                            crate::db_interpose_exec::pg_path::copy_pg_outcome(
+                                handle_state(db),
+                                pg_conn,
+                            );
                             crate::libpq_helpers::rust_pq_clear(res);
                             conn_guard.unlock();
                             sql_translation_free(&mut trans as *mut SqlTranslation);
                             return SQLITE_OK;
                         }
+                        crate::db_interpose_exec::pg_path::set_pg_last_error(
+                            pg_conn,
+                            "Could not allocate PostgreSQL table result",
+                        );
+                    } else {
+                        crate::db_interpose_exec::pg_path::record_pg_result_error(
+                            pg_conn, pg_conn, res,
+                        );
                     }
                     crate::libpq_helpers::rust_pq_clear(res);
                     conn_guard.unlock();
+                } else {
+                    crate::db_interpose_exec::pg_path::set_pg_last_error(
+                        pg_conn,
+                        &format!(
+                            "PostgreSQL table query translation failed: {}",
+                            cstr_to_string_or(trans.error.as_ptr(), "translation failed")
+                        ),
+                    );
                 }
                 sql_translation_free(&mut trans as *mut SqlTranslation);
+                crate::db_interpose_exec::pg_path::copy_pg_outcome(handle_state(db), pg_conn);
+                if !pz_err_msg.is_null() {
+                    *pz_err_msg = crate::db_interpose_exec::exec_error_message(&cstr_to_string_or(
+                        pg.last_error.as_ptr(),
+                        "PostgreSQL table query failed",
+                    ));
+                }
+                return SQLITE_ERROR;
             }
         } // if !pg_conn.is_null()
+    }
+
+    let filename = crate::db_interpose_open::lookup_db_handle_filename(db);
+    if filename
+        .as_ref()
+        .is_some_and(|path| crate::pg_config::pg_config_should_redirect(path.as_ptr(), 0) != 0)
+    {
+        let message = "PostgreSQL get_table connection unavailable or operation unsupported; refusing shadow SQLite execution";
+        unsafe {
+            crate::db_interpose_exec::pg_path::set_pg_last_error(handle_state(db), message);
+            if !pz_err_msg.is_null() {
+                *pz_err_msg = crate::db_interpose_exec::exec_error_message(message);
+            }
+        }
+        return SQLITE_ERROR;
     }
 
     match get_orig_sqlite3_get_table() {

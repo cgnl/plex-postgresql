@@ -11,27 +11,11 @@ use write::handle_cached_write;
 use super::support::{
     call_sqlite3_db_handle, call_sqlite3_expanded_sql, call_sqlite3_free, call_sqlite3_sql,
 };
-use super::STEP_RESULT_FALLBACK;
+use super::{STEP_RESULT_DONE, STEP_RESULT_FALLBACK};
 
 pub(super) unsafe fn step_handle_cached_stmt(p_stmt: *mut sqlite3_stmt) -> c_int {
     let db = call_sqlite3_db_handle(p_stmt);
-    // Try handle-scoped lookup first. Fall back to any library connection
-    // ONLY if the db handle is a library/blobs database (not :memory: etc.).
-    let mut pg_conn = crate::pg_client::rust_pg_find_connection(db);
-    if pg_conn.is_null() {
-        let filename = crate::db_interpose_open::lookup_db_handle_filename(db as *const _);
-        let is_library = filename
-            .as_ref()
-            .map(|f| {
-                let bytes = f.as_bytes();
-                bytes.windows(b"com.plexapp.plugins.library".len())
-                    .any(|w| w == b"com.plexapp.plugins.library")
-            })
-            .unwrap_or(false);
-        if is_library {
-            pg_conn = crate::pg_client::rust_pg_find_any_library_connection();
-        }
-    }
+    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
 
     if pg_conn.is_null() {
         return STEP_RESULT_FALLBACK;
@@ -64,6 +48,11 @@ pub(super) unsafe fn step_handle_cached_stmt(p_stmt: *mut sqlite3_stmt) -> c_int
             }
             return STEP_RESULT_FALLBACK;
         }
+    }
+
+    if !sql.is_null() && crate::pg_config::pg_config_should_skip_sql(sql) != 0 {
+        free_expanded_sql(expanded_sql);
+        return STEP_RESULT_DONE;
     }
 
     if !sql.is_null()

@@ -12,10 +12,17 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
         if !pg_conn_error_out.is_null() {
             *pg_conn_error_out = 0;
         }
+        if !pg_stmt.is_null() && (*pg_stmt).write_executed < 0 {
+            return STEP_RESULT_ERROR;
+        }
         if pg_stmt.is_null() || exec_conn.is_null() || (&*exec_conn).conn.is_null() {
             if !pg_stmt.is_null() {
                 let s = &mut *pg_stmt;
-                s.write_executed = 1;
+                s.write_executed = -1;
+                crate::db_interpose_exec::pg_path::set_pg_last_error(
+                    s.conn,
+                    "PostgreSQL write connection unavailable",
+                );
             }
             if !pg_conn_error_out.is_null() {
                 *pg_conn_error_out = 1;
@@ -24,7 +31,20 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
         }
         let stmt = &mut *pg_stmt;
         let ec = &mut *exec_conn;
+        let handle_conn = if stmt.shadow_stmt.is_null() {
+            stmt.conn
+        } else {
+            crate::pg_client::rust_pg_find_handle_connection(sqlite3_db_handle(stmt.shadow_stmt))
+        };
         let mut conn_guard = PthreadMutexGuard::lock(&mut ec.mutex as *mut _);
+        if ec.conn.is_null() {
+            crate::db_interpose_exec::pg_path::set_pg_last_error(
+                handle_conn,
+                "PostgreSQL write connection unavailable",
+            );
+            stmt.write_executed = -1;
+            return STEP_RESULT_ERROR;
+        }
 
         if skip_stats_resources_update()
             && !stmt.pg_sql.is_null()
@@ -32,6 +52,9 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             && contains_icase_bytes(cstr_bytes(stmt.pg_sql), b"statistics_resources")
         {
             log_error("STEP WRITE: skipping statistics_resources UPDATE via PLEX_PG_SKIP_STATS_RESOURCES_UPDATE");
+            ec.last_changes = 0;
+            crate::db_interpose_exec::pg_path::clear_pg_last_error(exec_conn);
+            crate::db_interpose_exec::pg_path::copy_pg_outcome(handle_conn, exec_conn);
             conn_guard.unlock();
             stmt.write_executed = 1;
             return STEP_RESULT_DONE;
@@ -119,10 +142,9 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             )
         };
 
-        conn_guard.unlock();
-
         let status = crate::libpq_helpers::rust_pq_result_status(res);
         if status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK {
+            crate::db_interpose_exec::pg_path::clear_pg_last_error(exec_conn);
             let cmd_tuples = crate::libpq_helpers::rust_pq_cmd_tuples(res);
             let tuples_ptr = if cmd_tuples.is_null() {
                 b"1\0".as_ptr() as *const c_char
@@ -131,7 +153,10 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             };
             ec.last_changes = crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
 
-            if status == PGRES_TUPLES_OK && crate::libpq_helpers::rust_pq_ntuples(res) > 0 {
+            if starts_with_icase_bytes(cstr_bytes(stmt.sql), b"INSERT")
+                && status == PGRES_TUPLES_OK
+                && crate::libpq_helpers::rust_pq_ntuples(res) > 0
+            {
                 let mut id_buf = [0 as c_char; 64];
                 let mut id_str: *const c_char = std::ptr::null();
                 if crate::db_interpose_helpers::rust_pg_result_text_copy(
@@ -148,6 +173,9 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                     let rowid = crate::db_interpose_helpers::rust_pg_text_to_int64(id_str);
                     if rowid > 0 {
                         ec.last_insert_rowid = rowid;
+                        if !handle_conn.is_null() {
+                            (*handle_conn).last_insert_rowid = rowid;
+                        }
                         crate::pg_client::rust_set_global_last_insert_rowid(rowid);
                     }
 
@@ -168,6 +196,9 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                 }
             }
         } else {
+            crate::db_interpose_exec::pg_path::record_pg_result_error(exec_conn, exec_conn, res);
+            ec.last_changes = 0;
+            crate::db_interpose_exec::pg_path::copy_pg_outcome(handle_conn, exec_conn);
             let err = if !exec_conn.is_null() && !ec.conn.is_null() {
                 crate::libpq_helpers::rust_pq_error_message(ec.conn)
             } else {
@@ -187,18 +218,15 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             ));
             if is_stale_prepared_stmt(res) {
                 crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
-                if !res.is_null() {
-                    crate::libpq_helpers::rust_pq_clear(res);
-                }
-                if !pg_conn_error_out.is_null() {
-                    *pg_conn_error_out = 1;
-                }
-                stmt.write_executed = 1;
-                return STEP_RESULT_ERROR;
             }
+            crate::libpq_helpers::rust_pq_clear(res);
+            stmt.write_executed = -1;
+            conn_guard.unlock();
             crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+            return STEP_RESULT_ERROR;
         }
 
+        crate::db_interpose_exec::pg_path::copy_pg_outcome(handle_conn, exec_conn);
         stmt.write_executed = 1;
         if !res.is_null() {
             crate::libpq_helpers::rust_pq_clear(res);

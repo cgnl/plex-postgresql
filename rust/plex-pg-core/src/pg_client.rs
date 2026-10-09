@@ -27,6 +27,7 @@ mod session;
 mod support;
 mod threading;
 mod tls_cache;
+pub(crate) mod transaction;
 
 #[allow(unused_imports)]
 use crate::db_interpose_conn_utils::{log_debug, log_error, log_info};

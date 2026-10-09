@@ -144,17 +144,6 @@ unsafe fn resolve_cached_column_type(
     ctx.trace_col = trace_col;
 
     if state.is_null {
-        // For NULL values, derive the SQLite type from the PG OID instead of
-        // returning SQLITE_NULL. SOCI's post_fetch does dynamic_cast based on
-        // the type reported by column_type(). If we return SQLITE_NULL but SOCI
-        // allocated a typed holder (int/text/etc.) based on column_decltype(),
-        // the cast fails with std::bad_cast.
-        let oid_type = sqlite_type_for_oid(state.oid);
-        if oid_type != SQLITE_NULL {
-            ctx.result = oid_type;
-            ctx.is_null = true;
-            return (oid_type, ctx);
-        }
         ctx.is_null = true;
         return (SQLITE_NULL, ctx);
     }
@@ -315,17 +304,6 @@ unsafe fn resolve_live_column_type(
     // --- seqlock: end CRASH_LAST_COLUMN write ---
 
     if state.is_null {
-        // For NULL values, derive the SQLite type from the PG OID instead of
-        // returning SQLITE_NULL. SOCI's post_fetch does dynamic_cast based on
-        // the type reported by column_type(). If we return SQLITE_NULL but SOCI
-        // allocated a typed holder (int/text/etc.) based on column_decltype(),
-        // the cast fails with std::bad_cast.
-        let oid_type = sqlite_type_for_oid(state.oid);
-        if oid_type != SQLITE_NULL {
-            ctx.result = oid_type;
-            ctx.is_null = true;
-            return (oid_type, ctx);
-        }
         ctx.is_null = true;
         return (SQLITE_NULL, ctx);
     }
@@ -369,8 +347,9 @@ pub(super) fn column_type_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
 
     if !raw_pg_stmt.is_null() && unsafe { (&*raw_pg_stmt).is_pg != 0 } {
         let pg_stmt = unsafe { &mut *raw_pg_stmt };
-        let needs_metadata =
-            pg_stmt.result.is_null() && pg_stmt.cached_result.is_null() && !pg_stmt.pg_sql.is_null();
+        let needs_metadata = pg_stmt.result.is_null()
+            && pg_stmt.cached_result.is_null()
+            && !pg_stmt.pg_sql.is_null();
         if needs_metadata {
             ensure_pg_result_for_metadata(raw_pg_stmt);
         }

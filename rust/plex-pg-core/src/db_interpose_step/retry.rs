@@ -26,6 +26,15 @@ pub(super) fn maybe_retry_step(p_stmt: *mut sqlite3_stmt, rc: c_int) -> Option<c
         let conn_error = STEP_PG_CONN_ERROR.with(|c| c.get());
         if !pg_stmt.is_null() && conn_error != 0 {
             let pg_stmt_ref = unsafe { &mut *pg_stmt };
+            if crate::pg_config::pg_config_is_write_operation(pg_stmt_ref.sql) != 0
+                || pg_stmt_ref.write_executed < 0
+                || pg_stmt_ref.read_done < 0
+                || crate::pg_client::transaction::transaction_active(pg_stmt_ref.conn)
+            {
+                STEP_PG_CONN_ERROR.with(|flag| flag.set(0));
+                STEP_RETRY_COUNT.with(|count| count.set(0));
+                return None;
+            }
             if pg_stmt_ref.is_pg != 0 {
                 STEP_PG_CONN_ERROR.with(|c| c.set(0));
                 let delay = delays[retry_count as usize];

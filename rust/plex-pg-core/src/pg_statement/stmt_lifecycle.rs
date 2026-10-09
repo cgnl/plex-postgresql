@@ -3,13 +3,9 @@ use std::sync::atomic::Ordering;
 
 use crate::db_interpose_conn_utils::{log_debug, log_error, PthreadMutexGuard};
 use crate::db_interpose_helpers::cstr_to_str_or_empty;
-use crate::ffi_types::{PgConnection, PgStmt};
+use crate::ffi_types::PgStmt;
 use crate::log_debug_lazy;
 use crate::log_info_lazy;
-
-extern "C" {
-    fn pg_pool_validate_connection(conn: *mut PgConnection) -> c_int;
-}
 
 const PMT_STMT_SWEEP_EXTRA_FREE: i32 = 6;
 
@@ -18,7 +14,7 @@ unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_nam
         return;
     }
 
-    if pg_pool_validate_connection(stmt.streaming_conn) == 0 {
+    if crate::pg_client::rust_pool_is_tracked_connection(stmt.streaming_conn.cast()) == 0 {
         log_error(&format!(
             "{}: streaming_conn invalid, skipping cancel/drain (stmt={:p})",
             op_name, stmt_ptr

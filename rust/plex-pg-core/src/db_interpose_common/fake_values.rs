@@ -53,12 +53,3 @@ pub fn rust_pg_check_fake_value(p_val: *mut crate::ffi_types::sqlite3_value) -> 
     }
     ptr::null_mut()
 }
-
-/// Reset the fake value counter (used after fork).
-/// Caller must ensure no concurrent access (e.g. single-threaded post-fork).
-#[allow(dead_code)]
-pub(crate) fn fake_value_reset_next() {
-    if let Ok(mut guard) = FAKE_VALUES.lock() {
-        guard.next = 0;
-    }
-}

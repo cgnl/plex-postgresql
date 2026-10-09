@@ -50,6 +50,11 @@ pub(super) fn is_txn_control_sql(sql: *const c_char) -> bool {
 
 pub(super) fn should_bypass_worker_delegation(sql: *const c_char) -> bool {
     crate::pg_config::pg_config_should_skip_sql(sql) != 0
+        || contains_icase_ptr(sql, "sqlite_master")
+        || contains_icase_ptr(sql, "sqlite_schema")
+        || contains_icase_ptr(sql, "locations_node")
+        || contains_icase_ptr(sql, "locations_parent")
+        || contains_icase_ptr(sql, "locations_rowid")
 }
 
 pub(super) fn detect_query_loop(sql: *const c_char) -> bool {

@@ -1,7 +1,7 @@
 use super::*;
-use crate::log_debug_lazy;
 use crate::byte_utils::{contains_icase_bytes, cstr_bytes};
 use crate::db_interpose_conn_utils::{cstr_prefix, cstr_to_string_or};
+use crate::log_debug_lazy;
 
 pub(super) fn advance_cached_result_impl(stmt: *mut PgStmt) -> c_int {
     if stmt.is_null() {
@@ -51,8 +51,20 @@ pub(super) fn streaming_next_impl(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) 
         stmt.streaming_mode = 0;
         stmt.streaming_conn = std::ptr::null_mut();
         stmt.result_conn = std::ptr::null_mut();
-        stmt.read_done = 1;
-        return STEP_RESULT_DONE;
+        if !stmt.result.is_null() {
+            crate::libpq_helpers::rust_pq_clear(stmt.result);
+            stmt.result = std::ptr::null_mut();
+        }
+        step_read_clear_row_caches(stmt as *mut PgStmt);
+        stmt.current_row = stmt.num_rows;
+        stmt.read_done = -1;
+        unsafe {
+            crate::db_interpose_exec::pg_path::set_pg_last_error(
+                stmt.conn,
+                "PostgreSQL stream connection disappeared before completion",
+            );
+        }
+        return STEP_RESULT_ERROR;
     }
 
     if !stmt.result.is_null() {
@@ -78,8 +90,16 @@ pub(super) fn streaming_next_impl(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) 
             }
         }
         stmt.streaming_conn = std::ptr::null_mut();
-        stmt.read_done = 1;
-        return STEP_RESULT_DONE;
+        stmt.result_conn = std::ptr::null_mut();
+        stmt.current_row = stmt.num_rows;
+        stmt.read_done = -1;
+        unsafe {
+            crate::db_interpose_exec::pg_path::set_pg_last_error(
+                stmt.conn,
+                "PostgreSQL stream ended without a completion result",
+            );
+        }
+        return STEP_RESULT_ERROR;
     }
 
     let row_status = crate::libpq_helpers::rust_pq_result_status(row_res);
@@ -109,6 +129,8 @@ pub(super) fn streaming_next_impl(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) 
             }
         }
         stmt.streaming_conn = std::ptr::null_mut();
+        stmt.result_conn = std::ptr::null_mut();
+        stmt.current_row = stmt.num_rows;
         stmt.read_done = 1;
         return STEP_RESULT_DONE;
     }
@@ -120,6 +142,13 @@ pub(super) fn streaming_next_impl(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) 
         row_status,
         cstr_to_str(stmt.pg_sql)
     ));
+    unsafe {
+        crate::db_interpose_exec::pg_path::record_pg_result_error(
+            stmt.conn,
+            stmt.streaming_conn,
+            row_res,
+        );
+    }
     crate::libpq_helpers::rust_pq_clear(row_res);
     let mut drain =
         crate::libpq_helpers::rust_pq_get_result(unsafe { (*stmt.streaming_conn).conn });
@@ -136,8 +165,10 @@ pub(super) fn streaming_next_impl(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) 
         }
     }
     stmt.streaming_conn = std::ptr::null_mut();
-    stmt.read_done = 1;
-    STEP_RESULT_DONE
+    stmt.result_conn = std::ptr::null_mut();
+    stmt.current_row = stmt.num_rows;
+    stmt.read_done = -1;
+    STEP_RESULT_ERROR
 }
 
 pub(super) fn eager_next_impl(stmt: *mut PgStmt) -> c_int {
@@ -178,9 +209,9 @@ pub(super) fn log_debug_context_impl(stmt: *mut PgStmt, exec_conn: *mut PgConnec
             !stmt_ref.sql.is_null()
                 && (contains_icase_bytes(cstr_bytes(stmt_ref.sql), b"devices")
                     || contains_icase_bytes(cstr_bytes(stmt_ref.sql), b"library_sections"))
-            || !stmt_ref.pg_sql.is_null()
-                && (contains_icase_bytes(cstr_bytes(stmt_ref.pg_sql), b"devices")
-                    || contains_icase_bytes(cstr_bytes(stmt_ref.pg_sql), b"library_sections"))
+                || !stmt_ref.pg_sql.is_null()
+                    && (contains_icase_bytes(cstr_bytes(stmt_ref.pg_sql), b"devices")
+                        || contains_icase_bytes(cstr_bytes(stmt_ref.pg_sql), b"library_sections"))
         };
         if has_match {
             log_debug_lazy!(

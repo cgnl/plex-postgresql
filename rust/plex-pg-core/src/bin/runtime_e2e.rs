@@ -1,0 +1,853 @@
+use libc::{c_char, c_int, c_void};
+use postgres::{Client, Config, NoTls};
+use std::ffi::{CStr, CString};
+use std::path::PathBuf;
+use std::ptr;
+
+type Handle = *mut c_void;
+type Result<T> = std::result::Result<T, String>;
+const ROW: i32 = 100;
+const DONE: i32 = 101;
+
+struct Api {
+    exec: unsafe extern "C" fn(
+        Handle,
+        *const c_char,
+        Option<
+            unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int,
+        >,
+        *mut c_void,
+        *mut *mut c_char,
+    ) -> c_int,
+    free: unsafe extern "C" fn(*mut c_void),
+    open: unsafe extern "C" fn(*const c_char, *mut Handle) -> c_int,
+    close: unsafe extern "C" fn(Handle) -> c_int,
+    prepare: unsafe extern "C" fn(
+        Handle,
+        *const c_char,
+        c_int,
+        *mut Handle,
+        *mut *const c_char,
+    ) -> c_int,
+    step: unsafe extern "C" fn(Handle) -> c_int,
+    finalize: unsafe extern "C" fn(Handle) -> c_int,
+    reset: unsafe extern "C" fn(Handle) -> c_int,
+    clear: unsafe extern "C" fn(Handle) -> c_int,
+    bind_int: unsafe extern "C" fn(Handle, c_int, i64) -> c_int,
+    bind_null: unsafe extern "C" fn(Handle, c_int) -> c_int,
+    bind_blob: unsafe extern "C" fn(
+        Handle,
+        c_int,
+        *const c_void,
+        c_int,
+        Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> c_int,
+    column_int: unsafe extern "C" fn(Handle, c_int) -> i64,
+    column_int32: unsafe extern "C" fn(Handle, c_int) -> c_int,
+    column_double: unsafe extern "C" fn(Handle, c_int) -> f64,
+    column_type: unsafe extern "C" fn(Handle, c_int) -> c_int,
+    column_blob: unsafe extern "C" fn(Handle, c_int) -> *const c_void,
+    column_bytes: unsafe extern "C" fn(Handle, c_int) -> c_int,
+    rowid: unsafe extern "C" fn(Handle) -> i64,
+    errmsg: unsafe extern "C" fn(Handle) -> *const c_char,
+    errcode: unsafe extern "C" fn(Handle) -> c_int,
+    extended: unsafe extern "C" fn(Handle) -> c_int,
+}
+
+unsafe fn symbol<T: Copy>(library: Handle, name: &str) -> Result<T> {
+    let name = CString::new(name).map_err(|error| error.to_string())?;
+    let address = libc::dlsym(library, name.as_ptr());
+    if address.is_null() {
+        return Err(format!(
+            "missing shared shim export {}",
+            name.to_string_lossy()
+        ));
+    }
+    Ok(std::mem::transmute_copy(&address))
+}
+
+impl Api {
+    unsafe fn load(path: &str) -> Result<Self> {
+        let path = CString::new(path).map_err(|error| error.to_string())?;
+        let library = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+        if library.is_null() {
+            let error = libc::dlerror();
+            return Err(if error.is_null() {
+                "dlopen failed".into()
+            } else {
+                CStr::from_ptr(error).to_string_lossy().into_owned()
+            });
+        }
+        let prefix = if cfg!(target_os = "macos") { "my_" } else { "" };
+        macro_rules! load {
+            ($name:literal) => {
+                symbol(library, &format!("{prefix}sqlite3_{}", $name))?
+            };
+        }
+        let api = Self {
+            exec: load!("exec"),
+            free: load!("free"),
+            open: load!("open"),
+            close: load!("close"),
+            prepare: load!("prepare_v2"),
+            step: load!("step"),
+            finalize: load!("finalize"),
+            reset: load!("reset"),
+            clear: load!("clear_bindings"),
+            bind_int: load!("bind_int64"),
+            bind_null: load!("bind_null"),
+            bind_blob: load!("bind_blob"),
+            column_int: load!("column_int64"),
+            column_int32: load!("column_int"),
+            column_double: load!("column_double"),
+            column_type: load!("column_type"),
+            column_blob: load!("column_blob"),
+            column_bytes: load!("column_bytes"),
+            rowid: load!("last_insert_rowid"),
+            errmsg: load!("errmsg"),
+            errcode: load!("errcode"),
+            extended: load!("extended_errcode"),
+        };
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(api.open as *const c_void, &mut info) == 0 || info.dli_fname.is_null() {
+            return Err("cannot verify sqlite3_open shared artifact provenance".into());
+        }
+        let actual = PathBuf::from(CStr::from_ptr(info.dli_fname).to_string_lossy().as_ref());
+        if actual.canonicalize().map_err(|error| error.to_string())?
+            != PathBuf::from(path.to_string_lossy().as_ref())
+                .canonicalize()
+                .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "sqlite3_open resolved outside selected shim: {}",
+                actual.display()
+            ));
+        }
+        println!("ARTIFACT {} ({}sqlite3_* ABI)", actual.display(), prefix);
+        Ok(api)
+    }
+
+    fn error(&self, db: Handle) -> String {
+        unsafe {
+            let message = (self.errmsg)(db);
+            if message.is_null() {
+                "null errmsg".into()
+            } else {
+                CStr::from_ptr(message).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    fn check(&self, db: Handle, code: i32, expected: i32, context: &str) -> Result<()> {
+        if code == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "{context}: rc={code}, expected={expected}, errmsg={}",
+                self.error(db)
+            ))
+        }
+    }
+
+    fn open(&self, path: &str) -> Result<Db<'_>> {
+        let path = CString::new(path).map_err(|error| error.to_string())?;
+        let mut handle = ptr::null_mut();
+        let code = unsafe { (self.open)(path.as_ptr(), &mut handle) };
+        if code != 0 || handle.is_null() {
+            let message = if handle.is_null() {
+                "null handle".into()
+            } else {
+                self.error(handle)
+            };
+            if !handle.is_null() {
+                unsafe {
+                    (self.close)(handle);
+                }
+            }
+            return Err(format!("sqlite3_open: rc={code}: {message}"));
+        }
+        Ok(Db { api: self, handle })
+    }
+}
+
+struct Db<'a> {
+    api: &'a Api,
+    handle: Handle,
+}
+impl Drop for Db<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            (self.api.close)(self.handle);
+        }
+    }
+}
+struct Stmt<'a> {
+    db: &'a Db<'a>,
+    handle: Handle,
+}
+impl Drop for Stmt<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            (self.db.api.finalize)(self.handle);
+        }
+    }
+}
+impl Db<'_> {
+    fn prepare(&self, sql: &str) -> Result<Stmt<'_>> {
+        let sql = CString::new(sql).map_err(|error| error.to_string())?;
+        let mut handle = ptr::null_mut();
+        let code = unsafe {
+            (self.api.prepare)(self.handle, sql.as_ptr(), -1, &mut handle, ptr::null_mut())
+        };
+        self.api.check(
+            self.handle,
+            code,
+            0,
+            &format!("prepare {}", sql.to_string_lossy()),
+        )?;
+        if handle.is_null() {
+            return Err("prepare returned null statement".into());
+        }
+        Ok(Stmt { db: self, handle })
+    }
+    fn exec(&self, sql: &str) -> Result<()> {
+        let stmt = self.prepare(sql)?;
+        self.api.check(
+            self.handle,
+            unsafe { (self.api.step)(stmt.handle) },
+            DONE,
+            sql,
+        )
+    }
+    fn exec_abi(&self, sql: &str) -> Result<()> {
+        let sql = CString::new(sql).map_err(|error| error.to_string())?;
+        let mut message = ptr::null_mut();
+        let code = unsafe {
+            (self.api.exec)(
+                self.handle,
+                sql.as_ptr(),
+                None,
+                ptr::null_mut(),
+                &mut message,
+            )
+        };
+        let detail = if message.is_null() {
+            self.api.error(self.handle)
+        } else {
+            let detail = unsafe { CStr::from_ptr(message).to_string_lossy().into_owned() };
+            unsafe { (self.api.free)(message.cast()) };
+            detail
+        };
+        require(code == 0, &format!("sqlite3_exec rc={code}: {detail}"))
+    }
+    fn scalar(&self, sql: &str) -> Result<i64> {
+        let stmt = self.prepare(sql)?;
+        self.api.check(
+            self.handle,
+            unsafe { (self.api.step)(stmt.handle) },
+            ROW,
+            sql,
+        )?;
+        Ok(unsafe { (self.api.column_int)(stmt.handle, 0) })
+    }
+}
+
+fn require(condition: bool, message: &str) -> Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(message.into())
+    }
+}
+fn env(name: &str) -> Result<String> {
+    std::env::var(name).map_err(|_| format!("missing explicit fixture config: {name}"))
+}
+
+fn run() -> Result<()> {
+    let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--shim-env") {
+        require(
+            args.len() == 2 || (args.len() == 3 && args[2] == "--reconnect"),
+            "usage: runtime_e2e --shim-env [--reconnect]",
+        )?;
+        args[1] = "--shim".into();
+        args.insert(2, env("RUNTIME_E2E_SHIM")?);
+    }
+    require(
+        args.len() == 3 || (args.len() == 4 && args[3] == "--reconnect"),
+        "usage: runtime_e2e --shim ABSOLUTE_PATH [--reconnect]",
+    )?;
+    require(args[1] == "--shim", "--shim required")?;
+    require(
+        PathBuf::from(&args[2]).is_absolute(),
+        "--shim requires an absolute artifact path",
+    )?;
+    require(
+        !std::env::vars_os().any(|(name, _)| name.to_string_lossy().starts_with("PG")),
+        "inherited libpq PG* settings forbidden; use the fixture script",
+    )?;
+    require(
+        env("RUNTIME_E2E_ISOLATED")? == "1",
+        "isolated fixture attestation required",
+    )?;
+    let host = env("PLEX_PG_HOST")?;
+    require(
+        host == "127.0.0.1" || host.starts_with("/"),
+        "fixture must use loopback or a local Unix socket",
+    )?;
+    let database = env("PLEX_PG_DATABASE")?;
+    let user = env("PLEX_PG_USER")?;
+    let schema = env("PLEX_PG_SCHEMA")?;
+    require(
+        database.starts_with("runtime_e2e_")
+            && user.starts_with("runtime_e2e_")
+            && schema == "runtime_e2e",
+        "refusing non-fixture database/user/schema",
+    )?;
+    require(
+        !database
+            .contains(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            && !user
+                .contains(|character: char| !character.is_ascii_alphanumeric() && character != '_'),
+        "invalid fixture identifiers",
+    )?;
+    let password = env("PLEX_PG_PASSWORD")?;
+    require(
+        !password.is_empty()
+            && password
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+        "fixture password must be explicit and conninfo-safe",
+    )?;
+    let port: u16 = env("PLEX_PG_PORT")?
+        .parse()
+        .map_err(|_| "invalid fixture port")?;
+    let root = PathBuf::from(env("RUNTIME_E2E_DIR")?)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    require(
+        root.join(".runtime-e2e-fixture").is_file(),
+        "missing temporary fixture directory marker",
+    )?;
+    let mut config = Config::new();
+    config
+        .host(&host)
+        .port(port)
+        .dbname(&database)
+        .user(&user)
+        .password(&password)
+        .connect_timeout(std::time::Duration::from_secs(5));
+    let mut observer = config.connect(NoTls).map_err(|error| error.to_string())?;
+    let identity = observer.query_one("SELECT current_database(), current_user, shobj_description(oid, 'pg_database') FROM pg_database WHERE datname=current_database()", &[]).map_err(|error| error.to_string())?;
+    require(
+        identity.get::<_, String>(0) == database
+            && identity.get::<_, String>(1) == user
+            && identity.get::<_, Option<String>>(2).as_deref()
+                == Some("runtime-e2e disposable fixture"),
+        "database fixture marker or identity mismatch",
+    )?;
+    observer.batch_execute("CREATE SCHEMA runtime_e2e; SET search_path TO runtime_e2e; CREATE TABLE runtime_items (id BIGSERIAL PRIMARY KEY, unique_value BIGINT NOT NULL UNIQUE, nullable_value BIGINT, integer_value BIGINT, blob_value BYTEA, flag BOOLEAN); CREATE TABLE runtime_child (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES runtime_items(id));").map_err(|error| error.to_string())?;
+    let api = unsafe { Api::load(&args[2])? };
+    let path = root.join("com.plexapp.plugins.library.db");
+    let path = path.to_str().ok_or("invalid fixture path")?;
+    let first = api.open(path)?;
+    let second = api.open(path)?;
+    type Case = (
+        &'static str,
+        fn(&Api, &Db<'_>, &Db<'_>, &mut Client) -> Result<()>,
+    );
+    let cases: [Case; 12] = [
+        ("sqlite_rtree_internals", |_, first, _, observer| {
+            first.exec("CREATE VIRTUAL TABLE locations USING rtree(id, lat_min, lat_max, lon_min, lon_max)")?;
+            require(
+                first.scalar(
+                    "SELECT length(data) FROM \"main\".\"locations_node\" WHERE nodeno=1",
+                )? > 0,
+                "SQLite RTree root node missing",
+            )?;
+            require(
+                first.scalar("SELECT COUNT(*) FROM locations_parent")? == 0,
+                "unexpected RTree parent rows",
+            )?;
+            require(
+                first.scalar("SELECT COUNT(*) FROM locations_rowid")? == 0,
+                "unexpected RTree rowid rows",
+            )?;
+            require(
+                observer
+                    .query_one(
+                        "SELECT to_regclass('runtime_e2e.locations_node') IS NULL",
+                        &[],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .get::<_, bool>(0),
+                "SQLite RTree internals leaked to PostgreSQL",
+            )
+        }),
+        ("normal_library_open", |_, first, _, observer| {
+            require(
+                first.scalar("SELECT COUNT(*) FROM runtime_items")? == 0,
+                "shim did not see PostgreSQL-only fixture table",
+            )?;
+            require(
+                observer
+                    .query_one("SELECT COUNT(*) FROM runtime_e2e.runtime_items", &[])
+                    .map_err(|error| error.to_string())?
+                    .get::<_, i64>(0)
+                    == 0,
+                "fixture unexpectedly populated",
+            )
+        }),
+        ("prepared_cached_writes", |api, first, _, observer| {
+            for _ in 0..2 {
+                let stmt = first.prepare("INSERT INTO runtime_items (unique_value) VALUES (?)")?;
+                for _ in 0..3 {
+                    let key = observer
+                        .query_one(
+                            "SELECT COALESCE(MAX(unique_value),0)+1 FROM runtime_e2e.runtime_items",
+                            &[],
+                        )
+                        .map_err(|error| error.to_string())?
+                        .get::<_, i64>(0);
+                    api.check(
+                        first.handle,
+                        unsafe { (api.bind_int)(stmt.handle, 1, key) },
+                        0,
+                        "bind cached write",
+                    )?;
+                    api.check(
+                        first.handle,
+                        unsafe { (api.step)(stmt.handle) },
+                        DONE,
+                        "step cached write",
+                    )?;
+                    require(
+                        unsafe { (api.rowid)(first.handle) } > 0,
+                        "missing inserted rowid",
+                    )?;
+                    api.check(
+                        first.handle,
+                        unsafe { (api.reset)(stmt.handle) },
+                        0,
+                        "reset cached write",
+                    )?;
+                    api.check(
+                        first.handle,
+                        unsafe { (api.clear)(stmt.handle) },
+                        0,
+                        "clear cached write",
+                    )?;
+                }
+            }
+            require(
+                observer
+                    .query_one("SELECT COUNT(*) FROM runtime_e2e.runtime_items", &[])
+                    .map_err(|error| error.to_string())?
+                    .get::<_, i64>(0)
+                    == 6,
+                "prepared writes not persisted to PostgreSQL",
+            )
+        }),
+        ("real_constraints_and_errors", |api, first, _, _| {
+            let mut errors = Vec::new();
+            for (sql, expected) in [
+                ("INSERT INTO runtime_items (unique_value) VALUES (1)", 2067),
+                (
+                    "INSERT INTO runtime_items (unique_value) VALUES (NULL)",
+                    1299,
+                ),
+                ("INSERT INTO runtime_child (parent_id) VALUES (999999)", 787),
+            ] {
+                let stmt = first.prepare(sql)?;
+                let code = unsafe { (api.step)(stmt.handle) };
+                let primary = unsafe { (api.errcode)(first.handle) };
+                let extended = unsafe { (api.extended)(first.handle) };
+                let message = api.error(first.handle);
+                if code & 255 != 19
+                    || primary != 19
+                    || extended != expected
+                    || message.is_empty()
+                    || message == "not an error"
+                {
+                    errors.push(format!("{sql}: rc={code}, primary={primary}, extended={extended} (expected {expected}), errmsg={message}"));
+                }
+            }
+            require(
+                first.scalar("SELECT COUNT(*) FROM runtime_items")? == 6,
+                "connection unusable after errors",
+            )?;
+            require(errors.is_empty(), &errors.join("; "))
+        }),
+        ("two_handle_rowid_isolation", |api, first, second, _| {
+            first.exec("INSERT INTO runtime_items (unique_value) VALUES (101)")?;
+            let first_id = unsafe { (api.rowid)(first.handle) };
+            second.exec("INSERT INTO runtime_items (unique_value) VALUES (102)")?;
+            let second_id = unsafe { (api.rowid)(second.handle) };
+            require(
+                second_id != first_id && first_id > 0 && second_id > 0,
+                "insert identities not distinct",
+            )?;
+            require(
+                unsafe { (api.rowid)(first.handle) } == first_id,
+                "second handle overwrote first handle rowid",
+            )?;
+            require(
+                first.scalar("SELECT last_insert_rowid()")? == first_id
+                    && second.scalar("SELECT last_insert_rowid()")? == second_id,
+                "SQL rowid isolation failed",
+            )
+        }),
+        (
+            "transaction_multiple_writes_rollback",
+            |_, first, second, observer| {
+                first.exec("BEGIN")?;
+                first.exec("INSERT INTO runtime_items (unique_value) VALUES (201)")?;
+                first.exec("INSERT INTO runtime_items (unique_value) VALUES (202)")?;
+                require(
+                    second.scalar(
+                        "SELECT COUNT(*) FROM runtime_items WHERE unique_value IN (201,202)",
+                    )? == 0,
+                    "uncommitted writes leaked to another handle",
+                )?;
+                first.exec("ROLLBACK")?;
+                require(observer.query_one("SELECT COUNT(*) FROM runtime_e2e.runtime_items WHERE unique_value IN (201,202)", &[]).map_err(|error| error.to_string())?.get::<_, i64>(0) == 0, "rollback writes persisted")
+            },
+        ),
+        ("savepoint", |_, first, _, observer| {
+            first.exec("BEGIN")?;
+            first.exec("INSERT INTO runtime_items (unique_value) VALUES (301)")?;
+            first.exec("SAVEPOINT runtime_point")?;
+            first.exec("INSERT INTO runtime_items (unique_value) VALUES (302)")?;
+            first.exec("ROLLBACK TO runtime_point")?;
+            first.exec("RELEASE runtime_point")?;
+            first.exec("COMMIT")?;
+            let count = observer
+                .query_one(
+                    "SELECT COUNT(*) FROM runtime_e2e.runtime_items WHERE unique_value=302",
+                    &[],
+                )
+                .map_err(|error| error.to_string())?
+                .get::<_, i64>(0);
+            require(
+                count == 0
+                    && first.scalar("SELECT COUNT(*) FROM runtime_items WHERE unique_value=301")?
+                        == 1,
+                "rollback/savepoint persistence incorrect",
+            )
+        }),
+        ("aborted_commit_rejected", |_, first, _, _| {
+            first.exec("BEGIN")?;
+            require(
+                first
+                    .exec("INSERT INTO runtime_items (unique_value) VALUES (1)")
+                    .is_err(),
+                "duplicate write unexpectedly succeeded",
+            )?;
+            require(
+                first.exec("COMMIT").is_err(),
+                "aborted transaction reported successful commit",
+            )?;
+            first.exec("ROLLBACK")
+        }),
+        ("null_int64_blob_boolean", |api, first, _, observer| {
+            let blob = [0_u8, 1, 127, 128, 255];
+            let number = 8_000_000_000_000_123_i64;
+            let stmt = first.prepare("INSERT INTO runtime_items (unique_value, nullable_value, integer_value, blob_value, flag) VALUES (401, ?, ?, ?, ?)")?;
+            api.check(
+                first.handle,
+                unsafe { (api.bind_null)(stmt.handle, 1) },
+                0,
+                "bind NULL",
+            )?;
+            api.check(
+                first.handle,
+                unsafe { (api.bind_int)(stmt.handle, 2, number) },
+                0,
+                "bind int64",
+            )?;
+            api.check(
+                first.handle,
+                unsafe {
+                    (api.bind_blob)(
+                        stmt.handle,
+                        3,
+                        blob.as_ptr().cast(),
+                        blob.len() as i32,
+                        None,
+                    )
+                },
+                0,
+                "bind BLOB",
+            )?;
+            api.check(
+                first.handle,
+                unsafe { (api.bind_int)(stmt.handle, 4, 1) },
+                0,
+                "bind boolean",
+            )?;
+            api.check(
+                first.handle,
+                unsafe { (api.step)(stmt.handle) },
+                DONE,
+                "type write",
+            )?;
+            let read = first.prepare("SELECT nullable_value, integer_value, blob_value, flag FROM runtime_items WHERE unique_value=401")?;
+            api.check(
+                first.handle,
+                unsafe { (api.step)(read.handle) },
+                ROW,
+                "type read",
+            )?;
+            let mut errors = Vec::new();
+            if unsafe { (api.column_type)(read.handle, 0) } != 5 {
+                errors.push("NULL storage class incorrect");
+            }
+            if unsafe { (api.column_type)(read.handle, 1) } != 1
+                || unsafe { (api.column_int)(read.handle, 1) } != number
+            {
+                errors.push("int64 roundtrip incorrect");
+            }
+            if unsafe { (api.column_type)(read.handle, 2) } != 4 {
+                errors.push("BLOB storage class incorrect");
+            }
+            let length = unsafe { (api.column_bytes)(read.handle, 2) };
+            let data = unsafe { (api.column_blob)(read.handle, 2) };
+            if length != blob.len() as i32 || data.is_null() {
+                errors.push("BLOB length/pointer incorrect");
+            } else if unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length as usize) }
+                != blob
+            {
+                errors.push("BLOB bytes changed");
+            }
+            if unsafe { (api.column_int)(read.handle, 3) } != 1 {
+                errors.push("boolean roundtrip incorrect");
+            }
+            drop(read);
+            let numeric = first.prepare("SELECT -123456789 AS integer_value, 9223372036854775700 AS big_value, 12345.625 AS real_value")?;
+            api.check(
+                first.handle,
+                unsafe { (api.step)(numeric.handle) },
+                ROW,
+                "numeric scalar read",
+            )?;
+            for _ in 0..8 {
+                if unsafe { (api.column_int32)(numeric.handle, 0) } != -123456789
+                    || unsafe { (api.column_int)(numeric.handle, 1) } != 9223372036854775700
+                    || unsafe { (api.column_double)(numeric.handle, 2) } != 12345.625
+                {
+                    errors.push("numeric scalar accessors changed values");
+                    break;
+                }
+            }
+            let persisted = observer.query_one("SELECT nullable_value, integer_value, blob_value, flag FROM runtime_e2e.runtime_items WHERE unique_value=401", &[]).map_err(|error| error.to_string())?;
+            require(
+                persisted.get::<_, Option<i64>>(0).is_none()
+                    && persisted.get::<_, i64>(1) == number
+                    && persisted.get::<_, Vec<u8>>(2) == blob
+                    && persisted.get::<_, bool>(3),
+                "PostgreSQL stored types differ",
+            )?;
+            require(errors.is_empty(), &errors.join("; "))
+        }),
+        ("select_result_exhaustion", |api, first, _, _| {
+            let stmt = first.prepare("SELECT COUNT(*) FROM runtime_items")?;
+            api.check(
+                first.handle,
+                unsafe { (api.step)(stmt.handle) },
+                ROW,
+                "first SELECT step",
+            )?;
+            api.check(
+                first.handle,
+                unsafe { (api.step)(stmt.handle) },
+                DONE,
+                "SELECT result exhaustion",
+            )
+        }),
+        ("maintenance_noop", |_, first, _, observer| {
+            let before: i64 = observer
+                .query_one("SELECT COUNT(*) FROM runtime_e2e.runtime_items", &[])
+                .map_err(|error| error.to_string())?
+                .get(0);
+            first.exec("VACUUM")?;
+            first.exec_abi("VACUUM")?;
+            first.exec("REINDEX")?;
+            first.exec("PRAGMA optimize")?;
+            let after: i64 = observer
+                .query_one("SELECT COUNT(*) FROM runtime_e2e.runtime_items", &[])
+                .map_err(|error| error.to_string())?
+                .get(0);
+            require(
+                before == after,
+                "maintenance changed PostgreSQL library data",
+            )
+        }),
+        (
+            "sqlite3_exec_transactions_and_errors",
+            |api, first, _, observer| {
+                first.exec_abi("BEGIN")?;
+                first.exec_abi("INSERT INTO runtime_items (unique_value) VALUES (701)")?;
+                first.exec_abi("ROLLBACK")?;
+                require(
+                    observer
+                        .query_one(
+                            "SELECT COUNT(*) FROM runtime_e2e.runtime_items WHERE unique_value=701",
+                            &[],
+                        )
+                        .map_err(|error| error.to_string())?
+                        .get::<_, i64>(0)
+                        == 0,
+                    "sqlite3_exec rollback persisted a write",
+                )?;
+                require(
+                    first
+                        .exec_abi("INSERT INTO runtime_items (unique_value) VALUES (1)")
+                        .is_err(),
+                    "sqlite3_exec hid a constraint failure",
+                )?;
+                require(
+                    unsafe { (api.extended)(first.handle) } == 2067,
+                    "sqlite3_exec lost extended constraint error",
+                )?;
+                first.exec_abi("INSERT INTO runtime_items (unique_value) VALUES (702)")?;
+                require(
+                    observer
+                        .query_one(
+                            "SELECT COUNT(*) FROM runtime_e2e.runtime_items WHERE unique_value=702",
+                            &[],
+                        )
+                        .map_err(|error| error.to_string())?
+                        .get::<_, i64>(0)
+                        == 1,
+                    "sqlite3_exec write did not persist",
+                )
+            },
+        ),
+    ];
+    let mut failures = 0;
+    for (name, case) in cases {
+        match case(&api, &first, &second, &mut observer) {
+            Ok(()) => println!("PASS {name}"),
+            Err(error) => {
+                failures += 1;
+                eprintln!("FAIL {name}: {error}");
+                let _ = first.exec("ROLLBACK");
+                let _ = second.exec("ROLLBACK");
+            }
+        }
+    }
+    if args.len() == 4 {
+        let reconnect = (|| -> Result<()> {
+            let victims = observer.query("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND usename=current_user AND pid<>pg_backend_pid()", &[]).map_err(|error| error.to_string())?;
+            require(
+                !victims.is_empty(),
+                "no real shim PostgreSQL backends to reconnect",
+            )?;
+            for victim in victims {
+                observer
+                    .query_one(
+                        "SELECT pg_terminate_backend($1)",
+                        &[&victim.get::<_, i32>(0)],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            require(
+                first.scalar("SELECT COUNT(*) FROM runtime_items")? > 0,
+                "reconnect did not recover reads",
+            )?;
+            first.exec("INSERT INTO runtime_items (unique_value) VALUES (501)")?;
+            require(
+                observer
+                    .query_one(
+                        "SELECT COUNT(*) FROM runtime_e2e.runtime_items WHERE unique_value=501",
+                        &[],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .get::<_, i64>(0)
+                    == 1,
+                "reconnect write not persisted",
+            )?;
+            observer.batch_execute("CREATE VIEW runtime_e2e.runtime_stream AS SELECT generate_series(1, 1000000)::bigint AS id").map_err(|error| error.to_string())?;
+            let stream = first.prepare("SELECT id FROM runtime_stream")?;
+            api.check(
+                first.handle,
+                unsafe { (api.step)(stream.handle) },
+                ROW,
+                "stream before disconnect",
+            )?;
+            let victims = observer.query("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND usename=current_user AND pid<>pg_backend_pid() AND query LIKE '%runtime_stream%'", &[]).map_err(|error| error.to_string())?;
+            require(
+                !victims.is_empty(),
+                "no real streaming backend to interrupt",
+            )?;
+            for victim in victims {
+                observer
+                    .query_one(
+                        "SELECT pg_terminate_backend($1)",
+                        &[&victim.get::<_, i32>(0)],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            let mut code = ROW;
+            let mut delivered = 1;
+            while code == ROW && delivered <= 1_000_000 {
+                code = unsafe { (api.step)(stream.handle) };
+                delivered += 1;
+            }
+            require(
+                code != ROW && code != DONE,
+                "interrupted stream reported successful exhaustion or replayed rows",
+            )?;
+            require(
+                unsafe { (api.step)(stream.handle) } == code,
+                "interrupted stream lost terminal error",
+            )?;
+            require(
+                !api.error(first.handle).is_empty(),
+                "interrupted stream lacks diagnostics",
+            )?;
+            drop(stream);
+            first.exec("BEGIN")?;
+            first.exec("INSERT INTO runtime_items (unique_value) VALUES (601)")?;
+            let victims = observer.query("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND usename=current_user AND pid<>pg_backend_pid()", &[]).map_err(|error| error.to_string())?;
+            for victim in victims {
+                observer
+                    .query_one(
+                        "SELECT pg_terminate_backend($1)",
+                        &[&victim.get::<_, i32>(0)],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            require(
+                first
+                    .exec("INSERT INTO runtime_items (unique_value) VALUES (602)")
+                    .is_err(),
+                "interrupted transaction silently resumed in autocommit",
+            )?;
+            require(
+                observer.query_one("SELECT COUNT(*) FROM runtime_e2e.runtime_items WHERE unique_value IN (601,602)", &[]).map_err(|error| error.to_string())?.get::<_, i64>(0) == 0,
+                "interrupted transaction persisted partial writes",
+            )
+        })();
+        match reconnect {
+            Ok(()) => println!("PASS reconnect"),
+            Err(error) => {
+                failures += 1;
+                eprintln!("FAIL reconnect: {error}");
+            }
+        }
+    }
+    require(
+        failures == 0,
+        &format!("{failures} runtime E2E case(s) failed"),
+    )?;
+    println!("PASS runtime_e2e: real shared shim + isolated PostgreSQL; zero skips");
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("runtime_e2e: {error}");
+        std::process::exit(1);
+    }
+}

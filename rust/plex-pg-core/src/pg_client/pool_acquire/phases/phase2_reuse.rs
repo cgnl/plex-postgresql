@@ -14,14 +14,16 @@ use crate::log_info_lazy;
 pub(crate) fn phase2_reuse_existing(ctx: &AcquireCtx<'_>) -> AcquireDecision {
     for i in 0..ctx.pool_size {
         let slot = &ctx.pm.slots[i];
+        if !slot.try_claim_free() {
+            continue;
+        }
         let conn = slot.conn.load(std::sync::atomic::Ordering::Acquire);
         if conn.is_null() || conn == ctx.exclude_conn as *mut _ {
+            slot.release();
             continue;
         }
         if conn_is_streaming_active_ptr(conn as *mut PgConnection) {
-            continue;
-        }
-        if !slot.try_claim_free() {
+            slot.release();
             continue;
         }
 
@@ -29,11 +31,7 @@ pub(crate) fn phase2_reuse_existing(ctx: &AcquireCtx<'_>) -> AcquireDecision {
 
         let txn = get_txn_status(conn);
         if txn == PQTRANS_INTRANS || txn == PQTRANS_INERROR {
-            let cmd = if txn == PQTRANS_INTRANS {
-                c"COMMIT"
-            } else {
-                c"ROLLBACK"
-            };
+            let cmd = c"ROLLBACK";
             log_info_lazy!(
                 "Pool PHASE 2: slot {} has pending transaction (status={}), sending cleanup before reset",
                 i, txn

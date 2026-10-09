@@ -2,7 +2,9 @@
 # Dockerfile for plex-postgresql
 # Build with Alpine 3.15 which has musl 1.2.2 - same as Plex's bundled musl!
 
-FROM alpine:3.15 AS builder
+ARG BUILDER_IMAGE=alpine:3.15
+ARG PLEX_BASE_IMAGE=linuxserver/plex:latest
+FROM ${BUILDER_IMAGE} AS builder
 
 ARG PLEX_PG_SANITIZE
 ENV PLEX_PG_SANITIZE=${PLEX_PG_SANITIZE}
@@ -47,8 +49,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     rm -rf /usr/local/cargo/registry/src/index.crates.io-* && \
     sh scripts/docker-build-shim.sh
 
+RUN nm -D --defined-only /libs/db_interpose_pg.so > /libs/default-exports.txt && \
+    awk '$3 ~ /^(vfork|__cxa_throw)(@.*)?$/ || $3 ~ /create_simple_converter/ { print "Forbidden default export: " $3; rejected=1 } END { exit rejected }' /libs/default-exports.txt
+
 # Runtime stage
-FROM linuxserver/plex:latest
+FROM ${PLEX_BASE_IMAGE}
+
+ENV VERSION=docker
 
 # Install PostgreSQL client for health checks, sqlite3 for schema fixes,
 # python3 for data migration, gdb for debugging
@@ -82,6 +89,7 @@ RUN ARCH=$(uname -m) && \
 
 COPY --from=builder /libs/*.so* /usr/local/lib/plex-postgresql/
 COPY --from=builder /libs/subreaper /usr/local/bin/subreaper
+COPY --from=builder /libs/default-exports.txt /usr/local/lib/plex-postgresql/
 
 COPY schema/plex_schema.sql /usr/local/lib/plex-postgresql/
 COPY schema/sqlite_schema.sql /usr/local/lib/plex-postgresql/

@@ -12,7 +12,7 @@ struct LiveScalarState {
     col_name: *const c_char,
     is_null: bool,
     value_buf: [c_char; 128],
-    value_ptr: *const c_char,
+    value_valid: bool,
 }
 
 impl LiveScalarState {
@@ -23,7 +23,7 @@ impl LiveScalarState {
             col_name,
             is_null,
             value_buf: [0; 128],
-            value_ptr: ptr::null(),
+            value_valid: false,
         }
     }
 }
@@ -101,7 +101,7 @@ unsafe fn load_live_scalar_state(
             state.value_buf.len(),
         );
         if val_len >= 0 {
-            state.value_ptr = state.value_buf.as_ptr();
+            state.value_valid = true;
         }
     }
 
@@ -136,8 +136,8 @@ pub(super) fn column_int_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
                 };
 
                 let mut rv = 0;
-                if !state.is_null && !state.value_ptr.is_null() {
-                    rv = pg_text_to_int_impl(state.value_ptr);
+                if !state.is_null && state.value_valid {
+                    rv = pg_text_to_int_impl(state.value_buf.as_ptr());
 
                     let mut masked = 0i64;
                     if mask_collection_metadata_type(
@@ -197,8 +197,8 @@ pub(super) fn column_int64_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> i64 {
                 };
 
                 let mut rv: i64 = 0;
-                if !state.is_null && !state.value_ptr.is_null() {
-                    rv = pg_text_to_int64_impl(state.value_ptr);
+                if !state.is_null && state.value_valid {
+                    rv = pg_text_to_int64_impl(state.value_buf.as_ptr());
 
                     let mut masked = 0i64;
                     if mask_collection_metadata_type(pg_stmt, state.col_name, rv, &mut masked) {
@@ -247,8 +247,8 @@ pub(super) fn column_double_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> f64 {
                     return 0.0;
                 };
 
-                if !state.is_null && !state.value_ptr.is_null() {
-                    pg_text_to_double_impl(state.value_ptr)
+                if !state.is_null && state.value_valid {
+                    pg_text_to_double_impl(state.value_buf.as_ptr())
                 } else {
                     0.0
                 }

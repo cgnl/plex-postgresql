@@ -40,6 +40,7 @@ static PMS_CHILD_ENV_SCRUB_ENABLED: AtomicI32 = AtomicI32::new(0);
 static PMS_CHILD_ENV_SCRUB_LOG_BUDGET: AtomicI32 = AtomicI32::new(0);
 
 static SELF_LD_PRELOAD: OnceLock<Option<CString>> = OnceLock::new();
+static SCANNER_LD_PRELOAD_ENTRY: OnceLock<Option<CString>> = OnceLock::new();
 
 const DEFAULT_LOG_BUDGET: i32 = 16;
 const _PRIVATE_LIB_DIR: &str = "/usr/local/lib/plex-postgresql";
@@ -99,6 +100,13 @@ pub fn scrub_current_process_preload() {
     }
 
     let had_preload = capture_self_ld_preload().is_some();
+    let _ = SCANNER_LD_PRELOAD_ENTRY.get_or_init(|| {
+        capture_self_ld_preload().and_then(|value| {
+            let mut entry = b"LD_PRELOAD=".to_vec();
+            entry.extend_from_slice(value.as_bytes());
+            CString::new(entry).ok()
+        })
+    });
     unsafe {
         let raw = libc::getenv(LD_PRELOAD_ENV.as_ptr() as *const c_char);
         if raw.is_null() || *raw == 0 {
@@ -428,6 +436,121 @@ unsafe fn adjusted_env_for_process(
     }
 }
 
+struct ExecEnvironment {
+    entries: [*const c_char; 4096],
+    preload: [u8; 8192],
+}
+
+impl ExecEnvironment {
+    fn new() -> Self {
+        Self {
+            entries: [ptr::null(); 4096],
+            preload: [0; 8192],
+        }
+    }
+
+    unsafe fn prepare(
+        &mut self,
+        path: *const c_char,
+        argv: *const *const c_char,
+        envp: *const *const c_char,
+    ) -> Result<(), c_int> {
+        let executable = if !path.is_null() {
+            path
+        } else if !argv.is_null() {
+            *argv
+        } else {
+            ptr::null()
+        };
+        let label = if executable.is_null() {
+            &[][..]
+        } else {
+            CStr::from_ptr(executable)
+                .to_bytes()
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .unwrap_or_default()
+        };
+        let scanner = label
+            .windows(b"Plex Media Scanner".len())
+            .any(|window| window == b"Plex Media Scanner");
+        let mut source = source_envp(envp);
+        let mut count = 0;
+        let mut has_preload = false;
+        let mut seen_preload = false;
+        while !source.is_null() && !(*source).is_null() {
+            let entry = *source;
+            source = source.add(1);
+            let bytes = CStr::from_ptr(entry).to_bytes();
+            let Some(separator) = bytes.iter().position(|byte| *byte == b'=') else {
+                continue;
+            };
+            let key = &bytes[..separator];
+            if key == b"LD_PRELOAD" {
+                if seen_preload {
+                    continue;
+                }
+                seen_preload = true;
+            }
+            let mut selected = entry;
+            if !scanner {
+                if key == b"LD_LIBRARY_PATH"
+                    || key.starts_with(b"PLEX_PG_")
+                    || key == b"LANG"
+                    || key == b"LANGUAGE"
+                    || key == b"CHARSET"
+                    || key.starts_with(b"LC_")
+                {
+                    continue;
+                }
+                if key == b"LD_PRELOAD" {
+                    let mut length = b"LD_PRELOAD=".len();
+                    self.preload[..length].copy_from_slice(b"LD_PRELOAD=");
+                    for token in bytes[separator + 1..].split(|byte| *byte == b':') {
+                        if token.is_empty()
+                            || token
+                                .windows(SHIM_SO_TOKEN.len())
+                                .any(|window| window == SHIM_SO_TOKEN.as_bytes())
+                        {
+                            continue;
+                        }
+                        let extra = usize::from(length > b"LD_PRELOAD=".len());
+                        if length + extra + token.len() >= self.preload.len() {
+                            return Err(libc::E2BIG);
+                        }
+                        if extra != 0 {
+                            self.preload[length] = b':';
+                            length += 1;
+                        }
+                        self.preload[length..length + token.len()].copy_from_slice(token);
+                        length += token.len();
+                    }
+                    if length == b"LD_PRELOAD=".len() {
+                        continue;
+                    }
+                    self.preload[length] = 0;
+                    selected = self.preload.as_ptr().cast();
+                }
+            }
+            has_preload |= key == b"LD_PRELOAD";
+            if count + 1 >= self.entries.len() {
+                return Err(libc::E2BIG);
+            }
+            self.entries[count] = selected;
+            count += 1;
+        }
+        if scanner && !has_preload {
+            if let Some(Some(entry)) = SCANNER_LD_PRELOAD_ENTRY.get() {
+                if count + 1 >= self.entries.len() {
+                    return Err(libc::E2BIG);
+                }
+                self.entries[count] = entry.as_ptr();
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn maybe_reexec_current_process_without_shim(label: &str, cmdline: &[u8]) {
     if !is_enabled() || should_keep_env_for_process(label) {
         return;
@@ -498,15 +621,13 @@ pub unsafe extern "C" fn execve(
         return -1;
     };
 
-    if let Some((label, filtered)) = adjusted_env_for_process(path, argv, envp) {
-        maybe_log_adjustment(
-            &label,
-            b"execve\0",
-            filtered.removed,
-            filtered.modified,
-            filtered.injected,
-        );
-        return orig(path, argv, filtered.ptrs.as_ptr());
+    if is_enabled() {
+        let mut filtered = ExecEnvironment::new();
+        if let Err(error) = filtered.prepare(path, argv, envp) {
+            set_errno(error);
+            return -1;
+        }
+        return orig(path, argv, filtered.entries.as_ptr());
     }
 
     orig(path, argv, envp)
@@ -522,22 +643,20 @@ pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char)
         return -1;
     };
 
-    let Some((label, filtered)) = adjusted_env_for_process(file, argv, ptr::null()) else {
+    if !is_enabled() {
         return orig_execvp(file, argv);
-    };
+    }
 
     let Some(orig_execvpe) = read_execvpe() else {
-        return orig_execvp(file, argv);
+        set_errno(libc::ENOSYS);
+        return -1;
     };
-
-    maybe_log_adjustment(
-        &label,
-        b"execvp\0",
-        filtered.removed,
-        filtered.modified,
-        filtered.injected,
-    );
-    orig_execvpe(file, argv, filtered.ptrs.as_ptr())
+    let mut filtered = ExecEnvironment::new();
+    if let Err(error) = filtered.prepare(file, argv, ptr::null()) {
+        set_errno(error);
+        return -1;
+    }
+    orig_execvpe(file, argv, filtered.entries.as_ptr())
 }
 
 #[no_mangle]
@@ -554,15 +673,13 @@ pub unsafe extern "C" fn execvpe(
         return -1;
     };
 
-    if let Some((label, filtered)) = adjusted_env_for_process(file, argv, envp) {
-        maybe_log_adjustment(
-            &label,
-            b"execvpe\0",
-            filtered.removed,
-            filtered.modified,
-            filtered.injected,
-        );
-        return orig(file, argv, filtered.ptrs.as_ptr());
+    if is_enabled() {
+        let mut filtered = ExecEnvironment::new();
+        if let Err(error) = filtered.prepare(file, argv, envp) {
+            set_errno(error);
+            return -1;
+        }
+        return orig(file, argv, filtered.entries.as_ptr());
     }
 
     orig(file, argv, envp)

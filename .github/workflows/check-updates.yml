@@ -1,77 +1,20 @@
-name: Check Upstream Updates
+name: Monitor Plex Compatibility Candidates
 
 on:
   schedule:
-    # Run every 6 hours
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
+concurrency:
+  group: plex-compatibility-monitor
+  cancel-in-progress: false
+
 jobs:
-  check-updates:
-    name: Check for Upstream Updates
-    runs-on: ubuntu-latest
-    outputs:
-      updated: ${{ steps.check.outputs.updated }}
-      version: ${{ steps.check.outputs.version }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          # Fetch all history so we can push back
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
-      - name: Run check script
-        id: check
-        run: python3 scripts/check-upstream-updates.py
-
-      - name: Commit and push changes
-        if: steps.check.outputs.updated == 'true'
-        run: |
-          set -eu
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          VERSION_TAG="v${{ steps.check.outputs.version }}"
-          
-          git add VERSION .github/upstream-digests.json CHANGELOG.md
-          git commit -m "chore: bump version to ${VERSION_TAG} for upstream updates"
-          
-          # Pull and rebase to prevent conflicts if main updated recently
-          git pull origin main --rebase
-          git push origin main
-          
-          git tag "${VERSION_TAG}"
-          git push origin "${VERSION_TAG}"
-
-  publish:
-    name: Publish Updated Images
-    needs: check-updates
-    if: needs.check-updates.outputs.updated == 'true'
+  candidate:
+    name: Resolve, build and probe candidates (no release)
     uses: ./.github/workflows/docker-publish.yml
-    with:
-      version: ${{ format('v{0}', needs.check-updates.outputs.version) }}
-
-  release-linux:
-    name: Release Linux Artifacts
-    needs: check-updates
-    if: needs.check-updates.outputs.updated == 'true'
-    uses: ./.github/workflows/release-linux-artifacts.yml
-    with:
-      tag: ${{ format('v{0}', needs.check-updates.outputs.version) }}
-
-  release-macos:
-    name: Release macOS Artifacts
-    needs: check-updates
-    if: needs.check-updates.outputs.updated == 'true'
-    uses: ./.github/workflows/release-macos-artifacts.yml
-    with:
-      tag: ${{ format('v{0}', needs.check-updates.outputs.version) }}
+    secrets: inherit

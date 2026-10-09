@@ -9,6 +9,9 @@ pub extern "C" fn rust_step_pick_thread_connection(
         return std::ptr::null_mut();
     }
     let bc = unsafe { &*base_conn };
+    if !bc.shadow_db.is_null() {
+        return base_conn;
+    }
     if crate::db_interpose_helpers::rust_is_library_or_blobs_db_path(bc.db_path.as_ptr()) == 0 {
         return base_conn;
     }
@@ -41,6 +44,22 @@ pub extern "C" fn rust_step_write_prepare_connection(
         let mut _stmt_guard: Option<StmtGuard> = Some(PgStmt::lock_mutex(pg_stmt));
 
         let mut exec_conn = *exec_conn_io;
+        if !stmt.conn.is_null() && !(*stmt.conn).shadow_db.is_null() {
+            exec_conn = stmt.conn;
+            *exec_conn_io = exec_conn;
+            let _conn_guard = PthreadMutexGuard::lock(&mut (*exec_conn).mutex);
+            if !crate::pg_client::transaction::session_ready_locked(exec_conn) {
+                return STEP_RESULT_ERROR;
+            }
+            if crate::pg_client::transaction::result_stream_live_locked(exec_conn) {
+                crate::pg_client::transaction::set_error(
+                    exec_conn,
+                    "Write cannot switch an active handle session while a result is streaming",
+                );
+                return STEP_RESULT_ERROR;
+            }
+            return STEP_RESULT_DONE;
+        }
         if exec_conn.is_null() || (&*exec_conn).conn.is_null() {
             log_error(&format!(
                 "STEP WRITE: NULL connection, retrying in 500ms (exec_conn={:p})",

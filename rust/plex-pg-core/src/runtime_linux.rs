@@ -13,19 +13,17 @@ use crate::env_utils;
 use crate::exception_what::pg_exception_install_terminate_logger;
 #[allow(unused_imports)]
 use crate::ffi_types::{sqlite3, sqlite3_stmt, sqlite3_value};
-use crate::runtime_common::{handle_exception_with_tls, log_shim_unloading, shim_init_common};
+#[cfg(feature = "exception-hook")]
+use crate::runtime_common::handle_exception_with_tls;
+use crate::runtime_common::{log_shim_unloading, shim_init_common};
 
 type SigactionFn =
     unsafe extern "C" fn(c_int, *const libc::sigaction, *mut libc::sigaction) -> c_int;
 type CxaThrowFn =
     unsafe extern "C" fn(*mut c_void, *mut c_void, Option<unsafe extern "C" fn(*mut c_void)>) -> !;
-/// Pass-through hook for create_simple_converter (ASCII path handled at the
-/// create_simple_codecvt level by the AArch64 asm hook below).
-type CreateSimpleConverterFn = unsafe extern "C" fn(*mut u8) -> *mut c_void;
 
 static mut ORIG_SIGACTION: Option<SigactionFn> = None;
 static mut ORIG_CXA_THROW: Option<CxaThrowFn> = None;
-static mut ORIG_CREATE_SIMPLE_CONVERTER: Option<CreateSimpleConverterFn> = None;
 
 /// Function-pointer statics for the AArch64 global_asm hook below.
 /// #[no_mangle] makes them addressable by their exact name from assembler.
@@ -87,18 +85,6 @@ unsafe fn resolve_interposition_hooks() {
         );
     }
 
-    // create_simple_converter — pass-through hook (ASCII handled at codecvt level)
-    let sym = libc::dlsym(
-        libc::RTLD_NEXT,
-        b"_ZN5boost6locale4util23create_simple_converterERKNSt3__212basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE\0".as_ptr() as *const c_char
-    );
-    if !sym.is_null() {
-        ptr::write(
-            ptr::addr_of_mut!(ORIG_CREATE_SIMPLE_CONVERTER),
-            Some(std::mem::transmute::<*mut c_void, CreateSimpleConverterFn>(sym)),
-        );
-    }
-
     // create_simple_codecvt — original target for the asm hook pass-through path.
     // Stored as a raw usize so the AArch64 assembler can read it directly.
     let sym = libc::dlsym(
@@ -106,16 +92,23 @@ unsafe fn resolve_interposition_hooks() {
         b"_ZN5boost6locale4util21create_simple_codecvtERKNSt3__26localeERKNS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS0_12char_facet_tE\0".as_ptr() as *const c_char
     );
     if !sym.is_null() {
-        ptr::write(ptr::addr_of_mut!(SHIM_CREATE_SIMPLE_CODECVT_PTR), sym as usize);
+        ptr::write(
+            ptr::addr_of_mut!(SHIM_CREATE_SIMPLE_CODECVT_PTR),
+            sym as usize,
+        );
     }
 
     // create_utf8_codecvt — ASCII redirect target for the asm hook.
     let sym = libc::dlsym(
         libc::RTLD_NEXT,
-        b"_ZN5boost6locale4util19create_utf8_codecvtERKNSt3__26localeENS0_12char_facet_tE\0".as_ptr() as *const c_char
+        b"_ZN5boost6locale4util19create_utf8_codecvtERKNSt3__26localeENS0_12char_facet_tE\0"
+            .as_ptr() as *const c_char,
     );
     if !sym.is_null() {
-        ptr::write(ptr::addr_of_mut!(SHIM_CREATE_UTF8_CODECVT_PTR), sym as usize);
+        ptr::write(
+            ptr::addr_of_mut!(SHIM_CREATE_UTF8_CODECVT_PTR),
+            sym as usize,
+        );
     }
 }
 
@@ -130,7 +123,7 @@ unsafe fn read_sigaction() -> Option<SigactionFn> {
 }
 
 fn setup_exception_catcher_if_enabled() {
-    if !exception_catcher_enabled() {
+    if !cfg!(feature = "exception-hook") || !exception_catcher_enabled() {
         return;
     }
     unsafe {
@@ -156,6 +149,7 @@ fn setup_exception_catcher_if_enabled() {
     }
 }
 
+#[cfg(feature = "exception-hook")]
 #[no_mangle]
 /// # Safety
 /// This is an ABI-level interposition hook for C++ exceptions.
@@ -936,29 +930,6 @@ mod ld_preload_wrappers {
         c_abi::my_sqlite3_column_decltype(stmt, idx)
     }
 
-    // Simple pass-through: let create_simple_converter proceed normally.
-    // The ASCII → UTF-8 redirect is now handled exclusively at the
-    // create_simple_codecvt level by the AArch64 global_asm hook above.
-    #[no_mangle]
-    #[allow(static_mut_refs)]
-    pub unsafe extern "C" fn _ZN5boost6locale4util23create_simple_converterERKNSt3__212basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE(
-        s: *mut u8,
-    ) -> *mut c_void {
-        let orig = match ptr::read(ptr::addr_of!(ORIG_CREATE_SIMPLE_CONVERTER)) {
-            Some(f) => f,
-            None => {
-                let name = b"_ZN5boost6locale4util23create_simple_converterERKNSt3__212basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE\0";
-                let sym = libc::dlsym(libc::RTLD_NEXT, name.as_ptr() as *const c_char);
-                if sym.is_null() {
-                    libc::abort();
-                }
-                let f = std::mem::transmute::<*mut c_void, CreateSimpleConverterFn>(sym);
-                ptr::write(ptr::addr_of_mut!(ORIG_CREATE_SIMPLE_CONVERTER), Some(f));
-                f
-            }
-        };
-        orig(s)
-    }
     // Note: create_simple_codecvt is implemented as a global_asm hook above
     // (AArch64 only) to correctly preserve the x8 SRET pointer while
     // redirecting ASCII charset requests to create_utf8_codecvt.

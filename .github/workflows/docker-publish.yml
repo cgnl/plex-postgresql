@@ -1,4 +1,4 @@
-name: Publish Docker Images
+name: Probe Docker Candidates (Promotion Blocked)
 
 on:
   push:
@@ -7,14 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version tag (for example: v0.9.16)"
+        description: "Source ref to probe; never publishes release tags"
         required: true
         type: string
   workflow_call:
     inputs:
       version:
-        description: "Release version tag (for example: v0.9.16)"
-        required: true
+        description: "Source ref to probe; never publishes release tags"
+        required: false
         type: string
 
 permissions:
@@ -22,113 +22,275 @@ permissions:
   packages: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.name }} / ${{ matrix.arch }}
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      plex_version: ${{ steps.inputs.outputs.plex_version }}
+      linuxserver_image: ${{ steps.inputs.outputs.linuxserver_image }}
+      plexinc_image: ${{ steps.inputs.outputs.plexinc_image }}
+      builder_image: ${{ steps.inputs.outputs.builder_image }}
+      postgres_image: ${{ steps.inputs.outputs.postgres_image }}
+      postgres15_image: ${{ steps.inputs.outputs.postgres15_image }}
+      postgres18_image: ${{ steps.inputs.outputs.postgres18_image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || github.ref }}
+          persist-credentials: false
+      - name: Record exact source
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Resolve all upstream inputs once
+        id: inputs
+        run: python3 scripts/check-upstream-updates.py --output evidence/upstream-candidate.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upstream-candidate
+          path: evidence/upstream-candidate.json
+          if-no-files-found: error
+
+  runtime-e2e:
+    name: Require the real interpose runtime E2E driver
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: ${{ needs.resolve.outputs.postgres_image }}
+        env:
+          POSTGRES_USER: runtime_e2e_admin
+          POSTGRES_PASSWORD: runtime_e2e_fixture_password
+          POSTGRES_DB: runtime_e2e_admin
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U runtime_e2e_admin -d runtime_e2e_admin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install existing native link prerequisites
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libsqlite3-dev postgresql-client
+      - name: Runtime routing and reconnect (missing driver fails)
+        env:
+          RUNTIME_E2E_EXTERNAL_FIXTURE: '1'
+          RUNTIME_E2E_ADMIN_HOST: 127.0.0.1
+          RUNTIME_E2E_ADMIN_PORT: ${{ job.services.postgres.ports['5432'] }}
+          RUNTIME_E2E_ADMIN_USER: runtime_e2e_admin
+          RUNTIME_E2E_ADMIN_PASSWORD: runtime_e2e_fixture_password
+          RUNTIME_E2E_ADMIN_DATABASE: runtime_e2e_admin
+        run: bash scripts/run-runtime-e2e.sh --reconnect
+
+  candidate:
+    name: Probe ${{ matrix.variant }} / ${{ matrix.arch }} / PG${{ matrix.postgres }}
+    needs: resolve
     runs-on: ${{ matrix.runner }}
-    strategy:
+    timeout-minutes: 60
+    strategy: &native_strategy
       fail-fast: false
       matrix:
         include:
-          # linuxserver variant
-          - name: linuxserver
+          - variant: linuxserver
             dockerfile: Dockerfile
-            image: ghcr.io/${{ github.repository_owner }}/plex-postgresql-linuxserver
             arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - name: linuxserver
+            runner: ubuntu-24.04
+            postgres: 15
+          - variant: linuxserver
             dockerfile: Dockerfile
-            image: ghcr.io/${{ github.repository_owner }}/plex-postgresql-linuxserver
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-          # plexinc variant
-          - name: plexinc
-            dockerfile: Dockerfile.standalone
-            image: ghcr.io/${{ github.repository_owner }}/plex-postgresql-plexinc
             arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - name: plexinc
-            dockerfile: Dockerfile.standalone
-            image: ghcr.io/${{ github.repository_owner }}/plex-postgresql-plexinc
+            runner: ubuntu-24.04
+            postgres: 18
+          - variant: linuxserver
+            dockerfile: Dockerfile
             arch: arm64
-            platform: linux/arm64
             runner: ubuntu-24.04-arm
-
+            postgres: 15
+          - variant: linuxserver
+            dockerfile: Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            postgres: 18
+          - variant: plexinc
+            dockerfile: Dockerfile.standalone
+            arch: amd64
+            runner: ubuntu-24.04
+            postgres: 15
+          - variant: plexinc
+            dockerfile: Dockerfile.standalone
+            arch: amd64
+            runner: ubuntu-24.04
+            postgres: 18
+          - variant: plexinc
+            dockerfile: Dockerfile.standalone
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            postgres: 15
+          - variant: plexinc
+            dockerfile: Dockerfile.standalone
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            postgres: 18
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.version || github.ref }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-candidate
+          path: evidence
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Resolve version
-        id: version
+      - name: Candidate repository and unique tag
+        id: image
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          VARIANT: ${{ matrix.variant }}
+          ARCH: ${{ matrix.arch }}
+          POSTGRES_MAJOR: ${{ matrix.postgres }}
         run: |
           set -eu
-          echo "value=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push per-platform image
+          IMAGE="ghcr.io/${REPOSITORY_OWNER,,}/plex-postgresql-${VARIANT}"
+          echo "repository=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$IMAGE:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}-pg${POSTGRES_MAJOR}" >> "$GITHUB_OUTPUT"
+      - name: Build once; push candidate only
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          platforms: ${{ matrix.platform }}
+          platforms: linux/${{ matrix.arch }}
           push: true
           provenance: false
-          tags: ${{ matrix.image }}:${{ steps.version.outputs.value }}-${{ matrix.arch }}
+          tags: ${{ steps.image.outputs.tag }}
+          build-args: |
+            BUILDER_IMAGE=${{ needs.resolve.outputs.builder_image }}
+            PLEX_BASE_IMAGE=${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
+      - name: Probe the exact candidate digest (incomplete gate fails)
+        env:
+          CANDIDATE_IMAGE: ${{ steps.image.outputs.repository }}@${{ steps.build.outputs.digest }}
+          POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
+          EXPECTED_PLEX_VERSION: ${{ needs.resolve.outputs.plex_version }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
+          EVIDENCE_DIR: evidence/container
+          PLEX_E2E_RESTART_CYCLES: '100'
+        run: bash scripts/plex-container-e2e.sh
+      - name: Preserve candidate digest and build metadata
+        if: always()
+        env:
+          CANDIDATE_REPOSITORY: ${{ steps.image.outputs.repository }}
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          POSTGRES_MAJOR: ${{ matrix.postgres }}
+          POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
+        run: |
+          mkdir -p evidence
+          printf '%s\n' "$CANDIDATE_REPOSITORY@$CANDIDATE_DIGEST" > evidence/candidate-ref.txt
+          printf '%s\n' "$BUILD_METADATA" > evidence/build-metadata.json
+          printf '%s\n' "$SOURCE_SHA" > evidence/source-sha.txt
+          printf '%s\n' "$POSTGRES_MAJOR" > evidence/postgres-major.txt
+          printf '%s\n' "$POSTGRES_IMAGE" > evidence/postgres-ref.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: candidate-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
+          path: evidence
+          if-no-files-found: error
 
-  manifest:
-    name: Create multi-arch manifest for ${{ matrix.name }}
-    runs-on: ubuntu-latest
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linuxserver
-            image: ghcr.io/${{ github.repository_owner }}/plex-postgresql-linuxserver
-          - name: plexinc
-            image: ghcr.io/${{ github.repository_owner }}/plex-postgresql-plexinc
-
+  soak:
+    name: Soak 5h50 / ${{ matrix.variant }} / ${{ matrix.arch }} / PG${{ matrix.postgres }}
+    if: ${{ always() && needs.resolve.result == 'success' && needs.runtime-e2e.result == 'success' }}
+    needs: [resolve, runtime-e2e, candidate]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: read
+    strategy: *native_strategy
     steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
+          path: prior-evidence
+      - name: Require completed 100-cycle smoke on the exact source and digest
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          EXPECTED_PLEX_VERSION: ${{ needs.resolve.outputs.plex_version }}
+          EXPECTED_VARIANT: ${{ matrix.variant }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          EXPECTED_POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path('prior-evidence')
+          result = json.loads((root / 'container/result.json').read_text())
+          image = (root / 'candidate-ref.txt').read_text().strip()
+          prefix = 'ghcr.io/' + os.environ['REPOSITORY_OWNER'].lower() + '/plex-postgresql-' + os.environ['EXPECTED_VARIANT'] + '@'
+          if not image.startswith(prefix) or not re.fullmatch(r'sha256:[0-9a-f]{64}', image[len(prefix):]):
+              raise SystemExit('Invalid candidate digest')
+          if (root / 'source-sha.txt').read_text().strip() != os.environ['EXPECTED_SOURCE_SHA']:
+              raise SystemExit('Source evidence mismatch')
+          if (root / 'postgres-ref.txt').read_text().strip() != os.environ['EXPECTED_POSTGRES_IMAGE']:
+              raise SystemExit('PostgreSQL evidence mismatch')
+          expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'workload-smoke-complete-certification-incomplete', 'exit_code': 1, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'promotion_allowed': False}
+          if any(result.get(key) != value for key, value in expected.items()):
+              raise SystemExit('Prior native smoke failed or is incomplete')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('CANDIDATE_IMAGE=' + image + '\n')
+          PY
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Continuous native mixed fixture workload for 21000 seconds
+        env:
+          POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
+          EXPECTED_PLEX_VERSION: ${{ needs.resolve.outputs.plex_version }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
+          PLEX_E2E_RESTART_CYCLES: '1'
+          PLEX_E2E_SOAK_SECONDS: '21000'
+          EVIDENCE_DIR: evidence/soak
+        run: bash scripts/plex-container-e2e.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
+          path: evidence
+          if-no-files-found: error
 
-      - name: Resolve version
-        id: version
+  promotion-blocked:
+    name: Fail closed until full native Plex certification exists
+    if: always()
+    needs: [resolve, runtime-e2e, candidate, soak]
+    runs-on: ubuntu-latest
+    steps:
+      - name: No production tags, manifests or releases
+        env:
+          RESOLUTION: ${{ needs.resolve.result }}
+          RUNTIME: ${{ needs.runtime-e2e.result }}
+          CANDIDATES: ${{ needs.candidate.result }}
         run: |
-          set -eu
-          echo "value=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
-
-      - name: Create and push multi-arch manifest
-        run: |
-          set -eux
-          VERSION="${{ steps.version.outputs.value }}"
-          IMAGE="${{ matrix.image }}"
-
-          # Create versioned manifest
-          docker manifest create "${IMAGE}:${VERSION}" \
-            "${IMAGE}:${VERSION}-amd64" \
-            "${IMAGE}:${VERSION}-arm64"
-          docker manifest push "${IMAGE}:${VERSION}"
-
-          # Create latest manifest
-          docker manifest create "${IMAGE}:latest" \
-            "${IMAGE}:${VERSION}-amd64" \
-            "${IMAGE}:${VERSION}-arm64"
-          docker manifest push "${IMAGE}:latest"
+          echo "Resolution: $RESOLUTION; runtime: $RUNTIME; candidates: $CANDIDATES"
+          echo "::error::Promotion blocked: full native scan/playback/watch-state/artwork and outage certification is incomplete. No skipped or smoke-only gate authorizes a release."
+          exit 1

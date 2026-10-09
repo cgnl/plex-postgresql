@@ -46,11 +46,7 @@ pub(super) fn pool_release_for_db_inner(db_handle: usize) {
 
                         let txn = get_txn_status(conn);
                         if txn == PQTRANS_INTRANS || txn == PQTRANS_INERROR {
-                            let cmd = if txn == PQTRANS_INTRANS {
-                                c"COMMIT"
-                            } else {
-                                c"ROLLBACK"
-                            };
+                            let cmd = c"ROLLBACK";
                             log_info_lazy!(
                                 "Pool: slot {} has pending transaction (status={}), sending cleanup before release",
                                 slot_idx, txn

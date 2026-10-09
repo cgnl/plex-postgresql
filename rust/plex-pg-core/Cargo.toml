@@ -6,6 +6,7 @@ build = "build.rs"
 
 [features]
 interpose = []
+exception-hook = []
 
 [lib]
 name = "plex_pg_core"

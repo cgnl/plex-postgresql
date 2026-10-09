@@ -70,19 +70,19 @@ END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
 DROP OPERATOR IF EXISTS public.= (boolean, integer);
+DROP OPERATOR IF EXISTS public.= (integer, boolean);
 CREATE OPERATOR public.= (
   PROCEDURE = public.eq_bool_int,
   LEFTARG = boolean,
   RIGHTARG = integer,
-  COMMUTATOR = =
+  COMMUTATOR = OPERATOR(public.=)
 );
 
-DROP OPERATOR IF EXISTS public.= (integer, boolean);
 CREATE OPERATOR public.= (
   PROCEDURE = public.eq_int_bool,
   LEFTARG = integer,
   RIGHTARG = boolean,
-  COMMUTATOR = =
+  COMMUTATOR = OPERATOR(public.=)
 );
 
 

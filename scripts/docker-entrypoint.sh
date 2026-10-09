@@ -3,7 +3,7 @@
 # Initializes PostgreSQL schema before Plex starts
 # Uses with-contenv to access Docker environment variables in s6-overlay
 
-set -e
+set -eo pipefail
 
 # Migration library location (copied by Dockerfile)
 MIGRATE_LIB="/usr/local/lib/plex-postgresql/migrate_lib.sh"
@@ -25,21 +25,25 @@ detect_sqlite_db() {
     )
 
     for pattern in "${locations[@]}"; do
-        # Use glob expansion for wildcard patterns
-        for db in $pattern; do
+        if [[ -f "$pattern" ]]; then
+            echo "$pattern"
+            return 0
+        fi
+        while IFS= read -r db; do
             if [[ -f "$db" ]]; then
                 echo "$db"
                 return 0
             fi
-        done
+        done < <(compgen -G "$pattern" || true)
     done
 
     # Default fallback
     echo "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
 }
 
-SQLITE_DB=$(detect_sqlite_db)
-if [[ "$SQLITE_DB" != "/config/"* ]]; then
+SQLITE_DB="${PLEX_SQLITE_SOURCE:-$(detect_sqlite_db)}"
+
+if [[ -n "$SQLITE_DB" && "$SQLITE_DB" != "/config/"* ]]; then
     echo "Found source SQLite database for migration: $SQLITE_DB"
 fi
 PG_HOST="${PLEX_PG_HOST:-postgres}"
@@ -71,7 +75,7 @@ wait_for_postgres() {
     local attempt=1
 
     while [ $attempt -le $max_attempts ]; do
-        if psql -c "SELECT 1" >/dev/null 2>&1; then
+        if migration_psql -c "SELECT 1" >/dev/null 2>&1; then
             echo "PostgreSQL is ready!"
             return 0
         fi
@@ -90,28 +94,31 @@ init_schema() {
     local schema_file="/usr/local/lib/plex-postgresql/plex_schema.sql"
     local compat_file="/usr/local/lib/plex-postgresql/pg_compat_functions.sql"
 
-    psql -c "CREATE SCHEMA IF NOT EXISTS $schema;" 2>/dev/null || true
+    migration_psql -c "CREATE SCHEMA IF NOT EXISTS $schema;" || return 1
 
-    local table_count=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ')
+    local table_count
+    table_count=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ') || return 1
 
     if [ "$table_count" -gt "0" ] 2>/dev/null; then
         echo "PostgreSQL schema '$schema' ready with $table_count tables"
         # Load sqlite_column_types metadata if table doesn't exist yet
         local types_file="/usr/local/lib/plex-postgresql/sqlite_column_types.sql"
         if [ -f "$types_file" ]; then
-            local types_exists=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema' AND table_name = 'sqlite_column_types';" 2>/dev/null | tr -d ' ')
+            local types_exists
+            types_exists=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema' AND table_name = 'sqlite_column_types';" 2>/dev/null | tr -d ' ') || return 1
             if [ "$types_exists" = "0" ] 2>/dev/null; then
                 echo "Loading sqlite_column_types metadata..."
-                psql -f "$types_file" 2>/dev/null || true
+                load_pg_schema_file "$types_file" || return 1
             fi
         fi
     else
         echo "PostgreSQL schema '$schema' is empty, loading schema..."
         if [ -f "$schema_file" ]; then
             echo "Loading schema from $schema_file..."
-            psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" 2>/dev/null || true
-            if psql -f "$schema_file" 2>&1; then
-                local new_count=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ')
+            migration_psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" || return 1
+            if load_pg_schema_file "$schema_file" "$SHIM_DIR/sqlite_column_types.sql" 2>&1; then
+                local new_count
+                new_count=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ') || return 1
                 echo "Schema loaded successfully! $new_count tables created."
 
                 # NOTE: schema_migrations rows from the dump are kept intact.
@@ -119,69 +126,48 @@ init_schema() {
                 # ON CONFLICT DO NOTHING, so duplicate versions are silently ignored.
                 # This prevents Plex from re-running all 446 migrations from scratch,
                 # which causes DDL/schema divergence issues with the SQLite shadow DB.
-                local migration_count=$(psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ')
+                local migration_count
+                migration_count=$(migration_psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ') || return 1
                 echo "schema_migrations has $migration_count entries (kept from dump, shim handles duplicates)"
             else
-                echo "WARNING: Schema load had errors, continuing anyway..."
+                echo "ERROR: Schema load failed" >&2
+                return 1
             fi
         else
-            echo "WARNING: Schema file $schema_file not found!"
+            echo "ERROR: Schema file $schema_file not found!" >&2
+            return 1
         fi
-        # Load sqlite_column_types metadata after fresh schema load
-        local types_file="/usr/local/lib/plex-postgresql/sqlite_column_types.sql"
-        if [ -f "$types_file" ]; then
-            echo "Loading sqlite_column_types metadata..."
-            psql -f "$types_file" 2>/dev/null || true
-        fi
+
     fi
+
+    validate_pg_schema_file "$schema_file" || return 1
 
     # Ensure PostgreSQL compatibility helper functions exist.
     if [ -f "$compat_file" ]; then
-        psql -f "$compat_file" 2>/dev/null || true
+        migration_psql -f "$compat_file" || return 1
     fi
+    migration_psql -q -c "SELECT version FROM $schema.schema_migrations LIMIT 0; SELECT id FROM $schema.metadata_items LIMIT 0; SELECT id FROM $schema.accounts LIMIT 0; SELECT id FROM $schema.blobs LIMIT 0;" >/dev/null || return 1
 }
 
 # Sync schema_migrations from PostgreSQL to SQLite
 # This ensures Plex doesn't try to re-run migrations that are already applied in PG
 sync_schema_migrations_to_sqlite() {
     local db_file="$1"
-    local db_name
-    db_name=$(basename "$db_file")
-
-    local pg_count=$(psql -t -c "SELECT COUNT(*) FROM ${PG_SCHEMA}.schema_migrations;" 2>/dev/null | tr -d ' ')
-    local sqlite_count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM schema_migrations;" 2>/dev/null || echo "0")
-
-    if [ "$pg_count" -gt "$sqlite_count" ] 2>/dev/null; then
-        echo "Syncing schema_migrations to SQLite ($sqlite_count → $pg_count rows)..."
-        # Export from PG and import into SQLite
-        psql -t -A -c "SELECT version FROM ${PG_SCHEMA}.schema_migrations ORDER BY version;" 2>/dev/null | while IFS= read -r version; do
-            [ -z "$version" ] && continue
-            sqlite3 "$db_file" "INSERT OR IGNORE INTO schema_migrations (version) VALUES ('$version');" 2>/dev/null || true
-        done
-        local new_count=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM schema_migrations;" 2>/dev/null || echo "0")
-        echo "SQLite schema_migrations now has $new_count entries"
-    else
-        echo "SQLite schema_migrations already in sync ($sqlite_count rows)"
-    fi
+    sync_shadow_migrations "$db_file"
 }
 
 seed_shadow_tables_from_pg() {
     local db_file="$1"
     local db_name helper table_list normalized_list raw_table table
-    db_name=$(basename "$db_file")
+    db_name="${2:-$(basename "$db_file")}"
 
     if [[ "$db_name" != "com.plexapp.plugins.library.db" ]]; then
         return 0
     fi
 
     if ! command -v psql >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
-        return 0
-    fi
-
-    helper="$SHIM_DIR/seed_shadow_table_from_pg.py"
-    if [[ ! -f "$helper" ]]; then
-        echo "WARNING: Shadow seed helper missing: $helper"
-        return 0
+        echo "ERROR: Shadow seeding requires psql and python3" >&2
+        return 1
     fi
 
     table_list="${PLEX_PG_SHADOW_SYNC_TABLES:-preferences}"
@@ -193,13 +179,20 @@ seed_shadow_tables_from_pg() {
             ;;
     esac
 
+    helper="$SHIM_DIR/seed_shadow_table_from_pg.py"
+    if [[ ! -f "$helper" ]]; then
+        echo "ERROR: Shadow seed helper missing: $helper" >&2
+        return 1
+    fi
+
     IFS=',' read -r -a shadow_tables <<< "$table_list"
     for raw_table in "${shadow_tables[@]}"; do
         table=$(printf '%s' "$raw_table" | tr -d '[:space:]')
         [[ -z "$table" ]] && continue
         echo "Seeding shadow SQLite $db_name table '$table' from PostgreSQL..."
         if ! python3 "$helper" "$db_file" "$table" "$PG_SCHEMA"; then
-            echo "WARNING: Failed to seed shadow table '$table' from PostgreSQL"
+            echo "ERROR: Failed to seed shadow table '$table' from PostgreSQL" >&2
+            return 1
         fi
     done
 }
@@ -211,31 +204,8 @@ seed_shadow_tables_from_pg() {
 init_single_sqlite_db() {
     local db_file="$1"
     local schema_file="$2"
-    local db_name
-    db_name=$(basename "$db_file")
-
-    # Always rebuild: remove stale shadow DB to prevent schema drift.
-    # Over time, shim operations can mutate the shadow schema (DDL routing,
-    # column additions, etc.) making it inconsistent with Plex's expectations.
-    if [ -f "$db_file" ]; then
-        echo "Rebuilding shadow SQLite $db_name (removing stale copy)..."
-        rm -f "$db_file" "${db_file}-shm" "${db_file}-wal"
-    fi
-
-    echo "Creating shadow SQLite $db_name from schema..."
-    if [ -f "$schema_file" ]; then
-        # Ignore errors from virtual tables (spellfix1, fts4, rtree)
-        sqlite3 "$db_file" < "$schema_file" 2>&1 || true
-        echo "Shadow SQLite $db_name initialized"
-    else
-        echo "WARNING: Schema file not found: $schema_file"
-    fi
+    build_shadow_database "$db_file" "$schema_file" || return 1
     chown abc:abc "$db_file" 2>/dev/null || true
-
-    # Sync migration versions from PG to SQLite
-    # This prevents Plex from re-running migrations that are already in PostgreSQL
-    sync_schema_migrations_to_sqlite "$db_file"
-    seed_shadow_tables_from_pg "$db_file"
 }
 
 # Pre-initialize SQLite databases with correct schema
@@ -465,13 +435,23 @@ echo "PostgreSQL: ${PLEX_PG_USER}@${PLEX_PG_HOST}:${PLEX_PG_PORT}/${PLEX_PG_DATA
 check_plex_claim
 
 if [ -n "$PLEX_PG_HOST" ]; then
+    [[ -f "$MIGRATE_LIB" ]] || { echo "ERROR: Migration safety library missing" >&2; exit 1; }
+    validate_migration_schema
+    if [[ -n "${PLEX_SQLITE_SOURCE:-}" && ! -f "$SQLITE_DB" ]]; then
+        echo "ERROR: Explicit SQLite migration source does not exist: $SQLITE_DB" >&2
+        exit 1
+    fi
+    if [[ -z "${PLEX_SQLITE_SOURCE:-}" && "$SQLITE_DB" == /config/* ]] && { [[ ! -f "$SQLITE_DB" ]] || is_shadow_database "$SQLITE_DB"; }; then
+        SQLITE_DB=""
+    fi
+    protect_shadow_destinations "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
     wait_for_postgres
     init_schema
 
     # Run migration if source SQLite DB exists (mounted via -v)
     if [[ -f "$MIGRATE_LIB" ]] && [[ -f "$SQLITE_DB" ]]; then
         echo "Checking for data migration..."
-        check_and_migrate || true
+        check_and_migrate
     fi
 
     ensure_plex_temp_dir

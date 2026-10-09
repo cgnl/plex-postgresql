@@ -1,5 +1,3 @@
-#[cfg(target_os = "linux")]
-use super::fake_values::fake_value_reset_next;
 use super::*;
 use crate::log_debug_lazy;
 use crate::log_info_lazy;
@@ -112,11 +110,9 @@ pub(crate) unsafe fn fast_mark_fork_child_passthrough() {
     CRASH_LAST_COLUMN_LEN.store(0, Ordering::SeqCst);
     GLOBAL_VALUE_TYPE_CALLS.store(0, Ordering::Relaxed);
     GLOBAL_COLUMN_TYPE_CALLS.store(0, Ordering::Relaxed);
-    fake_value_reset_next();
     worker_thread = 0 as libc::pthread_t;
     worker_running = 0;
     worker_request = EMPTY_WORKER_REQUEST;
-    rust_reset_exception_tracking();
     rust_reset_symbol_verification();
 }
 

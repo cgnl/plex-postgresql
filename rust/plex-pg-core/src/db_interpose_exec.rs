@@ -1,16 +1,14 @@
 use crate::byte_utils::{contains_bytes, contains_icase_bytes, starts_with_icase_bytes};
-mod pg_path;
+pub(crate) mod pg_path;
 mod support;
 
 use crate::db_interpose_common::stderr_ptr;
 use crate::db_interpose_conn_utils::{
-    apply_pg_session_settings, connect_new, cstr_prefix, cstr_to_string_or, log_error, log_info,
-    PgConnConfig, PthreadMutexGuard,
+    cstr_prefix, cstr_to_string_or, log_error, PthreadMutexGuard,
 };
 use crate::ffi_types::sqlite3;
 use crate::libpq_helpers::PGresult;
 use pg_path::exec_via_postgres;
-use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use support::orig_exec;
@@ -23,15 +21,8 @@ const PGRES_COMMAND_OK: c_int = 1;
 const PGRES_TUPLES_OK: c_int = 2;
 const PG_DIAG_SQLSTATE: c_int = b'C' as c_int;
 
-const PG_RETRY_MAX_DELAYS: usize = 10;
-
 type ExecCallback =
     Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int>;
-
-thread_local! {
-    static EXEC_RETRY_COUNT: Cell<i32> = const { Cell::new(0) };
-    static EXEC_PG_CONN_ERROR: Cell<i32> = const { Cell::new(0) };
-}
 
 #[repr(C)]
 struct SqlTranslation {
@@ -54,12 +45,27 @@ extern "C" {
     >;
 
     fn rewrite_blobs_schema_migrations(sql: *const c_char, db_path: *const c_char) -> *mut c_char;
-    fn pg_config_get() -> *mut PgConnConfig;
     fn sql_translate(sql: *const c_char) -> SqlTranslation;
     fn sql_translation_free(result: *mut SqlTranslation);
 }
 
 use crate::env_utils::loadone_trace_enabled;
+
+pub(crate) unsafe fn exec_error_message(message: &str) -> *mut c_char {
+    let Some(allocate) = crate::db_interpose_common::get_orig_sqlite3_malloc() else {
+        return std::ptr::null_mut();
+    };
+    let bytes = message.as_bytes();
+    let Ok(size) = c_int::try_from(bytes.len() + 1) else {
+        return std::ptr::null_mut();
+    };
+    let buffer = allocate(size) as *mut c_char;
+    if !buffer.is_null() {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), bytes.len());
+        *buffer.add(bytes.len()) = 0;
+    }
+    buffer
+}
 
 fn trim_ascii_sql(bytes: &[u8]) -> &[u8] {
     let mut i = 0usize;
@@ -112,54 +118,12 @@ pub extern "C" fn rust_my_sqlite3_exec(
     arg: *mut c_void,
     errmsg: *mut *mut c_char,
 ) -> c_int {
-    let rc = rust_my_sqlite3_exec_impl(db, sql, callback, arg, errmsg);
-
-    let mut delays = [0i32; PG_RETRY_MAX_DELAYS];
-    let mut max_retries = 0i32;
-    crate::pg_config::pg_config_get_retry_delays(delays.as_mut_ptr(), &mut max_retries);
-
-    let retry_count = EXEC_RETRY_COUNT.with(|c| c.get());
-    let conn_error = EXEC_PG_CONN_ERROR.with(|c| c.get());
-
-    if rc == SQLITE_ERROR && retry_count < max_retries && conn_error != 0 {
-        EXEC_PG_CONN_ERROR.with(|c| c.set(0));
-        let delay = delays[retry_count as usize];
-        let new_count = retry_count + 1;
-        EXEC_RETRY_COUNT.with(|c| c.set(new_count));
-        log_error(&format!(
-            "exec: PG conn error, retry {}/{} in {}ms (thread {:p})",
-            new_count,
-            max_retries,
-            delay,
-            unsafe { libc::pthread_self() } as *mut c_void
-        ));
-
-        let delay_ms = if delay < 0 { 0 } else { delay as u32 };
-        unsafe {
-            libc::usleep(delay_ms.saturating_mul(1000));
-        }
-
-        EXEC_PG_CONN_ERROR.with(|c| c.set(0));
-        let retry_rc = rust_my_sqlite3_exec(db, sql, callback, arg, errmsg);
-
-        if new_count > 0 && retry_rc != SQLITE_ERROR {
-            log_error(&format!(
-                "exec: retry succeeded after {} attempt(s)",
-                new_count
-            ));
-        }
-        EXEC_RETRY_COUNT.with(|c| c.set(0));
-        return retry_rc;
+    let result = rust_my_sqlite3_exec_impl(db, sql, callback, arg, errmsg);
+    if result == SQLITE_ERROR {
+        pg_path::primary_error_code(crate::pg_client::rust_pg_find_handle_connection(db))
+    } else {
+        result
     }
-
-    if retry_count > 0 {
-        if rc == SQLITE_ERROR {
-            log_error("exec: retries exhausted, returning SQLITE_ERROR");
-        }
-        EXEC_RETRY_COUNT.with(|c| c.set(0));
-    }
-
-    rc
 }
 
 fn rust_my_sqlite3_exec_impl(
@@ -171,6 +135,12 @@ fn rust_my_sqlite3_exec_impl(
 ) -> c_int {
     if sql.is_null() {
         log_error("exec called with NULL SQL");
+        return orig_exec(db, sql, callback, arg, errmsg);
+    }
+
+    if crate::db_interpose_common::SHIM_PASSTHROUGH_ONLY.load(std::sync::atomic::Ordering::Acquire)
+        != 0
+    {
         return orig_exec(db, sql, callback, arg, errmsg);
     }
 
@@ -195,13 +165,51 @@ fn rust_my_sqlite3_exec_impl(
         unsafe {
             trace_exec_skipped_select(b"pg_route\0".as_ptr() as *const c_char, db, pg_conn, sql);
         }
-        // Transaction control (BEGIN/COMMIT/ROLLBACK/SAVEPOINT) is in skip-SQL,
-        // so exec_via_postgres will no-op them. PG runs in autocommit mode —
-        // each statement commits immediately. This is intentional: the pool
-        // architecture cannot guarantee connection affinity across statements,
-        // so forwarding transactions would send BEGIN/COMMIT to different
-        // connections, causing data visibility bugs.
-        return exec_via_postgres(pg_conn, sql);
+        let handle = crate::pg_client::rust_pg_find_handle_connection(db);
+        let rc = if crate::pg_client::transaction::is_transaction_sql(sql_str) {
+            crate::pg_client::transaction::execute_transaction(pg_conn, sql_str)
+                .unwrap_or(SQLITE_ERROR)
+        } else {
+            exec_via_postgres(pg_conn, sql, handle)
+        };
+        unsafe {
+            pg_path::copy_pg_outcome(handle, pg_conn);
+            if !errmsg.is_null() {
+                *errmsg = if rc == SQLITE_OK {
+                    std::ptr::null_mut()
+                } else {
+                    exec_error_message(&cstr_to_string_or(
+                        (&*pg_conn).last_error.as_ptr(),
+                        "PostgreSQL execution failed",
+                    ))
+                };
+            }
+        }
+        return rc;
+    }
+
+    let passthrough = crate::db_interpose_common::SHIM_PASSTHROUGH_ONLY
+        .load(std::sync::atomic::Ordering::Acquire)
+        != 0;
+    let force_sqlite = std::env::var("PLEX_PG_FORCE_SQLITE_LIBRARY")
+        .is_ok_and(|value| !value.is_empty() && value != "0");
+    let filename = crate::db_interpose_open::lookup_db_handle_filename(db);
+    let must_route = !passthrough
+        && !force_sqlite
+        && filename
+            .as_ref()
+            .is_some_and(|path| crate::pg_config::pg_config_should_redirect(path.as_ptr(), 0) != 0);
+    let sql_str = unsafe { CStr::from_ptr(sql).to_str().unwrap_or("") };
+    if must_route && !crate::pg_config::is_sqlite_passthrough_str(sql_str) {
+        let msg = "PostgreSQL connection unavailable; refusing shadow SQLite execution";
+        let handle = crate::pg_client::rust_pg_find_handle_connection(db);
+        unsafe {
+            pg_path::set_pg_last_error(handle, msg);
+            if !errmsg.is_null() {
+                *errmsg = exec_error_message(msg);
+            }
+        }
+        return SQLITE_ERROR;
     }
 
     // For non-PG databases (e.g. :memory:), icu_load_collation may fail because

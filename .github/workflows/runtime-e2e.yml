@@ -1,0 +1,43 @@
+name: Rust Runtime E2E
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runtime-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['15', '18']
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: runtime_e2e_admin
+          POSTGRES_PASSWORD: runtime_e2e_fixture_password
+          POSTGRES_DB: runtime_e2e_admin
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U runtime_e2e_admin -d runtime_e2e_admin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install existing native link prerequisites
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev libsqlite3-dev postgresql-client
+      - name: Exercise the real interpose shared artifact
+        env:
+          RUNTIME_E2E_EXTERNAL_FIXTURE: '1'
+          RUNTIME_E2E_ADMIN_HOST: 127.0.0.1
+          RUNTIME_E2E_ADMIN_PORT: ${{ job.services.postgres.ports[5432] }}
+          RUNTIME_E2E_ADMIN_USER: runtime_e2e_admin
+          RUNTIME_E2E_ADMIN_PASSWORD: runtime_e2e_fixture_password
+          RUNTIME_E2E_ADMIN_DATABASE: runtime_e2e_admin
+        run: bash scripts/run-runtime-e2e.sh --reconnect

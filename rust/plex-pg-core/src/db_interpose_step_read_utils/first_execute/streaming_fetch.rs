@@ -42,7 +42,15 @@ pub(super) unsafe fn streaming_fetch_result(
     let first_res = crate::libpq_helpers::rust_pq_get_result(ec.conn);
     if first_res.is_null() {
         clear_streaming_state(s);
-        return finish_streaming_done(s, exec_conn_io, exec_conn, stmt_guard);
+        s.result_conn = std::ptr::null_mut();
+        s.read_done = -1;
+        crate::db_interpose_exec::pg_path::set_pg_last_error(
+            s.conn,
+            "PostgreSQL stream returned no initial result",
+        );
+        *exec_conn_io = exec_conn;
+        *stmt_guard = None;
+        return STEP_RESULT_ERROR;
     }
 
     let first_status = crate::libpq_helpers::rust_pq_result_status(first_res);
@@ -89,6 +97,7 @@ pub(super) unsafe fn streaming_fetch_result(
     if is_stale_prepared_stmt(first_res) {
         crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
     }
+    crate::db_interpose_exec::pg_path::record_pg_result_error(s.conn, exec_conn, first_res);
     crate::libpq_helpers::rust_pq_clear(first_res);
     let mut drain = crate::libpq_helpers::rust_pq_get_result(ec.conn);
     while !drain.is_null() {
@@ -96,6 +105,8 @@ pub(super) unsafe fn streaming_fetch_result(
         drain = crate::libpq_helpers::rust_pq_get_result(ec.conn);
     }
     clear_streaming_state(s);
+    s.result_conn = std::ptr::null_mut();
+    s.read_done = -1;
     crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
     *exec_conn_io = exec_conn;
     *stmt_guard = None; // unlock

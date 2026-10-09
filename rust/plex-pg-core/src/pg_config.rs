@@ -11,7 +11,7 @@ use crate::env_utils;
 
 // ─── Internal pure helpers ────────────────────────────────────────────────────
 
-fn strip_leading_ws_and_sql_comments(input: &str) -> &str {
+pub(crate) fn strip_leading_ws_and_sql_comments(input: &str) -> &str {
     let bytes = input.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
@@ -56,18 +56,48 @@ pub(crate) fn should_redirect_str(filename: &str, passthrough: bool) -> bool {
 /// extensions) and are invisible to PG. The shim should not register a PgStmt
 /// for them — prepare and step go directly through the real SQLite.
 pub(crate) fn is_sqlite_passthrough_str(sql: &str) -> bool {
+    if crate::pg_client::transaction::is_transaction_sql(sql) {
+        return false;
+    }
     let trimmed = strip_leading_ws_and_sql_comments(sql);
     if trimmed.is_empty() {
         return false;
     }
     let lower = trimmed.to_lowercase();
+    let sqlite_fts_ddl = [
+        "create trigger ",
+        "create trigger if not exists ",
+        "drop trigger ",
+        "drop trigger if exists ",
+        "drop table ",
+        "drop table if exists ",
+    ]
+    .iter()
+    .any(|prefix| {
+        lower.strip_prefix(prefix).is_some_and(|name| {
+            let name = name.trim_start_matches(['"', '`', '[']);
+            name.starts_with("fts3_") || name.starts_with("fts4_")
+        })
+    });
     lower.starts_with("icu_load_collation")
+        || lower.starts_with("create virtual table ")
+        || sqlite_fts_ddl
         || lower.starts_with("fts3_tokenizer")
         || lower.starts_with("select load_extension")
         || lower.starts_with("select fts3_tokenizer")
         || lower.starts_with("select icu_load_collation")
+        || lower == "analyze"
+        || lower.starts_with("analyze ")
+        || lower.contains("sqlite_stat1")
+        || lower.contains("sqlite_stat4")
         || lower.contains("sqlite_master")
         || lower.contains("sqlite_schema")
+        || lower.contains("locations_node")
+        || lower.contains("locations_parent")
+        || lower.contains("locations_rowid")
+        || (lower.starts_with("pragma")
+            && (lower.trim_end_matches(';').trim_end() == "pragma page_size"
+                || lower.contains(".page_size")))
 }
 
 /// Returns true if the SQL statement should be skipped (treated as a no-op).
@@ -75,6 +105,9 @@ pub(crate) fn is_sqlite_passthrough_str(sql: &str) -> bool {
 /// NOTE: SQLite engine config (fts3_tokenizer, icu_load_collation, load_extension)
 /// is NOT in this list — those are sqlite-passthrough (execute on real SQLite).
 pub(crate) fn should_skip_sql_str(sql: &str) -> bool {
+    if crate::pg_client::transaction::is_transaction_sql(sql) {
+        return false;
+    }
     let trimmed = strip_leading_ws_and_sql_comments(sql);
     if trimmed.is_empty() {
         return false;
@@ -90,14 +123,6 @@ pub(crate) fn should_skip_sql_str(sql: &str) -> bool {
         "analyze sqlite_",
         "attach database",
         "detach database",
-        // Transaction control — skipped entirely (is_pg=3, step returns DONE).
-        // PG runs in autocommit mode: each statement commits immediately.
-        "begin",
-        "end",
-        "commit",
-        "rollback",
-        "savepoint",
-        "release ",
     ];
 
     for prefix in PREFIX_PATTERNS {
@@ -146,6 +171,9 @@ pub(crate) fn should_skip_sql_str(sql: &str) -> bool {
 /// go through the PG path with a dummy shadow, instead of hitting real SQLite where
 /// the schema may be out of sync.
 pub(crate) fn is_write_operation_str(sql: &str) -> bool {
+    if crate::pg_client::transaction::is_transaction_sql(sql) {
+        return true;
+    }
     let lower = strip_leading_ws_and_sql_comments(sql).to_lowercase();
     lower.starts_with("insert")
         || lower.starts_with("update")
@@ -580,53 +608,53 @@ mod tests {
     }
 
     #[test]
-    fn skip_begin() {
-        assert!(should_skip_sql_str("BEGIN"));
+    fn do_not_skip_begin() {
+        assert!(!should_skip_sql_str("BEGIN"));
     }
 
     #[test]
-    fn skip_begin_immediate() {
-        assert!(should_skip_sql_str("BEGIN IMMEDIATE"));
+    fn do_not_skip_begin_immediate() {
+        assert!(!should_skip_sql_str("BEGIN IMMEDIATE"));
     }
 
     #[test]
-    fn skip_commit() {
-        assert!(should_skip_sql_str("COMMIT"));
+    fn do_not_skip_commit() {
+        assert!(!should_skip_sql_str("COMMIT"));
     }
 
     #[test]
-    fn skip_rollback() {
-        assert!(should_skip_sql_str("ROLLBACK"));
+    fn do_not_skip_rollback() {
+        assert!(!should_skip_sql_str("ROLLBACK"));
     }
 
     #[test]
-    fn skip_savepoint() {
-        assert!(should_skip_sql_str("SAVEPOINT sp1"));
+    fn do_not_skip_savepoint() {
+        assert!(!should_skip_sql_str("SAVEPOINT sp1"));
     }
 
     #[test]
-    fn skip_release_savepoint() {
-        assert!(should_skip_sql_str("RELEASE SAVEPOINT sp1"));
+    fn do_not_skip_release_savepoint() {
+        assert!(!should_skip_sql_str("RELEASE SAVEPOINT sp1"));
     }
 
     #[test]
-    fn skip_transaction_keywords_with_semicolon_and_case() {
-        assert!(should_skip_sql_str("  begin immediate ;"));
-        assert!(should_skip_sql_str("\tCoMmIt;"));
-        assert!(should_skip_sql_str("Rollback ;"));
-        assert!(should_skip_sql_str("end;"));
-        assert!(should_skip_sql_str(" savepoint a ;"));
-        assert!(should_skip_sql_str(" release a ;"));
-        assert!(should_skip_sql_str("ReLeAsE savepoint a;"));
+    fn do_not_skip_transaction_keywords_with_semicolon_and_case() {
+        assert!(!should_skip_sql_str("  begin immediate ;"));
+        assert!(!should_skip_sql_str("\tCoMmIt;"));
+        assert!(!should_skip_sql_str("Rollback ;"));
+        assert!(!should_skip_sql_str("end;"));
+        assert!(!should_skip_sql_str(" savepoint a ;"));
+        assert!(!should_skip_sql_str(" release a ;"));
+        assert!(!should_skip_sql_str("ReLeAsE savepoint a;"));
     }
 
     #[test]
-    fn skip_transaction_keywords_with_leading_comments() {
-        assert!(should_skip_sql_str("/*tx*/BEGIN"));
-        assert!(should_skip_sql_str("-- tx\nCOMMIT"));
-        assert!(should_skip_sql_str("/* tx */ ROLLBACK"));
-        assert!(should_skip_sql_str("/* tx */ SAVEPOINT s1"));
-        assert!(should_skip_sql_str("/* tx */ RELEASE s1"));
+    fn do_not_skip_transaction_keywords_with_leading_comments() {
+        assert!(!should_skip_sql_str("/*tx*/BEGIN"));
+        assert!(!should_skip_sql_str("-- tx\nCOMMIT"));
+        assert!(!should_skip_sql_str("/* tx */ ROLLBACK"));
+        assert!(!should_skip_sql_str("/* tx */ SAVEPOINT s1"));
+        assert!(!should_skip_sql_str("/* tx */ RELEASE s1"));
     }
 
     #[test]
@@ -793,13 +821,12 @@ mod tests {
     }
 
     #[test]
-    fn write_transaction_control_not_write() {
-        // Transaction control is skip-SQL (matches C shim), not write-like
-        assert!(!is_write_operation_str("BEGIN"));
-        assert!(!is_write_operation_str("COMMIT"));
-        assert!(!is_write_operation_str("ROLLBACK"));
-        assert!(!is_write_operation_str("SAVEPOINT sp1"));
-        assert!(!is_write_operation_str("RELEASE SAVEPOINT sp1"));
+    fn write_transaction_control() {
+        assert!(is_write_operation_str("BEGIN"));
+        assert!(is_write_operation_str("COMMIT"));
+        assert!(is_write_operation_str("ROLLBACK"));
+        assert!(is_write_operation_str("SAVEPOINT sp1"));
+        assert!(is_write_operation_str("RELEASE SAVEPOINT sp1"));
     }
 
     #[test]

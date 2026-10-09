@@ -8,6 +8,19 @@ pub(super) unsafe fn acquire_exec_connection(
     pg_conn_error_out: *mut c_int,
 ) -> Result<*mut PgConnection, c_int> {
     let mut exec_conn = *exec_conn_io;
+    let handle_conn = (*pg_stmt).conn;
+    if !handle_conn.is_null() && !(*handle_conn).shadow_db.is_null() {
+        crate::pg_client::transaction::ensure_handle_session(handle_conn);
+        if !crate::pg_client::transaction::session_ready(handle_conn) {
+            *stmt_guard = None;
+            if !crate::pg_client::transaction::transaction_active(handle_conn) {
+                set_pg_conn_error(pg_conn_error_out);
+            }
+            return Err(STEP_RESULT_ERROR);
+        }
+        *exec_conn_io = handle_conn;
+        return Ok(handle_conn);
+    }
     if exec_conn.is_null() || (&*exec_conn).conn.is_null() {
         log_error(&format!(
             "STEP SELECT: NULL connection, retrying in 500ms (exec_conn={:p})",
@@ -50,6 +63,25 @@ pub(super) unsafe fn lock_exec_connection(
     crate::pg_client::rust_pool_touch_connection(*exec_conn as *const c_void);
     let ec = &mut **exec_conn;
     let mut conn_guard = PthreadMutexGuard::lock(&mut ec.mutex as *mut _);
+
+    if !ec.shadow_db.is_null() {
+        if !crate::pg_client::transaction::session_ready_locked(*exec_conn) {
+            *stmt_guard = None;
+            if !crate::pg_client::transaction::transaction_active(*exec_conn) {
+                set_pg_conn_error(pg_conn_error_out);
+            }
+            return Err(STEP_RESULT_ERROR);
+        }
+        if crate::pg_client::transaction::result_stream_live_locked(*exec_conn) {
+            crate::pg_client::transaction::set_error(
+                *exec_conn,
+                "Read cannot switch an active handle session while a result is streaming",
+            );
+            *stmt_guard = None;
+            return Err(STEP_RESULT_ERROR);
+        }
+        return Ok(conn_guard);
+    }
 
     if ec.conn.is_null() {
         log_error("STEP SELECT: conn became NULL after lock (TOCTOU race)");
@@ -116,6 +148,14 @@ pub(super) unsafe fn ensure_connection_ready(
     pg_conn_error_out: *mut c_int,
 ) -> Result<(), c_int> {
     let ec = &mut *exec_conn;
+    if !ec.shadow_db.is_null() {
+        if crate::pg_client::transaction::session_ready_locked(exec_conn) {
+            return Ok(());
+        }
+        conn_guard.unlock();
+        *stmt_guard = None;
+        return Err(STEP_RESULT_ERROR);
+    }
     let conn_status = crate::libpq_helpers::rust_pq_status(ec.conn);
     if conn_status == CONNECTION_OK {
         return Ok(());
