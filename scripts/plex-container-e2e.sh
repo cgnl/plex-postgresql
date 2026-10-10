@@ -45,9 +45,191 @@ negative_config="$fixture-negative-config"
 password=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 phase="setup"
 
+# Reuse the same bounded, environment-free collector in shell checkpoints and
+# the concurrent coordinator. This file is evidence, not a product component.
+cat > "$EVIDENCE_DIR/pms-lifecycle-probe.py" <<'PY'
+import json
+import os
+from pathlib import Path
+import time
+
+
+def process_info(directory):
+    raw = (directory / "stat").read_text()
+    fields = raw.rsplit(")", 1)[1].split()
+    result = {"pid": int(directory.name), "state": fields[0],
+              "parent_pid": int(fields[1]), "start_ticks": int(fields[19])}
+    allowed = {"State", "PPid", "VmRSS", "VmHWM", "VmPeak", "Threads"}
+    result["status"] = {key: value.strip() for line in (directory / "status").read_text().splitlines()
+                        if ":" in line for key, value in [line.split(":", 1)] if key in allowed}
+    return result
+
+
+def memory_info():
+    roots = [Path("/sys/fs/cgroup"), Path("/sys/fs/cgroup/memory")]
+    names = ("memory.events", "memory.events.local", "memory.current", "memory.peak", "memory.max",
+             "memory.oom_control", "memory.failcnt", "memory.usage_in_bytes",
+             "memory.max_usage_in_bytes", "memory.limit_in_bytes")
+    files = {}
+    for root in roots:
+        for name in names:
+            path = root / name
+            try:
+                if path.is_file():
+                    with path.open() as source:
+                        files[name] = source.read(4096).strip()
+            except OSError:
+                pass
+    counters = {}
+    for name in ("memory.events", "memory.oom_control"):
+        for line in files.get(name, "").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                counters[name + "." + parts[0]] = int(parts[1])
+    if files.get("memory.failcnt", "").isdigit():
+        counters["memory.failcnt"] = int(files["memory.failcnt"])
+    return {"files": files, "counters": counters}
+
+
+def snapshot():
+    result = {"time": time.monotonic(), "pms": [], "parents": [],
+              "scan_complete": True, "memory": memory_info()}
+    deadline = time.monotonic() + 2
+    try:
+        entries = Path("/proc").iterdir()
+        for directory in entries:
+            if time.monotonic() > deadline:
+                result["scan_complete"] = False
+                break
+            if not directory.name.isdigit():
+                continue
+            try:
+                try:
+                    executable = os.readlink(directory / "exe")
+                except OSError:
+                    # Inspect only argv[0] to identify PMS, never return args.
+                    with (directory / "cmdline").open("rb") as source:
+                        executable = source.read(4096).split(b"\0", 1)[0].decode(errors="replace")
+                if executable.endswith("/Plex Media Server"):
+                    process = process_info(directory)
+                    result["pms"].append(process)
+                    try:
+                        parent = process_info(Path("/proc") / str(process["parent_pid"]))
+                        if parent not in result["parents"]:
+                            result["parents"].append(parent)
+                    except (OSError, ValueError, IndexError):
+                        pass
+            except (OSError, ValueError, IndexError):
+                continue
+    except OSError:
+        result["scan_complete"] = False
+    return result
+
+
+def compare(before, after):
+    old = {(process["pid"], process["start_ticks"]) for process in before["pms"]}
+    new = {(process["pid"], process["start_ticks"]) for process in after["pms"]}
+    counters = after["memory"]["counters"]
+    previous = before["memory"]["counters"]
+    delta = {key: max(0, value - previous.get(key, value)) for key, value in counters.items()}
+    complete = before["scan_complete"] and after["scan_complete"]
+    non_live = [(process["pid"], process["start_ticks"], process["state"])
+                for process in after["pms"] if process.get("state") in ("Z", "X", "x")]
+    return {"observation_complete": complete, "same_pms_processes": complete and bool(old) and old == new and not non_live,
+            "lost_pms": sorted(old - new) if complete else [],
+            "new_pms": sorted(new - old) if complete else [],
+            "pms_absent": complete and bool(old) and not new,
+            "non_live_pms": non_live,
+            "oom_counter_deltas": delta}
+
+
+if __name__ == "__main__":
+    print(json.dumps(snapshot()))
+PY
+
+capture_pms_lifecycle() {
+    local stage="$1"
+    [[ $(docker inspect --format '{{index .Config.Labels "plex-pg-canary"}}' "$plex" 2>/dev/null) == "$fixture" ]] || return 0
+    python3 - "$plex" "$EVIDENCE_DIR/$stage-pms-lifecycle.json" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+try:
+    probe = subprocess.run(["docker", "exec", sys.argv[1], "python3", "/tmp/plex-pms-lifecycle.py"],
+                           capture_output=True, text=True, timeout=10)
+    result = json.loads(probe.stdout) if probe.returncode == 0 else {"available": False, "exit_code": probe.returncode}
+    # Host PIDs correlate container namespace snapshots with kernel OOM logs.
+    # comm contains executable names only; arguments and environment are absent.
+    top = subprocess.run(["docker", "top", sys.argv[1], "-eo", "pid,ppid,stat,rss,comm"],
+                         capture_output=True, text=True, timeout=5)
+    result["host_processes"] = top.stdout[-8192:] if top.returncode == 0 else "unavailable"
+except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+    result = {"available": False, "error_type": type(error).__name__}
+Path(sys.argv[2]).write_text(json.dumps(result, indent=2) + "\n")
+PY
+}
+
+capture_host_failure() {
+    python3 - "$EVIDENCE_DIR" <<'PY'
+import json
+from pathlib import Path
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+root = Path(sys.argv[1])
+probe = runpy.run_path(str(root / "pms-lifecycle-probe.py"))
+result = {"memory": probe["memory_info"](), "kernel": {"available": False}}
+try:
+    allowed = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
+    result["host_memory"] = {key: value.strip() for line in Path("/proc/meminfo").read_text().splitlines()
+                             if ":" in line for key, value in [line.split(":", 1)] if key in allowed}
+except OSError:
+    pass
+if shutil.which("dmesg"):
+    try:
+        output = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5)
+        privileged_read = False
+        denied = re.search(r"permission denied|not permitted|access denied", output.stderr, re.I)
+        if output.returncode != 0 and denied and shutil.which("sudo"):
+            output = subprocess.run(["sudo", "-n", "dmesg"], capture_output=True, text=True, timeout=5)
+            privileged_read = True
+        lines = [line for line in output.stdout.splitlines()
+                 if re.search(r"out of memory|oom.kill|killed process|memory cgroup|segfault|general protection fault|plex media", line, re.I)]
+        result["kernel"] = {"available": output.returncode == 0, "exit_code": output.returncode,
+                            "noninteractive_privileged_read": privileged_read,
+                            "filtered_tail": "\n".join(lines[-100:])[-32768:]}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        result["kernel"]["error_type"] = type(error).__name__
+(root / "host-failure-memory.json").write_text(json.dumps(result, indent=2) + "\n")
+PY
+}
+
+compare_pms_lifecycle() {
+    python3 - "$EVIDENCE_DIR" "$1" "$2" <<'PY'
+import json
+from pathlib import Path
+import runpy
+import sys
+root = Path(sys.argv[1])
+before = json.loads((root / (sys.argv[2] + "-pms-lifecycle.json")).read_text())
+after = json.loads((root / (sys.argv[3] + "-pms-lifecycle.json")).read_text())
+if "pms" in before and "pms" in after:
+    probe = runpy.run_path(str(root / "pms-lifecycle-probe.py"))
+    result = probe["compare"](before, after)
+else:
+    result = {"observation_complete": False}
+(root / (sys.argv[3] + "-pms-transition.json")).write_text(json.dumps(result, indent=2) + "\n")
+PY
+}
+
 cleanup() {
     status=$?
     trap - EXIT
+    capture_pms_lifecycle cleanup || true
+    if ((status != 0)); then capture_host_failure || true; fi
     for container in "$plex" "$negative" "$fixture-source" "$fixture-imported" "$fixture-restored" "$postgres"; do
         if [[ $(docker inspect --format '{{index .Config.Labels "plex-pg-canary"}}' "$container" 2>/dev/null) == "$fixture" ]]; then
             docker logs "$container" > "$EVIDENCE_DIR/$container.log" 2>&1 || true
@@ -224,6 +406,8 @@ print("Actual PMS processes load db_interpose_pg.so:", [p.name for p in processe
 phase="first-start"
 start_plex "$plex" "$config"
 assert_ready "$plex" first-start
+docker cp "$EVIDENCE_DIR/pms-lifecycle-probe.py" "$plex:/tmp/plex-pms-lifecycle.py"
+capture_pms_lifecycle first-start
 phase="media-bootstrap"
 docker exec "$plex" mkdir -p /config/runtime-fixture-media
 # Plex installs its own H.264/AAC codecs on first analysis. Permit outbound
@@ -482,6 +666,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import runpy
 import subprocess
 import sys
 import threading
@@ -494,9 +679,12 @@ movie_section, tv_section, movie, episode1, episode2, destination = sys.argv[1:]
 output = Path(destination)
 output.mkdir(parents=True, exist_ok=False)
 gate = output / "start"
+lifecycle = runpy.run_path("/tmp/plex-pms-lifecycle.py")
+baseline = lifecycle["snapshot"]()
 result = {"passed": False, "clients_requested": 4, "sample_seconds": 20, "decoder_input_rate": "realtime",
           "browser_playback_verified": False, "server_transcoding_verified": False,
-          "workload": [], "postgres_sessions": []}
+          "workload": [], "postgres_sessions": [],
+          "pms_lifecycle": {"before": baseline, "during": []}}
 clients = []
 logs = []
 workload_errors = []
@@ -596,6 +784,7 @@ try:
     workload = threading.Thread(target=mixed_workload, args=(key,), daemon=True)
     workload.start()
     deadline = time.monotonic() + 180
+    next_lifecycle = time.monotonic()
     while any(client.poll() is None for client in clients):
         if time.monotonic() > deadline:
             raise RuntimeError("Concurrent real-media burst exceeded 180 seconds")
@@ -604,6 +793,11 @@ try:
                                 "AND client_addr IS NOT NULL AND pid<>pg_backend_pid()"],
                                env=pg_environment, capture_output=True, text=True, timeout=10, check=True)
         result["postgres_sessions"].append({"time": time.monotonic(), "count": int(count.stdout.strip())})
+        if time.monotonic() >= next_lifecycle and len(result["pms_lifecycle"]["during"]) < 32:
+            current = lifecycle["snapshot"]()
+            result["pms_lifecycle"]["during"].append({"snapshot": current,
+                                                     "transition": lifecycle["compare"](baseline, current)})
+            next_lifecycle = time.monotonic() + 1
         time.sleep(0.1)
     done.set()
     workload.join(timeout=25)
@@ -639,12 +833,20 @@ try:
         raise RuntimeError("No PostgreSQL session observation during four-client overlap")
     result["mixed_workload_overlap_events"] = len(mixed_overlap)
     result["passed"] = True
-    print("PASS four overlapping real H264/audio HTTP clients with TV scan and metadata/watch workload")
 except Exception as error:
     result["error"] = str(error)
     print("FAIL concurrent real-media burst: " + str(error), file=sys.stderr)
 finally:
     done.set()
+    final_snapshot = lifecycle["snapshot"]()
+    result["pms_lifecycle"]["after"] = final_snapshot
+    result["pms_lifecycle"]["transition"] = lifecycle["compare"](baseline, final_snapshot)
+    transitions = [result["pms_lifecycle"]["transition"],
+                   *(item["transition"] for item in result["pms_lifecycle"]["during"])]
+    result["pms_process_survived_burst"] = all(item["same_pms_processes"] for item in transitions)
+    if result["passed"] and not result["pms_process_survived_burst"]:
+        result["passed"] = False
+        result["error"] = "Actual PMS PID/start-time identity changed during concurrent real-media burst"
     for client in clients:
         if client.poll() is None:
             os.killpg(client.pid, signal.SIGTERM)
@@ -656,6 +858,8 @@ finally:
     for log in logs:
         log.close()
     (output / "concurrent-playback.json").write_text(json.dumps(result, indent=2) + "\n")
+if result["passed"]:
+    print("PASS four overlapping real H264/audio HTTP clients with TV scan and metadata/watch workload")
 sys.exit(0 if result["passed"] else 1)
 PY
     mkdir -p "$EVIDENCE_DIR/$stage-concurrent-real-media"
@@ -676,7 +880,10 @@ if ((real_media_sample_seconds == 0)); then
         --media-cache "$media_cache" --expected-version "$EXPECTED_PLEX_VERSION"
     native_roundtrip_verified=1
 fi
+capture_pms_lifecycle before-download-network-disconnect
 docker network disconnect "$download_network" "$plex"
+capture_pms_lifecycle after-download-network-disconnect
+compare_pms_lifecycle before-download-network-disconnect after-download-network-disconnect
 phase="watch-state"
 metadata_id=$(docker exec "$postgres" psql -X -U plex -d plex -v ON_ERROR_STOP=1 -Atc \
     "SELECT metadata.id FROM plex.metadata_items metadata JOIN plex.media_items media ON media.metadata_item_id=metadata.id JOIN plex.media_parts part ON part.media_item_id=media.id WHERE metadata.library_section_id=$section_id AND part.file='$media_file';")
