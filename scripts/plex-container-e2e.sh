@@ -393,6 +393,11 @@ cleanup() {
     trap - EXIT
     capture_pms_lifecycle cleanup || true
     if ((status != 0)); then capture_host_failure || true; fi
+    # systemd-coredump runs on the host. Resolve symbols while the owned
+    # supervisor still keeps /proc/<container-init>/root available.
+    if ((status != 0)); then
+        python3 "$script_dir/plex-host-core-diagnostic.py" "$EVIDENCE_DIR" "$plex" "$fixture" || true
+    fi
     for container in "$plex" "$negative" "$fixture-source" "$fixture-imported" "$fixture-restored" "$postgres"; do
         if [[ $(docker inspect --format '{{index .Config.Labels "plex-pg-canary"}}' "$container" 2>/dev/null) == "$fixture" ]]; then
             docker logs "$container" > "$EVIDENCE_DIR/$container.log" 2>&1 || true
@@ -1100,6 +1105,7 @@ for ((cycle=1; cycle<=restart_cycles; cycle++)); do
     phase="$stage"
     docker restart "$plex" >/dev/null
     assert_ready "$plex" "$stage"
+    capture_pms_lifecycle "$stage"
     assert_section_routing "$stage"
     assert_scanned_media "$stage"
     assert_watch_state "$stage" 1

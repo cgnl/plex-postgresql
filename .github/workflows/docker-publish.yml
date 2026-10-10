@@ -252,6 +252,17 @@ jobs:
           build-args: |
             BUILDER_IMAGE=${{ needs.resolve.outputs.builder_image }}
             PLEX_BASE_IMAGE=${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
+      - name: Prepare offline crash diagnostics
+        run: |
+          if ! command -v gdb >/dev/null; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install --no-install-recommends -y gdb
+          fi
+          command -v coredumpctl
+          command -v timeout
+          sudo -n true
+          gdb --version
+          coredumpctl --version
       - name: Verify the exact candidate digest
         env:
           CANDIDATE_IMAGE: ${{ steps.image.outputs.repository }}@${{ steps.build.outputs.digest }}
@@ -351,6 +362,17 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare offline crash diagnostics
+        run: |
+          if ! command -v gdb >/dev/null; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install --no-install-recommends -y gdb
+          fi
+          command -v coredumpctl
+          command -v timeout
+          sudo -n true
+          gdb --version
+          coredumpctl --version
       - name: Continuous native mixed fixture workload for 21000 seconds
         env:
           POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
