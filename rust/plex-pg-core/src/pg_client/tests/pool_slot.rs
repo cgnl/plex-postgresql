@@ -84,14 +84,20 @@ fn pool_slot_reclaim_error_fails_from_ready() {
 fn pool_slot_reclaim_zombie_from_ready() {
     let slot = PoolSlot::new();
     slot.state.store(SLOT_READY, Ordering::Relaxed);
-    assert!(slot.try_reclaim_zombie());
+    let dead = super::super::threading::DEAD_BIT | 1;
+    slot.owner_thread.store(dead, Ordering::Relaxed);
+    assert!(slot.try_reserve_zombie(dead));
+    slot.release();
     assert_eq!(slot.state.load(Ordering::Relaxed), SLOT_FREE);
 }
 
 #[test]
 fn pool_slot_reclaim_zombie_fails_from_free() {
     let slot = PoolSlot::new();
-    assert!(!slot.try_reclaim_zombie());
+    let dead = super::super::threading::DEAD_BIT | 1;
+    slot.owner_thread.store(dead, Ordering::Relaxed);
+    assert!(!slot.try_reserve_zombie(dead));
+    assert_eq!(slot.owner_thread.load(Ordering::Acquire), dead);
 }
 
 #[test]

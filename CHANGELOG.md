@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.3.22]
 
 ### Fixed
+- Replace connection-pool pthread liveness probes with lifecycle-owned logical tokens, preventing dereferences of expired thread descriptors during idle reclamation.
 - Preserve the SQLite MATCH boundary before following AND/OR filters and retain grouping for tag ranking by `count(*)`, fixing both observed native `/hubs/search` HTTP 500 errors.
 - Recognize exact repository bootstrap rows, including Administrator and preferences, before migration; reject modified defaults and preserve existing library data under destination locks.
 - Restore missing canonical defaults before fresh native startup on both container variants, preventing the LinuxServer default-account NULL dereference.
