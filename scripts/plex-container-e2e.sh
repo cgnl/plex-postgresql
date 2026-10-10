@@ -51,6 +51,8 @@ cat > "$EVIDENCE_DIR/pms-lifecycle-probe.py" <<'PY'
 import json
 import os
 from pathlib import Path
+import stat
+import sys
 import time
 
 
@@ -59,9 +61,15 @@ def process_info(directory):
     fields = raw.rsplit(")", 1)[1].split()
     result = {"pid": int(directory.name), "state": fields[0],
               "parent_pid": int(fields[1]), "start_ticks": int(fields[19])}
-    allowed = {"State", "PPid", "VmRSS", "VmHWM", "VmPeak", "Threads"}
+    allowed = {"State", "PPid", "VmRSS", "VmHWM", "VmPeak", "Threads", "CoreDumping"}
     result["status"] = {key: value.strip() for line in (directory / "status").read_text().splitlines()
                         if ":" in line for key, value in [line.split(":", 1)] if key in allowed}
+    try:
+        result["core_limits"] = [line for line in (directory / "limits").read_text().splitlines()
+                                 if line.startswith(("Max core file size", "Max file size"))]
+        result["coredump_filter"] = (directory / "coredump_filter").read_text()[:64].strip()
+    except OSError:
+        result["core_limits_available"] = False
     return result
 
 
@@ -91,9 +99,99 @@ def memory_info():
     return {"files": files, "counters": counters}
 
 
+def core_info():
+    result = {}
+    for key, filename in (("core_pattern", "/proc/sys/kernel/core_pattern"),
+                          ("core_uses_pid", "/proc/sys/kernel/core_uses_pid"),
+                          ("suid_dumpable", "/proc/sys/fs/suid_dumpable")):
+        try:
+            with Path(filename).open() as source:
+                result[key] = source.read(4096).strip()
+        except OSError:
+            result[key + "_available"] = False
+    result["core_pattern_piped"] = result.get("core_pattern", "").startswith("|")
+    return result
+
+
+def dump_index(root=Path("/run/plex-temp")):
+    result = {"root": str(root), "selected": [], "skipped": [], "scan_truncated": False,
+              "max_files": 8, "max_file_bytes": 64 * 1024 * 1024,
+              "max_total_bytes": 128 * 1024 * 1024, "selected_bytes": 0}
+    if not root.is_dir() or root.is_symlink():
+        result["available"] = False
+        return result
+    result["available"] = True
+    deadline = time.monotonic() + 2
+    for index, path in enumerate(root.rglob("*")):
+        if index >= 256 or time.monotonic() > deadline:
+            result["scan_truncated"] = True
+            break
+        if not (path.name.lower().endswith(".dmp") or path.name == "core" or path.name.startswith("core.")):
+            continue
+        reason = None
+        try:
+            if path.is_symlink() or not path.is_file():
+                reason = "not_regular_file"
+                size = 0
+            else:
+                size = path.stat().st_size
+                if size > result["max_file_bytes"]:
+                    reason = "file_size_limit"
+                elif len(result["selected"]) >= result["max_files"]:
+                    reason = "file_count_limit"
+                elif result["selected_bytes"] + size > result["max_total_bytes"]:
+                    reason = "total_size_limit"
+        except OSError:
+            reason, size = "unreadable", 0
+        entry = {"path": str(path), "bytes": size}
+        if reason:
+            entry["reason"] = reason
+            if len(result["skipped"]) < 16:
+                result["skipped"].append(entry)
+            else:
+                result["skipped_records_truncated"] = True
+        else:
+            result["selected"].append(entry)
+            result["selected_bytes"] += size
+    return result
+
+
+def read_dump(path, expected_size):
+    path = Path(path)
+    relative = path.relative_to("/run/plex-temp")
+    if ".." in relative.parts or not (path.name.lower().endswith(".dmp") or path.name == "core" or path.name.startswith("core.")):
+        raise ValueError("Unexpected transient dump path")
+    limit = 64 * 1024 * 1024
+    if not 0 <= expected_size <= limit:
+        raise ValueError("Invalid transient dump size")
+    directory = descriptor = None
+    try:
+        directory = os.open("/run/plex-temp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for part in relative.parts[:-1]:
+            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = following
+        descriptor = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != expected_size or before.st_size > limit:
+            raise ValueError("Transient dump changed or exceeded size limit")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = None
+            data = source.read(limit + 1)
+            after = os.fstat(source.fileno())
+        if len(data) != expected_size or len(data) > limit or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise ValueError("Transient dump changed during bounded read")
+        return data
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory is not None:
+            os.close(directory)
+
+
 def snapshot():
     result = {"time": time.monotonic(), "pms": [], "parents": [],
-              "scan_complete": True, "memory": memory_info()}
+              "scan_complete": True, "memory": memory_info(), "core": core_info()}
     deadline = time.monotonic() + 2
     try:
         entries = Path("/proc").iterdir()
@@ -144,7 +242,10 @@ def compare(before, after):
 
 
 if __name__ == "__main__":
-    print(json.dumps(snapshot()))
+    if len(sys.argv) == 4 and sys.argv[1] == "--read-dump":
+        sys.stdout.buffer.write(read_dump(sys.argv[2], int(sys.argv[3])))
+    else:
+        print(json.dumps(dump_index() if sys.argv[1:] == ["--dump-index"] else snapshot()))
 PY
 
 capture_pms_lifecycle() {
@@ -181,7 +282,7 @@ import subprocess
 import sys
 root = Path(sys.argv[1])
 probe = runpy.run_path(str(root / "pms-lifecycle-probe.py"))
-result = {"memory": probe["memory_info"](), "kernel": {"available": False}}
+result = {"memory": probe["memory_info"](), "core": probe["core_info"](), "kernel": {"available": False}}
 try:
     allowed = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
     result["host_memory"] = {key: value.strip() for line in Path("/proc/meminfo").read_text().splitlines()
@@ -204,6 +305,68 @@ if shutil.which("dmesg"):
     except (OSError, subprocess.TimeoutExpired) as error:
         result["kernel"]["error_type"] = type(error).__name__
 (root / "host-failure-memory.json").write_text(json.dumps(result, indent=2) + "\n")
+PY
+}
+
+capture_transient_dumps() {
+    python3 - "$1" "$fixture" "$EVIDENCE_DIR/$1-diagnostics" <<'PY'
+import json
+from pathlib import Path, PurePosixPath
+import subprocess
+import sys
+container, fixture, destination = sys.argv[1:]
+root = Path(destination)
+root.mkdir(parents=True, exist_ok=True)
+record = {"available": False, "copied": [], "copy_failures": []}
+try:
+    owned = subprocess.run(["docker", "inspect", "--format", '{{index .Config.Labels "plex-pg-canary"}}', container],
+                           capture_output=True, text=True, timeout=5)
+    if owned.returncode != 0 or owned.stdout.strip() != fixture:
+        raise RuntimeError("Container ownership was not verified")
+    probe = subprocess.run(["docker", "exec", container, "python3", "/tmp/plex-pms-lifecycle.py", "--dump-index"],
+                           capture_output=True, text=True, timeout=5)
+    if probe.returncode == 0:
+        record = json.loads(probe.stdout)
+        record.update({"copied": [], "copy_failures": []})
+        dump_root = root / "transient-dumps"
+        transferred = 0
+        for index, entry in enumerate(record.get("selected", [])[:8]):
+            path = PurePosixPath(entry["path"])
+            relative = path.relative_to("/run/plex-temp")
+            if ".." in relative.parts or not (path.name.lower().endswith(".dmp") or path.name == "core" or path.name.startswith("core.")):
+                raise RuntimeError("Unexpected transient dump path")
+            dump_root.mkdir(exist_ok=True)
+            copied = dump_root / (str(index + 1) + "-" + path.name)
+            partial = copied.with_name(copied.name + ".partial")
+            promoted = False
+            try:
+                if not isinstance(entry["bytes"], int) or not 0 <= entry["bytes"] <= 64 * 1024 * 1024:
+                    raise ValueError("Invalid indexed dump size")
+                if transferred + entry["bytes"] > 128 * 1024 * 1024:
+                    raise ValueError("Transient dump total size limit")
+                transfer = subprocess.run(["docker", "exec", container, "python3", "/tmp/plex-pms-lifecycle.py",
+                                           "--read-dump", str(path), str(entry["bytes"])],
+                                          capture_output=True, timeout=10)
+                if transfer.returncode != 0 or len(transfer.stdout) != entry["bytes"] or len(transfer.stdout) > 64 * 1024 * 1024:
+                    raise ValueError("Transient dump source changed or bounded transfer failed")
+                if partial.is_symlink() or copied.is_symlink():
+                    raise ValueError("Unexpected transient dump evidence symlink")
+                partial.write_bytes(transfer.stdout)
+                partial.replace(copied)
+                promoted = True
+                transferred += len(transfer.stdout)
+                record["copied"].append({"path": str(path), "evidence": str(copied.relative_to(root)), "bytes": len(transfer.stdout)})
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                record["copy_failures"].append({"path": str(path), "reason": type(error).__name__})
+            finally:
+                partial.unlink(missing_ok=True)
+                if not promoted:
+                    copied.unlink(missing_ok=True)
+    else:
+        record["probe_exit_code"] = probe.returncode
+except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+    record["collection_error_type"] = type(error).__name__
+(root / "transient-dump-index.json").write_text(json.dumps(record, indent=2) + "\n")
 PY
 }
 
@@ -235,6 +398,7 @@ cleanup() {
             docker logs "$container" > "$EVIDENCE_DIR/$container.log" 2>&1 || true
             docker inspect --format '{{json .State}}' "$container" > "$EVIDENCE_DIR/$container-state.json" || true
             mkdir -p "$EVIDENCE_DIR/$container-diagnostics"
+            if ((status != 0)); then capture_transient_dumps "$container" || true; fi
             docker cp "$container:/config/Library/Application Support/Plex Media Server/Crash Reports" "$EVIDENCE_DIR/$container-diagnostics/" 2>/dev/null || true
             docker cp "$container:/config/Library/Application Support/Plex Media Server/Logs" "$EVIDENCE_DIR/$container-diagnostics/" 2>/dev/null || true
             docker rm -fv "$container" >/dev/null || true
@@ -325,6 +489,7 @@ start_plex() {
         -e VERSION=docker -e PLEX_PG_HOST=postgres -e PLEX_PG_PORT=5432 \
         -e PLEX_PG_DATABASE=plex -e PLEX_PG_USER=plex -e "PLEX_PG_PASSWORD=$password" \
         -e PLEX_PG_SCHEMA=plex -e PLEX_PG_LOG_LEVEL=DEBUG -e MIGRATION_INTERACTIVE=0 \
+        -e PLEX_PG_REAPER_DIAGNOSTICS=1 \
         "$candidate_id" >/dev/null
 }
 

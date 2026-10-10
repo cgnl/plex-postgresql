@@ -32,10 +32,12 @@ pub(super) fn db_handle_impl(p_stmt: *mut sqlite3_stmt) -> *mut sqlite3 {
     }
 
     let pg_stmt = lookup_pg_stmt(p_stmt);
+    log_debug_lazy!("DB_HANDLE: lookup pStmt={:p} pg_stmt={:p}", p_stmt, pg_stmt);
     if is_interposed_pg_stmt(pg_stmt) {
         let s = unsafe { &*pg_stmt };
         if !s.shadow_stmt.is_null() {
             if let Some(f) = get_orig_sqlite3_db_handle() {
+                log_debug("DB_HANDLE: calling original with shadow_stmt");
                 let db = unsafe { f(s.shadow_stmt) };
                 log_debug_lazy!("DB_HANDLE: returning from shadow_stmt={:p}", db);
                 return db;
@@ -52,6 +54,7 @@ pub(super) fn db_handle_impl(p_stmt: *mut sqlite3_stmt) -> *mut sqlite3 {
     }
 
     if let Some(f) = get_orig_sqlite3_db_handle() {
+        log_debug_lazy!("DB_HANDLE: calling original with pStmt={:p}", p_stmt);
         let db = unsafe { f(p_stmt) };
         log_debug_lazy!("DB_HANDLE: returning orig={:p}", db);
         return db;
