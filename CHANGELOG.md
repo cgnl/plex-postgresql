@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Obtain prepared-statement column descriptors through privately named PREPARE/DESCRIBE/DEALLOCATE rounds instead of executing statements for metadata, and refuse to publish row-producing statements without descriptors, preventing native Plex SIGSEGVs that read column metadata after PostgreSQL outage recovery.
+
 ## [1.3.22]
 
 ### Fixed

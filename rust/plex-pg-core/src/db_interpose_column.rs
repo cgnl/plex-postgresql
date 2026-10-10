@@ -50,10 +50,10 @@ use decltype_accessor::column_decltype_impl;
 use decltype_cache::{lookup_decltype_direct, lookup_sqlite_decltype};
 use fake_value_slot::allocate_fake_sqlite_value;
 use metadata_accessors::{column_count_impl, column_name_impl, data_count_impl};
-#[allow(unused_imports)]
-use metadata_support::{
-    ensure_pg_result_for_metadata, mask_collection_metadata_type, set_metadata_result_state,
-};
+pub(crate) use metadata_support::ensure_pg_result_for_metadata;
+use metadata_support::mask_collection_metadata_type;
+#[cfg(test)]
+use metadata_support::set_metadata_result_state;
 use resolve_tables::resolve_column_tables_impl;
 use scalar_accessors::{column_double_impl, column_int64_impl, column_int_impl};
 use support::{
@@ -107,19 +107,6 @@ extern "C" {
         db_path: *const c_char,
         exclude_conn: *const c_void,
     ) -> *mut PgConnection;
-    fn pg_stmt_cache_lookup(
-        conn: *mut PgConnection,
-        sql_hash: u64,
-        stmt_name_out: *mut *const c_char,
-    ) -> c_int;
-    fn pg_stmt_cache_add(
-        conn: *mut PgConnection,
-        sql_hash: u64,
-        stmt_name: *const c_char,
-        param_count: c_int,
-    ) -> c_int;
-    fn pg_is_duplicate_prepared_stmt(res: *mut PgResultLibpq) -> c_int;
-
     fn pg_exception_note_phase(
         phase: *const c_char,
         sql: *const c_char,

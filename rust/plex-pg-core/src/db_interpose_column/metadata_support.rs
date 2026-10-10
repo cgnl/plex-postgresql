@@ -1,6 +1,25 @@
 use super::*;
 use crate::log_debug_lazy;
-use crate::log_info_lazy;
+
+static DESCRIPTOR_NAME_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+unsafe fn deallocate_descriptor(
+    conn: *mut PgConnection,
+    exec_conn: *mut PgConnection,
+    name: &CStr,
+) -> bool {
+    let ec = &mut *exec_conn;
+    let command = CString::new(format!("DEALLOCATE {}", name.to_string_lossy()))
+        .expect("generated DEALLOCATE cannot contain NUL");
+    let result = crate::libpq_helpers::rust_pq_exec(ec.conn, command.as_ptr());
+    let ok = crate::libpq_helpers::rust_pq_result_status(result) == PGRES_COMMAND_OK;
+    if !ok {
+        crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, result);
+    }
+    crate::libpq_helpers::rust_pq_clear(result);
+    ok
+}
 
 pub(crate) fn mask_collection_metadata_type(
     pg_stmt: &PgStmt,
@@ -30,6 +49,7 @@ pub(crate) fn mask_collection_metadata_type(
     true
 }
 
+#[cfg(test)]
 pub(crate) unsafe fn set_metadata_result_state(
     pg_stmt: &mut PgStmt,
     result: *mut PgResultLibpq,
@@ -44,237 +64,96 @@ pub(crate) unsafe fn set_metadata_result_state(
     pg_stmt.metadata_only_result = 1;
 }
 
+/// Obtain result descriptors without executing the statement or consuming its stream.
+/// Connection and statement locks are deliberately never held together.
 pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
     if pg_stmt.is_null() {
         return false;
     }
-
-    let pg_stmt_ref = unsafe { &mut *pg_stmt };
-
-    if !pg_stmt_ref.result.is_null() || !pg_stmt_ref.cached_result.is_null() {
-        return true;
-    }
-    if pg_stmt_ref.num_cols > 0 {
-        return true;
-    }
-    if pg_stmt_ref.pg_sql.is_null()
-        || pg_stmt_ref.conn.is_null()
-        || unsafe { (*pg_stmt_ref.conn).conn.is_null() }
-    {
-        return false;
-    }
-
-    let conn = pg_stmt_ref.conn;
+    let (conn, sql, param_count) = unsafe {
+        let _guard = PgStmt::lock_mutex(pg_stmt);
+        let s = &*pg_stmt;
+        if !s.descriptor.is_null() {
+            return true;
+        }
+        if s.pg_sql.is_null() || s.conn.is_null() {
+            return false;
+        }
+        (s.conn, CStr::from_ptr(s.pg_sql).to_owned(), s.param_count)
+    };
     let conn_ref = unsafe { &*conn };
-    let is_library =
-        crate::db_interpose_helpers::rust_is_library_db_path(conn_ref.db_path.as_ptr());
-    if is_library == 0 {
-        return false;
-    }
-
-    let mut exec_conn = conn;
     let thread_conn = unsafe {
         if conn_ref.streaming_active.load(Ordering::SeqCst) != 0 {
-            pg_get_thread_connection_excluding(conn_ref.db_path.as_ptr(), conn as *const c_void)
+            pg_get_thread_connection_excluding(conn_ref.db_path.as_ptr(), conn.cast())
         } else {
             pg_get_thread_connection(conn_ref.db_path.as_ptr())
         }
     };
-    if !thread_conn.is_null() {
-        let tc = unsafe { &*thread_conn };
-        if tc.is_pg_active != 0 && !tc.conn.is_null() {
-            exec_conn = thread_conn;
-        }
-    }
-
-    if unsafe { (&*exec_conn).streaming_active.load(Ordering::SeqCst) != 0 } {
-        log_debug_lazy!(
-            "METADATA: skipping — connection {:p} is streaming_active",
-            exec_conn
-        );
-        return false;
-    }
-
-    let ec = unsafe { &mut *exec_conn };
-    let _conn_guard = unsafe { PthreadMutexGuard::lock(&mut ec.mutex as *mut _) };
-
-    if ec.streaming_active.load(Ordering::SeqCst) != 0 {
-        log_debug_lazy!(
-            "METADATA: skipping after lock — connection {:p} is streaming_active",
-            exec_conn
-        );
-        return false;
-    }
-
-    crate::libpq_helpers::rust_pq_set_nonblocking(ec.conn, 0);
-    while crate::libpq_helpers::rust_pq_is_busy(ec.conn) != 0 {
-        crate::libpq_helpers::rust_pq_consume_input(ec.conn);
-    }
-    loop {
-        let pending = crate::libpq_helpers::rust_pq_get_result(ec.conn);
-        if pending.is_null() {
-            break;
-        }
-        crate::libpq_helpers::rust_pq_clear(pending);
-    }
-
-    let mut has_unbound_params = false;
-    if pg_stmt_ref.param_count > 0 {
-        has_unbound_params = true;
-        for i in 0..pg_stmt_ref.param_count as usize {
-            if !pg_stmt_ref.param_values[i].is_null() {
-                has_unbound_params = false;
-                break;
-            }
-        }
-    }
-
-    unsafe {
-        if has_unbound_params && pg_stmt_ref.stmt_name[0] != 0 {
-            log_info_lazy!(
-                "METADATA_DESCRIBE: Using prepared-statement describe for: {}",
-                cstr_prefix(pg_stmt_ref.pg_sql, 100, "?")
-            );
-
-            let mut cached_name: *const c_char = ptr::null();
-            let cached = pg_stmt_cache_lookup(
-                exec_conn,
-                pg_stmt_ref.sql_hash,
-                &mut cached_name as *mut *const c_char,
-            );
-            if cached == 0 {
-                let prep = crate::libpq_helpers::rust_pq_prepare(
-                    ec.conn,
-                    pg_stmt_ref.stmt_name.as_ptr(),
-                    pg_stmt_ref.pg_sql,
-                    0,
-                    ptr::null(),
-                );
-                if crate::libpq_helpers::rust_pq_result_status(prep) != PGRES_COMMAND_OK {
-                    if pg_is_duplicate_prepared_stmt(prep) == 0 {
-                        log_error(&format!(
-                            "METADATA_DESCRIBE: PQprepare failed: {}\n  Original SQL: {}\n  Translated SQL: {}",
-                            cstr_to_string_or(
-                                crate::libpq_helpers::rust_pq_error_message(ec.conn),
-                                "?"
-                            ),
-                            cstr_to_string_or(pg_stmt_ref.sql, "?"),
-                            cstr_to_string_or(pg_stmt_ref.pg_sql, "?")
-                        ));
-                        crate::libpq_helpers::rust_pq_clear(prep);
-                        return false;
-                    }
-                }
-                pg_stmt_cache_add(
-                    exec_conn,
-                    pg_stmt_ref.sql_hash,
-                    pg_stmt_ref.stmt_name.as_ptr(),
-                    pg_stmt_ref.param_count,
-                );
-                crate::libpq_helpers::rust_pq_clear(prep);
-            }
-
-            let desc = crate::libpq_helpers::rust_pq_describe_prepared(
-                ec.conn,
-                pg_stmt_ref.stmt_name.as_ptr(),
-            );
-
-            if crate::libpq_helpers::rust_pq_result_status(desc) == PGRES_COMMAND_OK {
-                pg_stmt_ref.num_cols = crate::libpq_helpers::rust_pq_nfields(desc);
-                pg_stmt_ref.ensure_column_capacity(pg_stmt_ref.num_cols as usize);
-                if pg_stmt_ref.num_cols > 0 {
-                    let ncols = pg_stmt_ref.num_cols as usize;
-                    let col_names =
-                        libc::calloc(ncols, std::mem::size_of::<*mut c_char>()) as *mut *mut c_char;
-                    if !col_names.is_null() {
-                        pg_stmt_ref.col_names = col_names;
-                        pg_stmt_ref.num_col_names = pg_stmt_ref.num_cols;
-                        for i in 0..ncols {
-                            let name = crate::db_interpose_helpers::rust_pg_result_col_name(
-                                helpers_result_ptr(desc),
-                                i as c_int,
-                            );
-                            if !name.is_null() {
-                                let dup = libc::strdup(name);
-                                *col_names.add(i) = dup;
-                            }
-                        }
-                    }
-                }
-                set_metadata_result_state(pg_stmt_ref, desc, exec_conn, 0, 0);
-                log_info_lazy!(
-                    "METADATA_DESCRIBE: Success - {} cols for: {}",
-                    pg_stmt_ref.num_cols,
-                    cstr_prefix(pg_stmt_ref.pg_sql, 100, "?")
-                );
-                return true;
-            }
-
-            log_error(&format!(
-                "METADATA_DESCRIBE: PQdescribePrepared failed: {}",
-                cstr_to_string_or(crate::libpq_helpers::rust_pq_error_message(ec.conn), "?")
-            ));
-            crate::libpq_helpers::rust_pq_clear(desc);
-            return false;
-        }
-    }
-
-    log_info_lazy!(
-        "METADATA_EXEC: Executing query for column metadata access: {}",
-        cstr_prefix(pg_stmt_ref.pg_sql, 100, "?")
-    );
-
-    let param_values: Vec<*const c_char> = {
-        let count = (pg_stmt_ref.param_count.max(0) as usize).min(pg_stmt_ref.param_values.len());
-        let mut pv = vec![ptr::null(); count];
-        for i in 0..count {
-            pv[i] = pg_stmt_ref.param_values[i] as *const c_char;
-        }
-        pv
-    };
-
-    pg_stmt_ref.result = crate::libpq_helpers::rust_pq_exec_params(
-        ec.conn,
-        pg_stmt_ref.pg_sql,
-        pg_stmt_ref.param_count,
-        ptr::null(),
-        param_values.as_ptr(),
-        ptr::null(),
-        ptr::null(),
-        0,
-    );
-
-    let status = crate::libpq_helpers::rust_pq_result_status(pg_stmt_ref.result);
-    if status == PGRES_TUPLES_OK {
-        pg_stmt_ref.num_rows = crate::libpq_helpers::rust_pq_ntuples(pg_stmt_ref.result);
-        pg_stmt_ref.num_cols = crate::libpq_helpers::rust_pq_nfields(pg_stmt_ref.result);
-        pg_stmt_ref.ensure_column_capacity(pg_stmt_ref.num_cols as usize);
-
-        unsafe {
-            set_metadata_result_state(
-                pg_stmt_ref,
-                pg_stmt_ref.result,
-                exec_conn,
-                pg_stmt_ref.num_rows,
-                -1,
-            );
-        }
-
-        // Release conn mutex before resolve_column_tables to reduce hold time.
-        // resolve_column_tables acquires its own conn lock scope.
-        drop(_conn_guard);
-
-        if rust_resolve_column_tables(pg_stmt, exec_conn) < 0 {
-            log_error("Failed to resolve column tables");
-        }
-
-        true
+    let exec_conn = if thread_conn.is_null() {
+        conn
     } else {
-        let err = cstr_to_string_or(crate::libpq_helpers::rust_pq_error_message(ec.conn), "?");
-        crate::libpq_helpers::rust_pq_clear(pg_stmt_ref.result);
-        pg_stmt_ref.result = ptr::null_mut();
-        drop(_conn_guard);
-        log_error(&format!("METADATA_EXEC: Query failed: {}", err));
-        false
+        thread_conn
+    };
+    let ec = unsafe { &mut *exec_conn };
+    let conn_guard = unsafe { PthreadMutexGuard::lock(&mut ec.mutex as *mut _) };
+    if ec.conn.is_null() || ec.streaming_active.load(Ordering::SeqCst) != 0 {
+        return false;
     }
+    // Use a private, unique name so metadata discovery cannot replace libpq's
+    // connection-scoped unnamed statement or collide with the execution cache.
+    // Preparing/describing evaluates no expressions and performs no writes.
+    let descriptor_name = CString::new(format!(
+        "plex_descriptor_{}_{}",
+        std::process::id(),
+        DESCRIPTOR_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+    .expect("generated descriptor name cannot contain NUL");
+    crate::libpq_helpers::rust_pq_set_nonblocking(ec.conn, 0);
+    let prep = crate::libpq_helpers::rust_pq_prepare(
+        ec.conn,
+        descriptor_name.as_ptr(),
+        sql.as_ptr(),
+        param_count,
+        ptr::null(),
+    );
+    let prepared = crate::libpq_helpers::rust_pq_result_status(prep) == PGRES_COMMAND_OK;
+    if !prepared {
+        unsafe {
+            crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, prep);
+        }
+    }
+    crate::libpq_helpers::rust_pq_clear(prep);
+    if !prepared {
+        return false;
+    }
+    let desc = crate::libpq_helpers::rust_pq_describe_prepared(ec.conn, descriptor_name.as_ptr());
+    let described = crate::libpq_helpers::rust_pq_result_status(desc) == PGRES_COMMAND_OK;
+    if !described {
+        unsafe {
+            crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, desc);
+        }
+    }
+    let deallocated =
+        unsafe { deallocate_descriptor(conn, exec_conn, CStr::from_ptr(descriptor_name.as_ptr())) };
+    if !described || !deallocated {
+        crate::libpq_helpers::rust_pq_clear(desc);
+        drop(conn_guard);
+        if !deallocated {
+            crate::pg_client::rust_pool_check_health(exec_conn.cast());
+        }
+        return false;
+    }
+    drop(conn_guard);
+    unsafe {
+        let _guard = PgStmt::lock_mutex(pg_stmt);
+        let s = &mut *pg_stmt;
+        if s.descriptor.is_null() {
+            s.descriptor = desc;
+            s.num_cols = crate::libpq_helpers::rust_pq_nfields(desc);
+            s.ensure_column_capacity(s.num_cols as usize);
+        } else {
+            crate::libpq_helpers::rust_pq_clear(desc);
+        }
+    }
+    true
 }

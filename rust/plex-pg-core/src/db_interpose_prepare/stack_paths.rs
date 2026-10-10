@@ -117,6 +117,9 @@ pub(super) unsafe fn maybe_handle_ondeck_low_stack(
                         );
                     }
                     sql_translation_free(&mut trans as *mut SqlTranslation);
+                    if !describe_before_publication(pg_stmt, pp_stmt) {
+                        return Some(SQLITE_ERROR);
+                    }
                     pg_register_stmt(*pp_stmt, pg_stmt);
                 }
             }
@@ -214,6 +217,9 @@ pub(super) unsafe fn maybe_handle_low_stack_prepare_path(
                     apply_prepared_stmt_settings(pg_stmt);
                 }
                 sql_translation_free(&mut trans as *mut SqlTranslation);
+                if !describe_before_publication(pg_stmt, pp_stmt) {
+                    return Some(SQLITE_ERROR);
+                }
                 pg_register_stmt(*pp_stmt, pg_stmt);
             }
         }

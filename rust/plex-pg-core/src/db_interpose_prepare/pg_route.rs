@@ -176,10 +176,10 @@ pub(super) unsafe fn maybe_register_pg_stmt(
     is_write: bool,
     pre_trans: &mut SqlTranslation,
     have_pre_trans: &mut bool,
-) {
+) -> bool {
     if !should_route_via_pg(pg_conn, is_read, is_write) || pp_stmt.is_null() || (*pp_stmt).is_null()
     {
-        return;
+        return true;
     }
 
     // SQLite engine config (fts3_tokenizer, icu_load_collation, load_extension)
@@ -187,19 +187,19 @@ pub(super) unsafe fn maybe_register_pg_stmt(
     // fall through to orig_step on the real SQLite statement.
     let sql_str = crate::db_interpose_helpers::cstr_to_str_or_empty(z_sql);
     if crate::pg_config::is_sqlite_passthrough_str(sql_str) {
-        return;
+        return true;
     }
 
     let pg_stmt = pg_stmt_create(pg_conn, z_sql, *pp_stmt);
     if pg_stmt.is_null() {
-        return;
+        return true;
     }
     let s = &mut *pg_stmt;
 
     if crate::pg_config::pg_config_should_skip_sql(z_sql) != 0 {
         s.is_pg = 3;
         pg_register_stmt(*pp_stmt, pg_stmt);
-        return;
+        return true;
     }
 
     s.is_pg = if is_write { 1 } else { 2 };
@@ -239,5 +239,27 @@ pub(super) unsafe fn maybe_register_pg_stmt(
     }
 
     sql_translation_free(&mut trans as *mut SqlTranslation);
+    if !describe_before_publication(pg_stmt, pp_stmt) {
+        return false;
+    }
     pg_register_stmt(*pp_stmt, pg_stmt);
+    true
+}
+
+/// Every PG prepare path must enforce this before publishing a row producer.
+pub(super) unsafe fn describe_before_publication(
+    pg_stmt: *mut PgStmt,
+    pp_stmt: *mut *mut sqlite3_stmt,
+) -> bool {
+    let s = &*pg_stmt;
+    let row_producing = s.is_pg == 2 || contains_icase_ptr(s.sql, "RETURNING");
+    if !row_producing || crate::db_interpose_column::ensure_pg_result_for_metadata(pg_stmt) {
+        return true;
+    }
+    // A newly created unpublished statement owns one reference. Release that
+    // ownership through the normal refcount path so all allocations are freed.
+    crate::pg_statement::rust_stmt_unref(pg_stmt);
+    crate::db_interpose_stmt_lifecycle::rust_my_sqlite3_finalize(*pp_stmt);
+    *pp_stmt = ptr::null_mut();
+    false
 }
