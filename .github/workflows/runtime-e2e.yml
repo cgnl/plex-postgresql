@@ -154,7 +154,7 @@ jobs:
             -v "$GITHUB_WORKSPACE":/src -w /src \
             "$ALPINE_BUILDER_IMAGE" sh -c '
               set -eu
-              apk add --no-cache bash build-base postgresql-dev sqlite-dev sqlite-libs linux-headers curl
+              apk add --no-cache bash build-base postgresql-dev postgresql14-client sqlite-dev sqlite-libs linux-headers curl
               export CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup RUSTUP_TOOLCHAIN=stable
               export PATH="/usr/local/cargo/bin:$PATH"
               curl --proto=https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal

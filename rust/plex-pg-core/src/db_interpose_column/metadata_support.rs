@@ -95,65 +95,80 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         thread_conn
     };
     let ec = unsafe { &mut *exec_conn };
-    let conn_guard = unsafe { PthreadMutexGuard::lock(&mut ec.mutex as *mut _) };
-    if ec.conn.is_null() || ec.streaming_active.load(Ordering::SeqCst) != 0 {
-        return false;
-    }
-    // Use a private, unique name so metadata discovery cannot replace libpq's
-    // connection-scoped unnamed statement or collide with the execution cache.
-    // Preparing/describing evaluates no expressions and performs no writes.
-    let descriptor_name = CString::new(format!(
-        "plex_descriptor_{}_{}",
-        std::process::id(),
-        DESCRIPTOR_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ))
-    .expect("generated descriptor name cannot contain NUL");
-    crate::libpq_helpers::rust_pq_set_nonblocking(ec.conn, 0);
-    let prep = crate::libpq_helpers::rust_pq_prepare(
-        ec.conn,
-        descriptor_name.as_ptr(),
-        sql.as_ptr(),
-        param_count,
-        ptr::null(),
-    );
-    let prepared = crate::libpq_helpers::rust_pq_result_status(prep) == PGRES_COMMAND_OK;
-    if !prepared {
-        unsafe {
-            crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, prep);
+    // A backend lost since the pool handed out this connection only surfaces
+    // once the first round trips fail. Mirror the step retry contract: let the
+    // pool reset the session and run the pure-metadata round once more, so a
+    // recovered PostgreSQL keeps prepare succeeding instead of failing it.
+    for attempt in 0..2 {
+        let conn_guard = unsafe { PthreadMutexGuard::lock(&mut ec.mutex as *mut _) };
+        if ec.conn.is_null() || ec.streaming_active.load(Ordering::SeqCst) != 0 {
+            return false;
         }
-    }
-    crate::libpq_helpers::rust_pq_clear(prep);
-    if !prepared {
-        return false;
-    }
-    let desc = crate::libpq_helpers::rust_pq_describe_prepared(ec.conn, descriptor_name.as_ptr());
-    let described = crate::libpq_helpers::rust_pq_result_status(desc) == PGRES_COMMAND_OK;
-    if !described {
-        unsafe {
-            crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, desc);
+        // Use a private, unique name so metadata discovery cannot replace libpq's
+        // connection-scoped unnamed statement or collide with the execution cache.
+        // Preparing/describing evaluates no expressions and performs no writes.
+        let descriptor_name = CString::new(format!(
+            "plex_descriptor_{}_{}",
+            std::process::id(),
+            DESCRIPTOR_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+        .expect("generated descriptor name cannot contain NUL");
+        crate::libpq_helpers::rust_pq_set_nonblocking(ec.conn, 0);
+        let prep = crate::libpq_helpers::rust_pq_prepare(
+            ec.conn,
+            descriptor_name.as_ptr(),
+            sql.as_ptr(),
+            param_count,
+            ptr::null(),
+        );
+        let mut round_ok = crate::libpq_helpers::rust_pq_result_status(prep) == PGRES_COMMAND_OK;
+        if !round_ok {
+            unsafe {
+                crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, prep);
+            }
         }
-    }
-    let deallocated =
-        unsafe { deallocate_descriptor(conn, exec_conn, CStr::from_ptr(descriptor_name.as_ptr())) };
-    if !described || !deallocated {
+        crate::libpq_helpers::rust_pq_clear(prep);
+        let mut desc = ptr::null_mut();
+        if round_ok {
+            desc =
+                crate::libpq_helpers::rust_pq_describe_prepared(ec.conn, descriptor_name.as_ptr());
+            round_ok = crate::libpq_helpers::rust_pq_result_status(desc) == PGRES_COMMAND_OK;
+            if !round_ok {
+                unsafe {
+                    crate::db_interpose_exec::pg_path::record_pg_result_error(
+                        conn, exec_conn, desc,
+                    );
+                }
+            }
+            let deallocated = unsafe {
+                deallocate_descriptor(conn, exec_conn, CStr::from_ptr(descriptor_name.as_ptr()))
+            };
+            round_ok = round_ok && deallocated;
+        }
+        if round_ok {
+            drop(conn_guard);
+            unsafe {
+                let _guard = PgStmt::lock_mutex(pg_stmt);
+                let s = &mut *pg_stmt;
+                if s.descriptor.is_null() {
+                    s.descriptor = desc;
+                    s.num_cols = crate::libpq_helpers::rust_pq_nfields(desc);
+                    s.ensure_column_capacity(s.num_cols as usize);
+                } else {
+                    crate::libpq_helpers::rust_pq_clear(desc);
+                }
+            }
+            return true;
+        }
         crate::libpq_helpers::rust_pq_clear(desc);
         drop(conn_guard);
-        if !deallocated {
-            crate::pg_client::rust_pool_check_health(exec_conn.cast());
+        // No-op while the session is healthy; resets a broken one and reports
+        // whether recovery was attempted, gating the single retry.
+        let recovered = crate::pg_client::rust_pool_check_health(exec_conn.cast());
+        if attempt == 0 && recovered != 0 {
+            continue;
         }
         return false;
     }
-    drop(conn_guard);
-    unsafe {
-        let _guard = PgStmt::lock_mutex(pg_stmt);
-        let s = &mut *pg_stmt;
-        if s.descriptor.is_null() {
-            s.descriptor = desc;
-            s.num_cols = crate::libpq_helpers::rust_pq_nfields(desc);
-            s.ensure_column_capacity(s.num_cols as usize);
-        } else {
-            crate::libpq_helpers::rust_pq_clear(desc);
-        }
-    }
-    true
+    false
 }
