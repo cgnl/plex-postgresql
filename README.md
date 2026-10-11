@@ -8,20 +8,19 @@ A small shim library that catches Plex SQLite calls and sends them to PostgreSQL
 
 ## Current validation status
 
-**v1.3.22 is a regular source release.** PRs #31, #32 and #33 are merged.
+**v1.3.22 is a regular release.** Linux AMD64/ARM64 and macOS ARM64 downloads
+are available. PRs #31, #32 and #33 are merged.
 All four native ZIP checks and all eight 100-restart lanes passed on `5dd3b51`.
-The 5h50 soak remains pending. New prebuilt release assets and Docker production
-promotion require their own completed certification. Native PlexInc/arm64/PG18 passes genuine SQLite import,
+The 5h50 load test completed, but the subsequent PostgreSQL restart check
+returned HTTP 500. This recovery issue is being investigated.
+Native PlexInc/arm64/PG18 passes genuine SQLite import,
 normal restart, both search routes, export and restoration into vanilla Plex,
 with watched state, server/media identity and source hashes preserved. The two
 observed search HTTP 500 causes have regressions and PostgreSQL 15/18 result
 parity. Browser playback and server-side transcoding remain unverified.
 
-The published v1.3.21 Linux ZIP includes both shim architectures but only ARM64
-`libpq`; it is not a complete native AMD64 installation bundle. The next bundle
-packages matched dependencies per architecture and validates its installation
-on the native runners. Docker production promotion remains gated on all native
-workload and ZIP-installation evidence.
+The v1.3.22 Linux ZIP includes matching dependencies for both architectures,
+fixing the incomplete AMD64 dependency set in v1.3.21.
 
 The acceptance matrix is **LinuxServer and PlexInc × native amd64 and arm64 ×
 PostgreSQL 15 and 18** (eight combinations), with 100 restart cycles per lane
@@ -32,8 +31,8 @@ See [release gates and known gaps](docs/release-readiness.md) and
 ## Latest published release: [v1.3.22](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.22)
 
 Published on 11 October 2026. Includes runtime, migration, startup ordering and
-compatibility automation fixes. Download the source archives or build the
-container from the tag. See [the changelog](CHANGELOG.md).
+compatibility automation fixes. Download the Linux/macOS bundles or use the
+LinuxServer/PlexInc Docker images. See [the changelog](CHANGELOG.md).
 
 ### Runtime architecture introduced in v1.2.0
 
@@ -45,7 +44,7 @@ container from the tag. See [the changelog](CHANGELOG.md).
 - 🔧 **Stack safety:** heap-allocated thread-local buffers for Plex's 544K worker thread stacks
 - ✅ **712 tests passing** across unit, integration, and compatibility suites
 
-[📥 Download v1.3.22 source](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.22) | [📋 Full Changelog](CHANGELOG.md)
+[📥 Download v1.3.22](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.22) | [📋 Full Changelog](CHANGELOG.md)
 
 New automatic releases require a certificate for the exact tested source and
 Linux ZIP/image bytes. Tag pushes no longer independently publish assets.

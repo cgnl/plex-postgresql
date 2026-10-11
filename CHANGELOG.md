@@ -11,36 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.3.22] - 2026-10-11
 
 ### Added
-- Scheduled compatibility discovery for public Plex releases and up to two validated historical profiles, with separate draft codefix PRs and explicit CI dispatch.
-- Authenticated native certification and publication workflows that reuse exact tested Linux payloads, ZIPs and image digests.
-- Native ZIP installation gates for both image variants and CPU architectures, plus four concurrent real H264/audio clients during scans and metadata/watch updates.
+- Automatic compatibility checks for new Plex versions and up to two older versions.
+- Separate pull requests for proposed compatibility fixes, with their own tests.
+- Installation tests for Linux downloads on AMD64 and ARM64.
+- Movie and TV playback tests with four simultaneous clients.
 
 ### Fixed
-- Order Linuxserver PostgreSQL initialization after upstream temporary-directory cleanup, preventing migration SQL from disappearing during restart.
-- Export only release libraries instead of the complete compiler filesystem in native ZIP jobs.
-- Retain existing SQLite export files in durable backups before replacement, including exports confirmed with `--yes`.
-- Allow one hour by default for private migration snapshots, with a configurable upper bound of 24 hours for large libraries on slow storage.
-- Load Plex's libraries before shim dependencies consistently in Linux wrappers and container startup.
-- Test the native ZIP's packaged migration helpers against real SQLite library/blob files and an isolated PostgreSQL destination.
-- Obtain prepared-statement column descriptors through privately named PREPARE/DESCRIBE/DEALLOCATE rounds instead of executing statements for metadata, and refuse to publish row-producing statements without descriptors, preventing native Plex SIGSEGVs that read column metadata after PostgreSQL outage recovery.
+- Prevent Linuxserver startup cleanup from deleting migration files.
+- Fix crashes caused by expired threads and missing query column information.
+- Fix HTTP 500 errors in library search and tag ranking.
+- Allow migration into a newly initialized database containing only default accounts and preferences.
+- Restore missing defaults before Plex starts.
+- Keep existing SQLite exports as backups, including when using `--yes`.
+- Allow longer migration snapshots for large libraries and slow storage.
+- Preserve source databases, migration history, Boolean values and Unicode during import and export.
+- Fix UUID and query-buffer ownership, INSERT/REPLACE behavior and returned row IDs.
+- Preserve FTS prefix and phrase searches.
+- Include migration helpers and matching runtime libraries in Linux downloads and Docker images.
+- Use Plex's bundled libraries consistently during startup.
+- Reduce native build exports to the required libraries.
 
-- Replace connection-pool pthread liveness probes with lifecycle-owned logical tokens, preventing dereferences of expired thread descriptors during idle reclamation.
-- Preserve the SQLite MATCH boundary before following AND/OR filters and retain grouping for tag ranking by `count(*)`, fixing both observed native `/hubs/search` HTTP 500 errors.
-- Recognize exact repository bootstrap rows, including Administrator and preferences, before migration; reject modified defaults and preserve existing library data under destination locks.
-- Restore missing canonical defaults before fresh native startup on both container variants, preventing the LinuxServer default-account NULL dereference.
-- Wait for committed artwork URLs before strict media validation and give the native bundle fixture its own temporary directory.
-- Isolate native thread/request state, retain bind-buffer ownership correctly, and validate the exact server UUID preference.
-- Preserve ordinary INSERT semantics, genuine unique constraints, atomic single-row REPLACE behavior and signed last-insert rowids.
-- Preserve Unicode, prepared FTS prefix terms and same-field phrase matching.
-- Import from private SQLite snapshots, retain source hashes, native Boolean-affinity values and the source migration history, and apply startup schema upgrades atomically.
-- Require a genuine matching companion database template for native export, preserving its full Plex schema and non-blob contents while replacing current blob data.
-- Include migration helpers and trusted schema/seed files in Docker images and release bundles.
-- Package Linux runtime dependencies per architecture and validate their Plex loader resolution before installation changes.
-
-### Validation and distribution
-- Publish as a regular source release, not a prerelease. GitHub source archives contain the merged changes; new prebuilt binaries and Docker production promotion remain gated on their own certification.
-- All four native ZIP installation checks and all eight native 100-restart lanes passed on `5dd3b51`; the eight 350-minute soak lanes are still running at publication time.
-- Eighty Python regression tests and 34 PostgreSQL 15/18 migration checks pass. Automatic code generation still requires an API key; automatic publication requires genuine trust bootstrap.
+### Known issue
+- A check after the 5h50 load test still returns HTTP 500 when PostgreSQL restarts. The failure is being investigated.
 
 ## [1.3.21] - 2026-10-09
 
