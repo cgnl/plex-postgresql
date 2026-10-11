@@ -25,7 +25,7 @@ pub(crate) const POOL_SIZE_DEFAULT: usize = 50;
 pub(crate) struct PoolSlot {
     /// Opaque pointer to C-allocated pg_connection_t (null = no connection)
     pub conn: AtomicPtr<c_void>,
-    /// Thread ID of owner (0 = unowned)
+    /// Logical TLS owner token (0 = unowned, high bit = retired owner)
     pub owner_thread: AtomicU64,
     /// Unix timestamp of last use
     pub last_used: AtomicI64,
@@ -82,11 +82,42 @@ impl PoolSlot {
             .is_ok()
     }
 
-    /// CAS: READY → FREE (zombie reclaim for dead threads).
-    pub fn try_reclaim_zombie(&self) -> bool {
-        self.state
-            .compare_exchange(SLOT_READY, SLOT_FREE, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
+    /// Reserve precisely the observed retired owner before touching its connection.
+    pub fn try_reserve_zombie(&self, dead_owner: u64) -> bool {
+        use super::threading::{owner_is_dead, DEAD_BIT};
+        if !owner_is_dead(dead_owner)
+            || self
+                .owner_thread
+                .compare_exchange(dead_owner, DEAD_BIT, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        if self
+            .state
+            .compare_exchange(
+                SLOT_READY,
+                SLOT_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            let _ = self.owner_thread.compare_exchange(
+                DEAD_BIT,
+                dead_owner,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+            return false;
+        }
+        true
+    }
+
+    /// A streaming connection remains owned by its retired thread until drained.
+    pub fn restore_zombie(&self, dead_owner: u64) {
+        self.owner_thread.store(dead_owner, Ordering::Release);
+        self.state.store(SLOT_READY, Ordering::Release);
     }
 
     /// Set slot to READY (after successful connection creation).
@@ -145,6 +176,22 @@ impl PoolManager {
             global_metadata_id: AtomicI64::new(0),
             global_last_insert_rowid: AtomicI64::new(0),
             live_pool_conns: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// TLS teardown only touches initialized atomics: no locks, allocation or libpq.
+    pub fn retire_thread_owner(&self, token: u64) {
+        use super::threading::DEAD_BIT;
+        if token == 0 || token >= DEAD_BIT {
+            return;
+        }
+        for slot in &self.slots {
+            let _ = slot.owner_thread.compare_exchange(
+                token,
+                token | DEAD_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 

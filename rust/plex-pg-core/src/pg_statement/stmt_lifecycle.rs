@@ -144,6 +144,10 @@ pub fn rust_stmt_free(stmt_ptr: *mut PgStmt) {
         }
 
         clear_streaming_state(stmt_ptr, stmt, "pg_stmt_free");
+        if !stmt.descriptor.is_null() {
+            crate::libpq_helpers::rust_pq_clear(stmt.descriptor);
+            stmt.descriptor = std::ptr::null_mut();
+        }
 
         log_debug_lazy!(
             "pg_stmt_free: START stmt={:p} sql={:p} pg_sql={:p}",
@@ -299,7 +303,10 @@ pub fn rust_stmt_clear_result(stmt_ptr: *mut PgStmt) {
         stmt.metadata_only_result = 0;
         stmt.current_row = -1;
         stmt.num_rows = 0;
-        stmt.num_cols = 0;
+        // sqlite3_reset releases rows, not the prepared result descriptor.
+        if stmt.descriptor.is_null() {
+            stmt.num_cols = 0;
+        }
         stmt.write_executed = 0;
         stmt.read_done = 0;
 

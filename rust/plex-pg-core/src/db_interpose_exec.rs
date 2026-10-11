@@ -1,6 +1,7 @@
 use crate::byte_utils::{contains_bytes, contains_icase_bytes, starts_with_icase_bytes};
 pub(crate) mod pg_path;
-mod support;
+pub(crate) mod replace_guard;
+pub(crate) mod support;
 
 use crate::db_interpose_common::stderr_ptr;
 use crate::db_interpose_conn_utils::{
@@ -250,27 +251,50 @@ fn rust_my_sqlite3_exec_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::support::parse_positive_returning_rowid;
+    use super::support::parse_returning_rowid;
     use std::ffi::CString;
 
     #[test]
-    fn parse_positive_returning_rowid_accepts_positive_values() {
+    fn parse_returning_rowid_accepts_positive_values() {
         let value = CString::new("12345").unwrap();
-        assert_eq!(parse_positive_returning_rowid(value.as_ptr()), Some(12345));
+        assert_eq!(parse_returning_rowid(value.as_ptr()), Some(12345));
     }
 
     #[test]
-    fn parse_positive_returning_rowid_rejects_null_and_empty_values() {
+    fn parse_returning_rowid_rejects_null_and_empty_values() {
         let empty = CString::new("").unwrap();
-        assert_eq!(parse_positive_returning_rowid(std::ptr::null()), None);
-        assert_eq!(parse_positive_returning_rowid(empty.as_ptr()), None);
+        assert_eq!(parse_returning_rowid(std::ptr::null()), None);
+        assert_eq!(parse_returning_rowid(empty.as_ptr()), None);
     }
 
     #[test]
-    fn parse_positive_returning_rowid_rejects_zero_and_negative_values() {
+    fn parse_returning_rowid_accepts_zero_and_negative_values() {
         let zero = CString::new("0").unwrap();
         let negative = CString::new("-9").unwrap();
-        assert_eq!(parse_positive_returning_rowid(zero.as_ptr()), None);
-        assert_eq!(parse_positive_returning_rowid(negative.as_ptr()), None);
+        assert_eq!(parse_returning_rowid(zero.as_ptr()), Some(0));
+        assert_eq!(parse_returning_rowid(negative.as_ptr()), Some(-9));
+    }
+    #[test]
+    fn parse_returning_rowid_rejects_invalid_and_out_of_range_values() {
+        for value in [
+            "NULL",
+            "invalid",
+            "1x",
+            "9223372036854775808",
+            "-9223372036854775809",
+        ] {
+            let value = CString::new(value).unwrap();
+            assert_eq!(parse_returning_rowid(value.as_ptr()), None);
+        }
+        let non_utf8 = [255_u8, 0];
+        assert_eq!(parse_returning_rowid(non_utf8.as_ptr().cast()), None);
+    }
+
+    #[test]
+    fn parse_returning_rowid_accepts_signed_boundaries() {
+        for rowid in [i64::MIN, i64::MAX] {
+            let value = CString::new(rowid.to_string()).unwrap();
+            assert_eq!(parse_returning_rowid(value.as_ptr()), Some(rowid));
+        }
     }
 }

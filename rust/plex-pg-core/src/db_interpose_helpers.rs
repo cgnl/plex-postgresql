@@ -52,7 +52,8 @@ pub(crate) use string_utils::cstr_to_str_or_empty;
 use string_utils::{
     contains_ascii_icase, cstr_to_str, find_ascii_icase, find_closing_paren, find_subslice,
     has_boundary, is_next_numeric_boundary, is_prev_numeric_boundary, normalize_ident_token,
-    push_capped, split_csv_simple, starts_with_icase, write_buf, write_i32_to_buf, write_i64_to_buf,
+    push_capped, split_csv_simple, starts_with_icase, write_buf, write_i32_to_buf,
+    write_i64_to_buf,
 };
 pub use type_cache::{
     rust_decltype_cache_insert, rust_decltype_cache_lookup, rust_decltype_cache_lookup_alias,
@@ -78,7 +79,7 @@ pub fn rust_decode_hex_bytes(
     if out_len < expected {
         return 0;
     }
-    let bytes = unsafe { std::slice::from_raw_parts(hex as *const u8, hex_len) };
+    let bytes = unsafe { std::slice::from_raw_parts(hex.cast::<u8>(), hex_len) };
 
     fn hex_val(b: u8) -> Option<u8> {
         match b {

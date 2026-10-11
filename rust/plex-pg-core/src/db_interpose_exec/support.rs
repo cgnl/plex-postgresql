@@ -7,7 +7,7 @@ pub(crate) fn malloc_cstring(value: &str) -> *mut c_char {
         if ptr.is_null() {
             return std::ptr::null_mut();
         }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
         *ptr.add(bytes.len()) = 0;
         ptr
     }
@@ -29,20 +29,11 @@ pub(crate) fn is_stale_prepared_stmt(res: *mut PGresult) -> bool {
     crate::pg_client::rust_is_stale_sqlstate(sqlstate) != 0
 }
 
-pub(crate) fn parse_positive_returning_rowid(id_str: *const c_char) -> Option<i64> {
+pub(crate) fn parse_returning_rowid(id_str: *const c_char) -> Option<i64> {
     if id_str.is_null() {
         return None;
     }
-    let bytes = unsafe { CStr::from_ptr(id_str).to_bytes() };
-    if bytes.is_empty() {
-        return None;
-    }
-    let rowid = crate::db_interpose_helpers::rust_pg_text_to_int64(id_str);
-    if rowid > 0 {
-        Some(rowid)
-    } else {
-        None
-    }
+    unsafe { CStr::from_ptr(id_str).to_str().ok()?.parse::<i64>().ok() }
 }
 
 pub(crate) fn orig_exec(

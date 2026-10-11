@@ -85,7 +85,7 @@ pub(super) fn write_i64_to_buf(out: *mut c_char, out_len: usize, val: i64) -> bo
         return false;
     }
     use std::io::Write;
-    let buf = unsafe { std::slice::from_raw_parts_mut(out as *mut u8, out_len) };
+    let buf = unsafe { std::slice::from_raw_parts_mut(out.cast::<u8>(), out_len) };
     let mut cursor = std::io::Cursor::new(buf);
     let _ = write!(cursor, "{}\0", val);
     true
@@ -96,7 +96,7 @@ pub(super) fn write_i32_to_buf(out: *mut c_char, out_len: usize, val: i32) -> bo
         return false;
     }
     use std::io::Write;
-    let buf = unsafe { std::slice::from_raw_parts_mut(out as *mut u8, out_len) };
+    let buf = unsafe { std::slice::from_raw_parts_mut(out.cast::<u8>(), out_len) };
     let mut cursor = std::io::Cursor::new(buf);
     let _ = write!(cursor, "{}\0", val);
     true
@@ -184,7 +184,7 @@ pub(super) fn write_buf(out: *mut c_char, out_len: usize, value: Option<&str>) {
     let bytes = value.as_bytes();
     let n = bytes.len().min(out_len - 1);
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, n);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast::<u8>(), n);
         *out.add(n) = 0;
     }
 }

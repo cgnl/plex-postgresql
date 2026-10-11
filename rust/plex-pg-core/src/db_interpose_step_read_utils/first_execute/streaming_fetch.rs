@@ -82,7 +82,7 @@ pub(super) unsafe fn streaming_fetch_result(
             crate::libpq_helpers::rust_pq_clear(final_null);
         }
         clear_streaming_state(s);
-        s.num_cols = 0;
+        // An empty result still has the prepared output columns.
         s.num_rows = 0;
         return finish_streaming_done(s, exec_conn_io, exec_conn, stmt_guard);
     }

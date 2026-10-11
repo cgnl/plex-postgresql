@@ -1136,7 +1136,11 @@ ALTER TABLE ONLY plex.metadata_items ALTER COLUMN metadata_type SET STATISTICS 2
 CREATE VIEW plex.fts4_metadata_titles AS
  SELECT metadata_items.id AS rowid,
     metadata_items.title,
-    metadata_items.title_fts
+    setweight(to_tsvector('simple', COALESCE(metadata_items.title, '')), 'A') ||
+        setweight(to_tsvector('simple', COALESCE(metadata_items.title_sort, '')), 'B') ||
+        setweight(to_tsvector('simple', COALESCE(metadata_items.original_title, '')), 'C') AS title_fts,
+    metadata_items.title_sort,
+    metadata_items.original_title
    FROM plex.metadata_items;
 
 
@@ -1147,7 +1151,11 @@ CREATE VIEW plex.fts4_metadata_titles AS
 CREATE VIEW plex.fts4_metadata_titles_icu AS
  SELECT metadata_items.id AS rowid,
     metadata_items.title,
-    metadata_items.title_fts
+    setweight(to_tsvector('simple', COALESCE(metadata_items.title, '')), 'A') ||
+        setweight(to_tsvector('simple', COALESCE(metadata_items.title_sort, '')), 'B') ||
+        setweight(to_tsvector('simple', COALESCE(metadata_items.original_title, '')), 'C') AS title_fts,
+    metadata_items.title_sort,
+    metadata_items.original_title
    FROM plex.metadata_items;
 
 
@@ -1180,7 +1188,8 @@ CREATE TABLE plex.tags (
 CREATE VIEW plex.fts4_tag_titles AS
  SELECT tags.id AS rowid,
     tags.tag AS title,
-    tags.search_vector AS title_fts
+    COALESCE(tags.search_vector, to_tsvector('simple', COALESCE(tags.tag, ''))) AS title_fts,
+    tags.tag
    FROM plex.tags;
 
 
@@ -1191,7 +1200,8 @@ CREATE VIEW plex.fts4_tag_titles AS
 CREATE VIEW plex.fts4_tag_titles_icu AS
  SELECT tags.id AS rowid,
     tags.tag AS title,
-    tags.search_vector AS title_fts
+    COALESCE(tags.search_vector, to_tsvector('simple', COALESCE(tags.tag, ''))) AS title_fts,
+    tags.tag
    FROM plex.tags;
 
 
@@ -3399,14 +3409,6 @@ ALTER TABLE ONLY plex.metadata_item_setting_markers
 
 
 --
--- Name: metadata_item_settings metadata_item_settings_account_guid_unique; Type: CONSTRAINT; Schema: plex; Owner: -
---
-
-ALTER TABLE ONLY plex.metadata_item_settings
-    ADD CONSTRAINT metadata_item_settings_account_guid_unique UNIQUE (account_id, guid);
-
-
---
 -- Name: metadata_item_settings metadata_item_settings_pkey; Type: CONSTRAINT; Schema: plex; Owner: -
 --
 
@@ -3535,14 +3537,6 @@ ALTER TABLE ONLY plex.sqlite_column_types
 
 
 --
--- Name: statistics_bandwidth statistics_bandwidth_account_id_device_id_timespan_at_lan_key; Type: CONSTRAINT; Schema: plex; Owner: -
---
-
-ALTER TABLE ONLY plex.statistics_bandwidth
-    ADD CONSTRAINT statistics_bandwidth_account_id_device_id_timespan_at_lan_key UNIQUE (account_id, device_id, timespan, at, lan);
-
-
---
 -- Name: statistics_bandwidth statistics_bandwidth_pkey; Type: CONSTRAINT; Schema: plex; Owner: -
 --
 
@@ -3639,6 +3633,15 @@ CREATE INDEX idx_blobs_linked ON plex.blobs USING btree (linked_type, linked_id)
 --
 
 CREATE UNIQUE INDEX idx_blobs_linked_type_id_blob_type ON plex.blobs USING btree (linked_type, linked_id, blob_type);
+
+-- Genuine unique indexes from Plex SQLite, including separately declared indexes.
+CREATE UNIQUE INDEX idx_play_queues_client_account_type ON plex.play_queues USING btree (client_identifier, account_id, metadata_type);
+CREATE UNIQUE INDEX idx_media_provider_resources_uuid ON plex.media_provider_resources USING btree (uuid);
+CREATE UNIQUE INDEX idx_media_grabs_uuid ON plex.media_grabs USING btree (uuid);
+CREATE UNIQUE INDEX idx_external_metadata_sources_uri ON plex.external_metadata_sources USING btree (uri);
+CREATE UNIQUE INDEX idx_blobs_linked_type_guid_blob_type ON plex.blobs USING btree (linked_type, linked_guid, blob_type);
+CREATE UNIQUE INDEX idx_metadata_agent_providers_identifier ON plex.metadata_agent_providers USING btree (identifier);
+CREATE UNIQUE INDEX idx_metadata_agent_provider_group_items_pair ON plex.metadata_agent_provider_group_items USING btree (metadata_agent_provider_group_id, metadata_agent_provider_id);
 
 
 --

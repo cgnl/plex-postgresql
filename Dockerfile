@@ -37,6 +37,7 @@ RUN --mount=type=cache,target=/usr/local/rustup,sharing=locked \
 # Copy source files
 COPY include/ include/
 COPY rust/ rust/
+COPY schema/ schema/
 COPY Makefile Makefile
 COPY VERSION VERSION
 COPY scripts/docker-build-shim.sh scripts/docker-build-shim.sh
@@ -95,10 +96,14 @@ COPY schema/plex_schema.sql /usr/local/lib/plex-postgresql/
 COPY schema/sqlite_schema.sql /usr/local/lib/plex-postgresql/
 COPY schema/sqlite_column_types.sql /usr/local/lib/plex-postgresql/
 COPY schema/pg_compat_functions.sql /usr/local/lib/plex-postgresql/
+COPY schema/sqlite_constraint_parity_upgrade.sql /usr/local/lib/plex-postgresql/
+COPY schema/fts_view_parity_upgrade.sql /usr/local/lib/plex-postgresql/
+COPY schema/seed_data.sql /usr/local/lib/plex-postgresql/
 COPY scripts/migrate_lib.sh /usr/local/lib/plex-postgresql/
 COPY scripts/migrate_table.py /usr/local/lib/plex-postgresql/
 COPY scripts/seed_shadow_table_from_pg.py /usr/local/lib/plex-postgresql/
 COPY scripts/doctor.sh /usr/local/lib/plex-postgresql/
+COPY scripts/export_pg_to_sqlite.py scripts/bootstrap-plex-codecs.py scripts/verify-bbb-playback.py /usr/local/lib/plex-postgresql/
 
 # Copy the initialization script for s6-overlay
 # This will run BEFORE Plex starts as part of the init sequence

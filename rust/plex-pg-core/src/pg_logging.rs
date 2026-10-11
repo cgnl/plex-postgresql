@@ -783,7 +783,7 @@ mod tests {
     fn format_timestamp_year_reasonable() {
         let ts = format_timestamp();
         let year: u32 = ts[1..5].parse().expect("year should be numeric");
-        assert!(year >= 2024 && year <= 2100, "year out of range: {}", year);
+        assert!((2024..=2100).contains(&year), "year out of range: {}", year);
     }
 
     // ── should_rotate ───────────────────────────────────────────────────────

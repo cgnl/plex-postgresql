@@ -27,6 +27,10 @@ pub(super) fn pool_get_connection_inner_excluding(
     db_path: *const c_char,
     exclude_conn: *const c_void,
 ) -> *mut c_void {
+    let current_thread = current_thread_id();
+    if current_thread == 0 {
+        return std::ptr::null_mut();
+    }
     let pm = pool();
     let selected_path = match resolve_selected_pool_path(pm, db_path, exclude_conn) {
         Some(path) => path,
@@ -35,7 +39,6 @@ pub(super) fn pool_get_connection_inner_excluding(
     let selected_path_c =
         CString::new(selected_path.clone()).expect("selected library path cannot contain NUL");
     let db_path = selected_path_c.as_ptr();
-    let current_thread = current_thread_id();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

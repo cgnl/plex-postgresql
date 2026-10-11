@@ -121,14 +121,12 @@ init_schema() {
                 new_count=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ') || return 1
                 echo "Schema loaded successfully! $new_count tables created."
 
-                # NOTE: schema_migrations rows from the dump are kept intact.
-                # The shim intercepts INSERT INTO schema_migrations and adds
-                # ON CONFLICT DO NOTHING, so duplicate versions are silently ignored.
-                # This prevents Plex from re-running all 446 migrations from scratch,
-                # which causes DDL/schema divergence issues with the SQLite shadow DB.
+                # Keep the dump's history for a fresh PostgreSQL bootstrap.
+                # A source import replaces it atomically with the native library's
+                # actual migration rows before synchronizing the SQLite shadows.
                 local migration_count
                 migration_count=$(migration_psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ') || return 1
-                echo "schema_migrations has $migration_count entries (kept from dump, shim handles duplicates)"
+                echo "schema_migrations has $migration_count entries (bootstrap history; source import replaces it)"
             else
                 echo "ERROR: Schema load failed" >&2
                 return 1
@@ -141,6 +139,8 @@ init_schema() {
     fi
 
     validate_pg_schema_file "$schema_file" || return 1
+    apply_sqlite_schema_parity_upgrades "$SHIM_DIR/sqlite_constraint_parity_upgrade.sql" \
+        "$SHIM_DIR/fts_view_parity_upgrade.sql" || return 1
 
     # Ensure PostgreSQL compatibility helper functions exist.
     if [ -f "$compat_file" ]; then
@@ -447,6 +447,9 @@ if [ -n "$PLEX_PG_HOST" ]; then
     protect_shadow_destinations "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
     wait_for_postgres
     init_schema
+    if [[ ! -f "$SQLITE_DB" ]]; then
+        seed_fresh_pg_defaults
+    fi
 
     # Run migration if source SQLite DB exists (mounted via -v)
     if [[ -f "$MIGRATE_LIB" ]] && [[ -f "$SQLITE_DB" ]]; then

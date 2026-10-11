@@ -17,8 +17,8 @@ pub extern "C" fn rust_step_write_log_debug_context(
             && (contains_icase_bytes(cstr_bytes(stmt.sql), b"devices")
                 || contains_icase_bytes(cstr_bytes(stmt.sql), b"library_sections"))
             || !stmt.pg_sql.is_null()
-            && (contains_icase_bytes(cstr_bytes(stmt.pg_sql), b"devices")
-                || contains_icase_bytes(cstr_bytes(stmt.pg_sql), b"library_sections"));
+                && (contains_icase_bytes(cstr_bytes(stmt.pg_sql), b"devices")
+                    || contains_icase_bytes(cstr_bytes(stmt.pg_sql), b"library_sections"));
         if has_match {
             log_debug_lazy!(
                 "STEP WRITE devices/library_sections: param_count={} is_pg={}",

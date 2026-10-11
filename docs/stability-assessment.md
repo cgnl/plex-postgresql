@@ -97,6 +97,23 @@ charset assembly. Docker build/probe export checks reject its reintroduction.
 The faulting native instruction does not by itself prove that this wrapper was
 the cause: the candidate must still pass actual startup/workload tests.
 
+A later concurrent-workload core now identifies a concrete pool fault on
+LinuxServer amd64/PostgreSQL 15. The matched candidate's musl `pthread_kill`
+called its lock routine on an unmapped retained thread descriptor, reached
+from `reclaim_zombies_and_reap` during column metadata lookup. The actual PMS
+exited with signal 11 and zero observed OOM counters. The
+[retained evidence](evidence/native-pool-owner-crash-20261010.json) records the
+candidate digest, core hash and independently recovered call sites.
+
+Pool ownership now uses unique logical TLS tokens, atomic exit retirement and
+exact-owner reclamation instead of calling pthread functions on retained
+handles. Live owners and active streams remain protected; abandoned transaction
+cleanup stays in the existing connection reuse path. Calling `pthread_kill`
+after a thread ID's lifetime ends is undefined and can itself fault, as the
+[Linux pthread documentation](https://man7.org/linux/man-pages/man3/pthread_kill.3.html)
+explains. This fixes the identified ownership mechanism; the new native matrix
+and full 5h50 workload still determine runtime certification.
+
 Native startup also reported a VACUUM step failure on the shadow SQLite path.
 The cached/unregistered-statement route did not honor the existing maintenance
 no-op policy; it now returns DONE for those statements after checking SQLite

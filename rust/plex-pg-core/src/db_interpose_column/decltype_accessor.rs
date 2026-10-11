@@ -14,7 +14,10 @@ fn passthrough_decltype(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const c_char 
 /// SAFETY: Must be called while stmt mutex is held. Does NOT log to avoid
 /// deadlock with the LOGGER mutex.
 fn no_result_decltype(pg_stmt: &mut PgStmt, idx: c_int) -> Option<*const c_char> {
-    if pg_stmt.result.is_null() || idx < 0 || idx >= pg_stmt.num_cols {
+    if (pg_stmt.descriptor.is_null() && pg_stmt.result.is_null())
+        || idx < 0
+        || idx >= pg_stmt.num_cols
+    {
         return Some(text_decltype());
     }
     None
@@ -63,7 +66,11 @@ unsafe fn resolve_special_case_decltype(
     col_name: *const c_char,
 ) -> Option<*const c_char> {
     let table_oid = crate::db_interpose_helpers::rust_pg_result_col_table_oid(
-        helpers_result_ptr(pg_stmt.result),
+        helpers_result_ptr(if pg_stmt.descriptor.is_null() {
+            pg_stmt.result
+        } else {
+            pg_stmt.descriptor
+        }),
         idx,
     );
     let special_case =
@@ -94,12 +101,6 @@ pub(super) fn column_decltype_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *co
 
     let pg_stmt = unsafe { &mut *raw_pg_stmt };
 
-    // Call ensure_metadata_result BEFORE acquiring stmt mutex to avoid
-    // ABBA deadlock (stmt mutex -> conn mutex).
-    if pg_stmt.result.is_null() && pg_stmt.cached_result.is_null() && !pg_stmt.pg_sql.is_null() {
-        ensure_pg_result_for_metadata(raw_pg_stmt);
-    }
-
     // Hold mutex only for data reads — no logging inside this block
     // to avoid ABBA deadlock between stmt mutex and LOGGER mutex.
     let _guard = unsafe { PgStmt::lock_mutex(raw_pg_stmt) };
@@ -108,8 +109,14 @@ pub(super) fn column_decltype_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *co
         return result;
     }
 
-    let col_name =
-        crate::db_interpose_helpers::rust_pg_result_col_name(helpers_result_ptr(pg_stmt.result), idx);
+    let col_name = crate::db_interpose_helpers::rust_pg_result_col_name(
+        helpers_result_ptr(if pg_stmt.descriptor.is_null() {
+            pg_stmt.result
+        } else {
+            pg_stmt.descriptor
+        }),
+        idx,
+    );
 
     let cached_type = unsafe { lookup_cached_decltype(pg_stmt, idx, col_name) };
     if !cached_type.is_null() {
@@ -117,7 +124,11 @@ pub(super) fn column_decltype_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *co
     }
 
     let oid = crate::db_interpose_helpers::rust_pg_result_col_oid(
-        helpers_result_ptr(pg_stmt.result),
+        helpers_result_ptr(if pg_stmt.descriptor.is_null() {
+            pg_stmt.result
+        } else {
+            pg_stmt.descriptor
+        }),
         idx,
     );
 

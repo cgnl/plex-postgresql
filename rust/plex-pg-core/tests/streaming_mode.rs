@@ -239,6 +239,13 @@ fn sim_step_first(stmt: &mut SimStmt, conn: &mut SimConn) -> i32 {
 fn streaming_transitions_single_rows() {
     let mut conn = SimConn::new();
     conn.queue_single_rows(3, 2);
+    assert_eq!(
+        conn.results
+            .iter()
+            .map(|result| result.num_rows)
+            .collect::<Vec<_>>(),
+        [1, 1, 1, 0]
+    );
     let mut stmt = SimStmt::new();
 
     let rc = sim_step_first(&mut stmt, &mut conn);
@@ -318,4 +325,31 @@ fn streaming_connection_exclusive_lifecycle() {
     let rc2 = sim_step_streaming(&mut stmt, &mut conn);
     assert_eq!(rc2, SIM_SQLITE_DONE);
     assert!(!conn.in_use_by_streaming);
+}
+
+#[test]
+fn streaming_command_result_releases_connection_and_result() {
+    for first_step in [true, false] {
+        let mut conn = SimConn::new();
+        conn.single_row_mode = true;
+        conn.in_use_by_streaming = !first_step;
+        conn.results.push(SimResult {
+            status: SimStatus::CommandOk,
+            num_rows: 0,
+            num_cols: 0,
+            freed: false,
+        });
+        let mut stmt = SimStmt::new();
+        stmt.streaming_mode = !first_step;
+        let rc = if first_step {
+            sim_step_first(&mut stmt, &mut conn)
+        } else {
+            sim_step_streaming(&mut stmt, &mut conn)
+        };
+        assert_eq!(rc, SIM_SQLITE_DONE);
+        assert!(conn.results[0].freed);
+        assert!(!conn.in_use_by_streaming);
+        assert!(!stmt.streaming_mode);
+        assert!(stmt.read_done);
+    }
 }

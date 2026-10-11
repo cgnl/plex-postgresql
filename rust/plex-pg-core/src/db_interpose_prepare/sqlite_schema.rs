@@ -84,7 +84,7 @@ pub(super) unsafe fn maybe_skip_alter_table_add(
             if len < table_name.len() {
                 ptr::copy_nonoverlapping(
                     table_start as *const u8,
-                    table_name.as_mut_ptr() as *mut u8,
+                    table_name.as_mut_ptr().cast::<u8>(),
                     len,
                 );
             }
@@ -123,7 +123,7 @@ pub(super) unsafe fn maybe_skip_alter_table_add(
             if len < column_name.len() {
                 ptr::copy_nonoverlapping(
                     add_ptr as *const u8,
-                    column_name.as_mut_ptr() as *mut u8,
+                    column_name.as_mut_ptr().cast::<u8>(),
                     len,
                 );
             }

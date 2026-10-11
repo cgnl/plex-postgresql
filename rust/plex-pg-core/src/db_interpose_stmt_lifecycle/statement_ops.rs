@@ -122,7 +122,7 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                         cached_ref.sql
                     };
                 }
-                
+
                 remember_finalized_stmt(p_stmt, final_sql, is_pg_value);
 
                 log_debug_lazy!(

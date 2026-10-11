@@ -383,7 +383,7 @@ mod tests {
         assert!(evicted.is_none());
         let hit = cache.lookup(123).unwrap();
         assert_eq!(hit.param_count, 2);
-        assert_eq!(hit.stmt_name[0] as u8, b'b');
+        assert_eq!(hit.stmt_name, name2);
     }
 
     #[test]

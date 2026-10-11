@@ -7,7 +7,7 @@ pub(super) fn malloc_cstring(value: &str) -> *mut c_char {
         if ptr.is_null() {
             return std::ptr::null_mut();
         }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
         *ptr.add(bytes.len()) = 0;
         ptr
     }

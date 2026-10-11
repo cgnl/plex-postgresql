@@ -22,7 +22,7 @@ mod support;
 mod wrappers;
 
 use internal_flow::prepare_v2_internal_impl;
-use pg_route::{maybe_register_pg_stmt, should_use_dummy_shadow};
+use pg_route::{describe_before_publication, maybe_register_pg_stmt, should_use_dummy_shadow};
 use pg_stmt_setup::{apply_prepared_stmt_settings, copy_param_names};
 use sqlite_path::{prepare_dummy_shadow_stmt, prepare_real_sqlite_stmt};
 use sqlite_schema::maybe_skip_alter_table_add;

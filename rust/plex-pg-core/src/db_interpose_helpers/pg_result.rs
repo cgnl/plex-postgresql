@@ -77,7 +77,7 @@ pub fn rust_column_text_transform(
         return 0;
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(source_value as *const u8, source_len) };
+    let bytes = unsafe { std::slice::from_raw_parts(source_value.cast::<u8>(), source_len) };
     if std::str::from_utf8(bytes).is_err() {
         unsafe {
             *out = 0;
@@ -93,7 +93,7 @@ pub fn rust_column_text_transform(
     if let Some(rewritten) = rewrite_server_library_uri_bytes(bytes, out_cap) {
         let n = rewritten.len().min(out_cap);
         unsafe {
-            std::ptr::copy_nonoverlapping(rewritten.as_ptr(), out as *mut u8, n);
+            std::ptr::copy_nonoverlapping(rewritten.as_ptr(), out.cast::<u8>(), n);
             *out.add(n) = 0;
         }
         return 1;
@@ -127,7 +127,7 @@ pub fn rust_pg_result_text_copy(
     let len_usize = len as usize;
     let copy_len = len_usize.min(out_len.saturating_sub(1));
     unsafe {
-        std::ptr::copy_nonoverlapping(val_ptr as *const u8, out as *mut u8, copy_len);
+        std::ptr::copy_nonoverlapping(val_ptr.cast::<u8>(), out.cast::<u8>(), copy_len);
         *out.add(copy_len) = 0;
     }
     len
@@ -158,7 +158,7 @@ pub fn rust_pg_result_blob_copy(
     let len_usize = len as usize;
     let copy_len = len_usize.min(out_len);
     unsafe {
-        std::ptr::copy_nonoverlapping(val_ptr as *const u8, out, copy_len);
+        std::ptr::copy_nonoverlapping(val_ptr.cast::<u8>(), out, copy_len);
     }
     copy_len as c_int
 }
@@ -314,7 +314,7 @@ pub fn rust_pg_result_text_transform_copy(
     if !preview.is_null() && preview_len > 0 {
         let copy_len = len_usize.min(preview_len.saturating_sub(1));
         unsafe {
-            std::ptr::copy_nonoverlapping(val_ptr as *const u8, preview as *mut u8, copy_len);
+            std::ptr::copy_nonoverlapping(val_ptr.cast::<u8>(), preview.cast::<u8>(), copy_len);
             *preview.add(copy_len) = 0;
         }
     }
@@ -327,7 +327,7 @@ pub fn rust_pg_result_text_transform_copy(
 
     let copy_len = len_usize.min(out_len.saturating_sub(1));
     unsafe {
-        std::ptr::copy_nonoverlapping(val_ptr as *const u8, out as *mut u8, copy_len);
+        std::ptr::copy_nonoverlapping(val_ptr.cast::<u8>(), out.cast::<u8>(), copy_len);
         *out.add(copy_len) = 0;
     }
     0
@@ -472,10 +472,10 @@ pub fn rust_pg_decode_bytea(
     }
 
     let len_usize = len as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(val_ptr as *const u8, len_usize) };
+    let bytes = unsafe { std::slice::from_raw_parts(val_ptr.cast::<u8>(), len_usize) };
     if len_usize < 2 || bytes[0] != b'\\' || bytes[1] != b'x' {
         unsafe {
-            *ptr_out = val_ptr as *mut u8;
+            *ptr_out = val_ptr.cast_mut().cast::<u8>();
             *len_out = len;
             *is_hex_out = 0;
         }
@@ -657,7 +657,7 @@ pub fn rust_get_table_from_pgresult(
                 }
                 unsafe {
                     if len_usize > 0 {
-                        std::ptr::copy_nonoverlapping(val_ptr as *const u8, buf, len_usize);
+                        std::ptr::copy_nonoverlapping(val_ptr.cast::<u8>(), buf, len_usize);
                     }
                     *buf.add(len_usize) = 0;
                     *rows_ptr.add(idx) = buf as *mut c_char;
