@@ -1,4 +1,4 @@
-name: Probe Docker Candidates (Promotion Blocked)
+name: Native Plex Acceptance Matrix
 
 on:
   push:
@@ -51,30 +51,74 @@ jobs:
           path: evidence/upstream-candidate.json
           if-no-files-found: error
 
-  runtime-e2e:
-    name: Require the real interpose runtime E2E driver
+  media-fixtures:
+    name: Prepare pinned real media once
     needs: resolve
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
-    services:
-      postgres:
-        image: ${{ needs.resolve.outputs.postgres_image }}
-        env:
-          POSTGRES_USER: runtime_e2e_admin
-          POSTGRES_PASSWORD: runtime_e2e_fixture_password
-          POSTGRES_DB: runtime_e2e_admin
-        ports:
-          - 5432/tcp
-        options: >-
-          --health-cmd "pg_isready -U runtime_e2e_admin -d runtime_e2e_admin"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           persist-credentials: false
+      - name: Fetch and verify immutable movie and TV fixtures
+        run: python3 scripts/prepare-media-fixtures.py media-fixture-cache
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinned-real-media
+          path: media-fixture-cache
+          compression-level: 0
+          if-no-files-found: error
+
+  runtime-e2e:
+    name: Require the real interpose runtime E2E driver
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Use an isolated Docker client configuration
+        run: |
+          set -eu
+          docker_config=$(mktemp -d "$RUNNER_TEMP/plex-docker-config.XXXXXX")
+          printf '{}\n' > "$docker_config/config.json"
+          chmod 700 "$docker_config"
+          chmod 600 "$docker_config/config.json"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - name: Start the owned PostgreSQL fixture
+        id: postgres
+        env:
+          POSTGRES_IMAGE: ${{ needs.resolve.outputs.postgres_image }}
+        run: |
+          set -eu
+          ownership="runtime-e2e-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          container_file=$(mktemp "$RUNNER_TEMP/runtime-e2e-postgres.XXXXXX")
+          echo "RUNTIME_E2E_CONTAINER_FILE=$container_file" >> "$GITHUB_ENV"
+          docker pull "$POSTGRES_IMAGE"
+          container=$(docker create \
+            --label plex-postgresql.test=runtime-e2e \
+            --label "plex-postgresql.run=$ownership" \
+            -e POSTGRES_USER=runtime_e2e_admin \
+            -e POSTGRES_PASSWORD=runtime_e2e_fixture_password \
+            -e POSTGRES_DB=runtime_e2e_admin \
+            -p 127.0.0.1::5432 "$POSTGRES_IMAGE")
+          printf '%s\n' "$container" > "$container_file"
+          docker start "$container" >/dev/null
+          ready=0
+          for attempt in $(seq 1 60); do
+            if docker exec "$container" pg_isready -h 127.0.0.1 -p 5432 -U runtime_e2e_admin -d runtime_e2e_admin >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1
+          binding=$(docker port "$container" 5432/tcp)
+          [[ "$binding" =~ ^127\.0\.0\.1:([0-9]+)$ ]]
+          echo "port=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install existing native link prerequisites
         run: sudo apt-get update && sudo apt-get install -y libpq-dev libsqlite3-dev postgresql-client
@@ -82,15 +126,34 @@ jobs:
         env:
           RUNTIME_E2E_EXTERNAL_FIXTURE: '1'
           RUNTIME_E2E_ADMIN_HOST: 127.0.0.1
-          RUNTIME_E2E_ADMIN_PORT: ${{ job.services.postgres.ports['5432'] }}
+          RUNTIME_E2E_ADMIN_PORT: ${{ steps.postgres.outputs.port }}
           RUNTIME_E2E_ADMIN_USER: runtime_e2e_admin
           RUNTIME_E2E_ADMIN_PASSWORD: runtime_e2e_fixture_password
           RUNTIME_E2E_ADMIN_DATABASE: runtime_e2e_admin
         run: bash scripts/run-runtime-e2e.sh --reconnect
 
+      - name: Clean up the owned PostgreSQL fixture
+        if: always()
+        run: |
+          set -eu
+          if [[ -z "${RUNTIME_E2E_CONTAINER_FILE:-}" || ! -s "$RUNTIME_E2E_CONTAINER_FILE" ]]; then
+            exit 0
+          fi
+          container=$(cat "$RUNTIME_E2E_CONTAINER_FILE")
+          [[ "$container" =~ ^[0-9a-f]{64}$ ]]
+          expected="runtime-e2e-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          actual=$(docker inspect --format '{{ index .Config.Labels "plex-postgresql.run" }}' "$container")
+          kind=$(docker inspect --format '{{ index .Config.Labels "plex-postgresql.test" }}' "$container")
+          [[ "$actual" == "$expected" && "$kind" == runtime-e2e ]]
+          if [[ "${{ job.status }}" != success ]]; then
+            docker logs --tail 80 "$container" || true
+          fi
+          docker rm -fv "$container"
+          rm "$RUNTIME_E2E_CONTAINER_FILE"
+
   candidate:
     name: Probe ${{ matrix.variant }} / ${{ matrix.arch }} / PG${{ matrix.postgres }}
-    needs: resolve
+    needs: [resolve, media-fixtures]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy: &native_strategy
@@ -138,10 +201,22 @@ jobs:
             runner: ubuntu-24.04-arm
             postgres: 18
     steps:
+      - name: Use an isolated Docker client configuration
+        run: |
+          set -eu
+          docker_config=$(mktemp -d "$RUNNER_TEMP/plex-docker-config.XXXXXX")
+          printf '{}\n' > "$docker_config/config.json"
+          chmod 700 "$docker_config"
+          chmod 600 "$docker_config/config.json"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: pinned-real-media
+          path: media-fixture-cache
       - uses: actions/download-artifact@v4
         with:
           name: upstream-candidate
@@ -177,14 +252,27 @@ jobs:
           build-args: |
             BUILDER_IMAGE=${{ needs.resolve.outputs.builder_image }}
             PLEX_BASE_IMAGE=${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
-      - name: Probe the exact candidate digest (incomplete gate fails)
+      - name: Prepare offline crash diagnostics
+        run: |
+          if ! command -v gdb >/dev/null; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install --no-install-recommends -y gdb
+          fi
+          command -v coredumpctl
+          command -v timeout
+          sudo -n true
+          gdb --version
+          coredumpctl --version
+      - name: Verify the exact candidate digest
         env:
           CANDIDATE_IMAGE: ${{ steps.image.outputs.repository }}@${{ steps.build.outputs.digest }}
+          BASE_PLEX_IMAGE: ${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
           POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
           EXPECTED_PLEX_VERSION: ${{ needs.resolve.outputs.plex_version }}
           EXPECTED_ARCH: ${{ matrix.arch }}
           VARIANT: ${{ matrix.variant }}
           EVIDENCE_DIR: evidence/container
+          PLEX_E2E_MEDIA_CACHE_DIR: ${{ github.workspace }}/media-fixture-cache
           PLEX_E2E_RESTART_CYCLES: '100'
         run: bash scripts/plex-container-e2e.sh
       - name: Preserve candidate digest and build metadata
@@ -221,10 +309,22 @@ jobs:
       packages: read
     strategy: *native_strategy
     steps:
+      - name: Use an isolated Docker client configuration
+        run: |
+          set -eu
+          docker_config=$(mktemp -d "$RUNNER_TEMP/plex-docker-config.XXXXXX")
+          printf '{}\n' > "$docker_config/config.json"
+          chmod 700 "$docker_config"
+          chmod 600 "$docker_config/config.json"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: pinned-real-media
+          path: media-fixture-cache
       - uses: actions/download-artifact@v4
         with:
           name: candidate-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
@@ -251,7 +351,7 @@ jobs:
               raise SystemExit('Source evidence mismatch')
           if (root / 'postgres-ref.txt').read_text().strip() != os.environ['EXPECTED_POSTGRES_IMAGE']:
               raise SystemExit('PostgreSQL evidence mismatch')
-          expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'workload-smoke-complete-certification-incomplete', 'exit_code': 1, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'real_movie_and_tv_playback_verified': True, 'real_media_full_decode_verified': True, 'promotion_allowed': False}
+          expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'native-workload-complete', 'exit_code': 0, 'workload_passed': True, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'real_movie_and_tv_playback_verified': True, 'real_media_full_decode_verified': True, 'native_import_and_rollback_verified': True, 'four_concurrent_real_media_clients_verified': True, 'promotion_allowed': False}
           if any(result.get(key) != value for key, value in expected.items()):
               raise SystemExit('Prior native smoke failed or is incomplete')
           with open(os.environ['GITHUB_ENV'], 'a') as output:
@@ -262,6 +362,17 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare offline crash diagnostics
+        run: |
+          if ! command -v gdb >/dev/null; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install --no-install-recommends -y gdb
+          fi
+          command -v coredumpctl
+          command -v timeout
+          sudo -n true
+          gdb --version
+          coredumpctl --version
       - name: Continuous native mixed fixture workload for 21000 seconds
         env:
           POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
@@ -271,6 +382,7 @@ jobs:
           PLEX_E2E_RESTART_CYCLES: '1'
           PLEX_E2E_SOAK_SECONDS: '21000'
           EVIDENCE_DIR: evidence/soak
+          PLEX_E2E_MEDIA_CACHE_DIR: ${{ github.workspace }}/media-fixture-cache
         run: bash scripts/plex-container-e2e.sh
       - uses: actions/upload-artifact@v4
         if: always()
@@ -279,18 +391,95 @@ jobs:
           path: evidence
           if-no-files-found: error
 
-  promotion-blocked:
-    name: Fail closed until full native Plex certification exists
+  native-acceptance:
+    name: Require complete native workload evidence
     if: always()
-    needs: [resolve, runtime-e2e, candidate, soak]
+    needs: [resolve, media-fixtures, runtime-e2e, candidate, soak, native-bundle-install]
     runs-on: ubuntu-latest
     steps:
-      - name: No production tags, manifests or releases
+      - name: Verify every native matrix lane completed
         env:
           RESOLUTION: ${{ needs.resolve.result }}
           RUNTIME: ${{ needs.runtime-e2e.result }}
           CANDIDATES: ${{ needs.candidate.result }}
+          SOAK: ${{ needs.soak.result }}
+          BUNDLES: ${{ needs.native-bundle-install.result }}
+          MEDIA: ${{ needs.media-fixtures.result }}
         run: |
-          echo "Resolution: $RESOLUTION; runtime: $RUNTIME; candidates: $CANDIDATES"
-          echo "::error::Promotion blocked: full native scan/playback/watch-state/artwork and outage certification is incomplete. No skipped or smoke-only gate authorizes a release."
-          exit 1
+          test "$RESOLUTION" = success
+          test "$RUNTIME" = success
+          test "$CANDIDATES" = success
+          test "$SOAK" = success
+          test "$BUNDLES" = success
+          test "$MEDIA" = success
+          echo 'PASS all declared native workload lanes. Image promotion remains a separate action.'
+
+  native-bundle-install:
+    name: Native ZIP / ${{ matrix.variant }} / ${{ matrix.arch }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: linuxserver
+            arch: amd64
+            bundle_arch: x86_64
+            runner: ubuntu-24.04
+          - variant: linuxserver
+            arch: arm64
+            bundle_arch: aarch64
+            runner: ubuntu-24.04-arm
+          - variant: plexinc
+            arch: amd64
+            bundle_arch: x86_64
+            runner: ubuntu-24.04
+          - variant: plexinc
+            arch: arm64
+            bundle_arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Use an isolated Docker client configuration
+        run: |
+          set -eu
+          docker_config=$(mktemp -d "$RUNNER_TEMP/plex-docker-config.XXXXXX")
+          printf '{}\n' > "$docker_config/config.json"
+          chmod 700 "$docker_config"
+          chmod 600 "$docker_config/config.json"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the matching native release payload
+        env:
+          BUILDER_IMAGE: ${{ needs.resolve.outputs.builder_image }}
+          BUNDLE_ARCH: ${{ matrix.bundle_arch }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          docker buildx build --platform "linux/$ARCH" --target builder \
+            --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
+            --output type=local,dest=bundle-root .
+          mkdir -p "bundle/libs/$BUNDLE_ARCH" bundle/scripts bundle/schema
+          cp "bundle-root/libs/db_interpose_pg.so" "bundle/db_interpose_pg-linux-$BUNDLE_ARCH.so"
+          cp -L bundle-root/libs/*.so* "bundle/libs/$BUNDLE_ARCH/"
+          rm "bundle/libs/$BUNDLE_ARCH/db_interpose_pg.so"
+          cp scripts/install_wrappers_linux.sh scripts/migrate_lib.sh bundle/scripts/
+          cp schema/*.sql bundle/schema/
+          (cd bundle && zip -r ../native-bundle.zip .)
+      - name: Verify the ZIP on the unmodified pinned Plex image
+        env:
+          BASE_PLEX_IMAGE: ${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          EVIDENCE_DIR: evidence/native-bundle
+        run: bash scripts/test-native-linux-bundle.sh native-bundle.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-bundle-${{ matrix.variant }}-${{ matrix.arch }}
+          path: evidence/native-bundle
+          if-no-files-found: error

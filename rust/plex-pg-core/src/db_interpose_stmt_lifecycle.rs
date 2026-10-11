@@ -90,6 +90,31 @@ mod tests {
     }
 
     #[test]
+    fn finalize_pg_read_stmt_finalizes_its_shadow_statement() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            reset_finalize_test_state();
+            let old_finalize = crate::db_interpose_common::orig_sqlite3_finalize;
+            let old_sql = crate::db_interpose_common::orig_sqlite3_sql;
+            crate::db_interpose_common::orig_sqlite3_finalize = Some(fake_finalize);
+            crate::db_interpose_common::orig_sqlite3_sql = None;
+
+            let pg_stmt = Box::into_raw(Box::new(crate::ffi_types::PgStmt::new()));
+            (*pg_stmt).is_pg = 2;
+            let stmt = 0x9abcusize as *mut sqlite3_stmt;
+            crate::pg_statement::rust_stmt_register(stmt as usize, pg_stmt as usize);
+            let rc = rust_my_sqlite3_finalize(stmt);
+
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(FINALIZE_CALLS.load(Ordering::Acquire), 1);
+
+            crate::db_interpose_common::orig_sqlite3_finalize = old_finalize;
+            crate::db_interpose_common::orig_sqlite3_sql = old_sql;
+            reset_finalize_test_state();
+        }
+    }
+
+    #[test]
     fn finalize_recently_finalized_stmt_skips_original_finalize() {
         let _guard = TEST_LOCK.lock().unwrap();
         unsafe {

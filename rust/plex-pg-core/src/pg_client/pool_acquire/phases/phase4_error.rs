@@ -13,6 +13,9 @@ use crate::log_info_lazy;
 
 pub(crate) fn phase4_reclaim_error(ctx: &AcquireCtx<'_>) -> AcquireDecision {
     for i in 0..ctx.pool_size {
+        if ctx.connect_failed.get() {
+            break;
+        }
         let slot = &ctx.pm.slots[i];
         if !slot.try_reclaim_error() {
             continue;
@@ -35,6 +38,7 @@ pub(crate) fn phase4_reclaim_error(ctx: &AcquireCtx<'_>) -> AcquireDecision {
         }
 
         release_failed_new_connection(slot, new_conn);
+        ctx.connect_failed.set(true);
     }
 
     AcquireDecision::Continue

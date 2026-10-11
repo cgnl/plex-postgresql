@@ -67,7 +67,10 @@ fn type_unknown_oid_is_text() {
 
 #[test]
 fn decltype_int8_is_dt_integer_8() {
-    assert_eq!(oid_to_sqlite_decltype(20).to_str().unwrap(), "dt_integer(8)");
+    assert_eq!(
+        oid_to_sqlite_decltype(20).to_str().unwrap(),
+        "dt_integer(8)"
+    );
 }
 
 #[test]
@@ -189,16 +192,14 @@ fn upsert_insert_without_table_returns_none() {
 }
 
 #[test]
-fn upsert_qualifying_insert_returns_upsert_sql() {
-    let sql = "INSERT INTO plex.metadata_item_settings (account_id, guid) VALUES (1, 'x')";
-    let result = convert_metadata_settings_upsert(sql);
-
-    assert!(result.is_some());
-    let upsert = result.unwrap();
-    assert!(upsert.starts_with(sql));
-    assert!(upsert.contains("ON CONFLICT (account_id, guid)"));
-    assert!(upsert.contains("DO UPDATE SET"));
-    assert!(upsert.contains("RETURNING id"));
+fn upsert_plain_metadata_insert_preserves_source_semantics() {
+    for sql in [
+        "INSERT INTO plex.metadata_item_settings (account_id, guid) VALUES (1, 'x')",
+        "INSERT INTO plex.metadata_item_settings (id, account_id, guid) VALUES (7, 1, 'x')",
+        "INSERT INTO plex.metadata_item_settings DEFAULT VALUES",
+    ] {
+        assert_eq!(convert_metadata_settings_upsert(sql), None);
+    }
 }
 
 #[test]
@@ -224,8 +225,7 @@ fn upsert_empty_string_returns_none() {
 fn upsert_case_insensitive_match() {
     let sql = "insert into METADATA_ITEM_SETTINGS (account_id, guid) values (1, 'x')";
     let result = convert_metadata_settings_upsert(sql);
-    assert!(result.is_some());
-    assert!(result.unwrap().contains("ON CONFLICT"));
+    assert_eq!(result, None);
 }
 
 #[test]
@@ -242,13 +242,13 @@ fn upsert_ffi_non_matching_returns_null() {
 }
 
 #[test]
-fn upsert_ffi_qualifying_returns_non_null_and_must_free() {
+fn upsert_ffi_plain_metadata_insert_returns_null() {
     let input = cs("INSERT INTO plex.metadata_item_settings (account_id, guid) VALUES (1, 'x')");
     let ptr = rust_convert_metadata_settings_upsert(input.as_ptr());
-    assert!(!ptr.is_null());
-    let result = unsafe { CString::from_raw(ptr) };
-    let s = result.to_str().unwrap();
-    assert!(s.contains("ON CONFLICT"));
+    assert!(
+        ptr.is_null(),
+        "plain INSERT must stay on the normal write path"
+    );
 }
 
 #[test]

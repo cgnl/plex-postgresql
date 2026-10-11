@@ -56,6 +56,8 @@ pub struct PgStmt {
     pub sql: *mut c_char,
     pub pg_sql: *mut c_char,
     pub result: *mut PGresult,
+    /// Immutable prepared result descriptor, owned until finalize (not reset).
+    pub descriptor: *mut PGresult,
     pub cached_result: *mut CachedResult,
     pub sql_hash: u64,
     pub stmt_name: [c_char; STMT_NAME_LEN],
@@ -113,6 +115,7 @@ impl PgStmt {
             sql: std::ptr::null_mut(),
             pg_sql: std::ptr::null_mut(),
             result: std::ptr::null_mut(),
+            descriptor: std::ptr::null_mut(),
             cached_result: std::ptr::null_mut(),
             sql_hash: 0,
             stmt_name: [0; STMT_NAME_LEN],

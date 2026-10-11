@@ -28,10 +28,10 @@ fn stack_protection_smoke_linux() {
         type FinalizeFn = unsafe extern "C" fn(*mut c_void) -> c_int;
         type CloseFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
-        let open = libc::dlsym(handle, b"sqlite3_open\0".as_ptr() as *const c_char);
-        let prepare = libc::dlsym(handle, b"sqlite3_prepare_v2\0".as_ptr() as *const c_char);
-        let finalize = libc::dlsym(handle, b"sqlite3_finalize\0".as_ptr() as *const c_char);
-        let close = libc::dlsym(handle, b"sqlite3_close\0".as_ptr() as *const c_char);
+        let open = libc::dlsym(handle, c"sqlite3_open".as_ptr());
+        let prepare = libc::dlsym(handle, c"sqlite3_prepare_v2".as_ptr());
+        let finalize = libc::dlsym(handle, c"sqlite3_finalize".as_ptr());
+        let close = libc::dlsym(handle, c"sqlite3_close".as_ptr());
 
         assert!(!open.is_null());
         assert!(!prepare.is_null());
@@ -44,13 +44,13 @@ fn stack_protection_smoke_linux() {
         let close: CloseFn = std::mem::transmute(close);
 
         let mut db: *mut c_void = std::ptr::null_mut();
-        let rc = open(b":memory:\0".as_ptr() as *const c_char, &mut db);
+        let rc = open(c":memory:".as_ptr(), &mut db);
         assert_eq!(rc, 0);
 
         let mut stmt: *mut c_void = std::ptr::null_mut();
         let mut tail: *const c_char = std::ptr::null();
-        let sql = b"SELECT 1\0";
-        let rc2 = prepare(db, sql.as_ptr() as *const c_char, -1, &mut stmt, &mut tail);
+        let sql = c"SELECT 1";
+        let rc2 = prepare(db, sql.as_ptr(), -1, &mut stmt, &mut tail);
         assert_eq!(rc2, 0);
 
         let _ = finalize(stmt);

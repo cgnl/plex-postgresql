@@ -2,7 +2,7 @@
 ///
 /// Enforces PostgreSQL GROUP BY strict mode:
 ///   - All non-aggregate SELECT columns must appear in GROUP BY
-///   - SELECT DISTINCT → remove GROUP BY entirely
+///   - SELECT DISTINCT → remove GROUP BY only when no aggregate depends on it
 ///   - ORDER BY col that has an aggregate in SELECT → replace with aggregate expr
 use sqlparser::ast::*;
 use sqlparser::tokenizer::Span;
@@ -41,6 +41,16 @@ fn transform_query(q: &mut Query) {
     };
 
     let has_group_by = !gb_exprs.is_empty();
+    let aggregate_order = q.order_by.as_ref().is_some_and(|order| {
+        matches!(&order.kind, OrderByKind::Expressions(expressions)
+            if expressions.iter().any(|expression| crate::query::is_aggregate_expr(&expression.expr)))
+    });
+    let aggregate_projection_or_having = matches!(q.body.as_ref(), SetExpr::Select(select)
+    if select.having.is_some() || select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => crate::query::is_aggregate_expr(expr),
+        _ => false,
+    }));
+    let preserve_aggregate_group = aggregate_order || aggregate_projection_or_having;
 
     // Fix ORDER BY: if a bare column appears as arg of aggregate in SELECT,
     // replace the ORDER BY expression with the aggregate call.
@@ -58,8 +68,8 @@ fn transform_query(q: &mut Query) {
 
     // Now mutate the SELECT body
     if let SetExpr::Select(sel) = q.body.as_mut() {
-        if has_distinct {
-            // DISTINCT present — remove GROUP BY (it's redundant with DISTINCT)
+        if has_distinct && !preserve_aggregate_group {
+            // DISTINCT cannot replace grouping used by aggregate expressions.
             sel.group_by = GroupByExpr::Expressions(vec![], vec![]);
         } else if has_group_by {
             // Collect missing non-aggregate columns from SELECT projection

@@ -974,6 +974,7 @@ mod tests {
 
     #[test]
     fn retry_delays_default_when_no_env_var() {
+        let _guard = env_lock().lock().unwrap();
         // Ensure the env var is not set for this test.
         // (Other tests may have set it — use a subshell-like approach via
         //  remove_var + restore.)
@@ -991,6 +992,7 @@ mod tests {
 
     #[test]
     fn retry_delays_from_env_var() {
+        let _guard = env_lock().lock().unwrap();
         let prev = std::env::var("PLEX_PG_RETRY_DELAYS").ok();
         std::env::set_var("PLEX_PG_RETRY_DELAYS", "100,200,300");
 

@@ -703,8 +703,8 @@ pub fn rust_query_cache_store(
                     let name_copy = libc::malloc(name_len + 1) as *mut c_char;
                     if !name_copy.is_null() {
                         std::ptr::copy_nonoverlapping(
-                            name as *const u8,
-                            name_copy as *mut u8,
+                            name.cast::<u8>(),
+                            name_copy.cast::<u8>(),
                             name_len + 1,
                         );
                         *names_ptr.add(c) = name_copy;
@@ -777,13 +777,13 @@ pub fn rust_query_cache_store(
 
                         if !val_src.is_null() {
                             std::ptr::copy_nonoverlapping(
-                                val_src as *const u8,
-                                val_copy as *mut u8,
+                                val_src.cast::<u8>(),
+                                val_copy.cast::<u8>(),
                                 len as usize,
                             );
                         }
                         // Null-terminate
-                        *(val_copy as *mut u8).add(len as usize) = 0;
+                        *(val_copy.cast::<u8>()).add(len as usize) = 0;
                         *row.values.add(c_idx) = val_copy;
                     }
                 }

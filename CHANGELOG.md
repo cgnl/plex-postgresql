@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Obtain prepared-statement column descriptors through privately named PREPARE/DESCRIBE/DEALLOCATE rounds instead of executing statements for metadata, and refuse to publish row-producing statements without descriptors, preventing native Plex SIGSEGVs that read column metadata after PostgreSQL outage recovery.
+
+## [1.3.22]
+
+### Fixed
+- Replace connection-pool pthread liveness probes with lifecycle-owned logical tokens, preventing dereferences of expired thread descriptors during idle reclamation.
+- Preserve the SQLite MATCH boundary before following AND/OR filters and retain grouping for tag ranking by `count(*)`, fixing both observed native `/hubs/search` HTTP 500 errors.
+- Recognize exact repository bootstrap rows, including Administrator and preferences, before migration; reject modified defaults and preserve existing library data under destination locks.
+- Restore missing canonical defaults before fresh native startup on both container variants, preventing the LinuxServer default-account NULL dereference.
+- Wait for committed artwork URLs before strict media validation and give the native bundle fixture its own temporary directory.
+- Isolate native thread/request state, retain bind-buffer ownership correctly, and validate the exact server UUID preference.
+- Preserve ordinary INSERT semantics, genuine unique constraints, atomic single-row REPLACE behavior and signed last-insert rowids.
+- Preserve Unicode, prepared FTS prefix terms and same-field phrase matching.
+- Import from private SQLite snapshots, retain source hashes, native Boolean-affinity values and the source migration history, and apply startup schema upgrades atomically.
+- Require a genuine matching companion database template for native export, preserving its full Plex schema and non-blob contents while replacing current blob data.
+- Include migration helpers and trusted schema/seed files in Docker images and release bundles.
+- Package Linux runtime dependencies per architecture and validate their Plex loader resolution before installation changes.
+
+### Added
+- Native ZIP installation gates for both image variants and CPU architectures, plus four concurrent real H264/audio clients during scans and metadata/watch updates.
+
+
 ## [1.3.21] - 2026-10-09
 
 ### Fixed

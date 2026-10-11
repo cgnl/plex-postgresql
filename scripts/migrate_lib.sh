@@ -60,6 +60,150 @@ PY
     migration_psql -1 -f "$temporary"
 )
 
+# Earlier shim releases added natural-key constraints absent from Plex SQLite.
+# Remove only the known constraints with their original column definitions;
+# primary keys and administrator-defined constraints remain intact.
+sqlite_constraint_parity_upgrade_sql() {
+    cat <<SQL
+DO \$upgrade\$
+DECLARE candidate record; existing record;
+BEGIN
+    FOR candidate IN
+        SELECT * FROM (VALUES
+            ('metadata_item_settings', 'metadata_item_settings_account_guid_unique', ARRAY['account_id', 'guid']::text[]),
+            ('statistics_bandwidth', 'statistics_bandwidth_account_id_device_id_timespan_at_lan_key', ARRAY['account_id', 'device_id', 'timespan', 'at', 'lan']::text[])
+        ) AS shim(table_name, constraint_name, columns)
+    LOOP
+        SELECT c.contype, ARRAY(
+            SELECT a.attname::text FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, position)
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = key.attnum
+            ORDER BY key.position
+        ) AS columns INTO existing
+        FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE n.nspname = '$PG_SCHEMA' AND t.relname = candidate.table_name
+          AND c.conname = candidate.constraint_name;
+        IF FOUND THEN
+            IF existing.contype <> 'u' OR existing.columns <> candidate.columns THEN
+                RAISE EXCEPTION 'Refusing changed shim constraint %.%', candidate.table_name, candidate.constraint_name;
+            END IF;
+            EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', '$PG_SCHEMA', candidate.table_name, candidate.constraint_name);
+        END IF;
+    END LOOP;
+END \$upgrade\$;
+SQL
+}
+
+apply_sqlite_constraint_parity_upgrade() {
+    validate_migration_schema || return 1
+    local statement
+    statement=$(sqlite_constraint_parity_upgrade_sql) || return 1
+    migration_psql -1 -q -c "$statement"
+}
+
+# Startup schema changes must commit together, including the last FTS view.
+# Individual upgrade entrypoints remain available for independent diagnostics.
+apply_sqlite_schema_parity_upgrades() (
+    validate_migration_schema || return 1
+    [[ "$PG_SCHEMA" == plex ]] || { echo 'ERROR: Combined bundled schema upgrade requires PG_SCHEMA=plex' >&2; return 1; }
+    local unique_file="$1" fts_file="$2" temporary
+    temporary=$(mktemp "${TMPDIR:-/tmp}/plex-schema-upgrades.XXXXXX") || return 1
+    trap 'rm -f "$temporary"' EXIT
+    # Validate both trusted files before generating or executing any DDL. Remove
+    # only their outer transaction wrappers, retaining nested PL/pgSQL BEGINs.
+    python3 - "$unique_file" "$fts_file" > "$temporary" <<'PY_UPGRADES'
+import pathlib
+import re
+import sys
+
+def top_level_statements(text):
+    statements, current, index = [], [], 0
+    while index < len(text):
+        if text.startswith('--', index):
+            end = text.find('\n', index)
+            index = len(text) if end < 0 else end + 1
+            current.append(' ')
+        elif text.startswith('/*', index):
+            depth = 1
+            index += 2
+            while depth and index < len(text):
+                if text.startswith('/*', index):
+                    depth += 1
+                    index += 2
+                elif text.startswith('*/', index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                raise RuntimeError('Unterminated SQL comment')
+            current.append(' ')
+        elif text[index] in ("'", '"'):
+            quote = text[index]
+            index += 1
+            while index < len(text):
+                if text[index] == quote:
+                    index += 1
+                    if index < len(text) and text[index] == quote:
+                        index += 1
+                        continue
+                    break
+                index += 1
+            else:
+                raise RuntimeError('Unterminated SQL quote')
+            current.append(' quoted ')
+        elif text[index] == '$' and (match := re.match(r'\$(?:[a-zA-Z_][a-zA-Z_0-9]*)?\$', text[index:])):
+            delimiter = match.group(0)
+            end = text.find(delimiter, index + len(delimiter))
+            if end < 0:
+                raise RuntimeError('Unterminated SQL dollar quote')
+            index = end + len(delimiter)
+            current.append(' dollar_quoted ')
+        elif text[index] == ';':
+            statement = ''.join(current).strip()
+            if statement:
+                statements.append(statement)
+            current = []
+            index += 1
+        elif text[index] == '\\':
+            raise RuntimeError('psql commands are not permitted in combined upgrade files')
+        else:
+            current.append(text[index])
+            index += 1
+    if ''.join(current).strip():
+        raise RuntimeError('Incomplete top-level SQL statement')
+    return statements
+
+bodies = []
+for filename in sys.argv[1:]:
+    path = pathlib.Path(filename)
+    if not path.is_file():
+        raise RuntimeError(f'Missing schema upgrade file: {path}')
+    lines = path.read_text().splitlines(keepends=True)
+    code = [index for index, line in enumerate(lines) if line.strip() and not line.lstrip().startswith('--')]
+    if len(code) < 3 or not re.fullmatch(r'BEGIN\s*;', lines[code[0]].strip(), re.IGNORECASE) or not re.fullmatch(r'COMMIT\s*;', lines[code[-1]].strip(), re.IGNORECASE):
+        raise RuntimeError(f'Expected single outer BEGIN/COMMIT wrappers: {path}')
+    statements = top_level_statements(''.join(lines))
+    if statements[0].upper() != 'BEGIN' or statements[-1].upper() != 'COMMIT':
+        raise RuntimeError(f'Invalid outer SQL transaction: {path}')
+    for statement in statements[1:-1]:
+        if re.match(r'^(?:BEGIN|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE|START\s+TRANSACTION|PREPARE\s+TRANSACTION)\b', statement, re.IGNORECASE):
+            raise RuntimeError(f'Unexpected top-level transaction control: {path}')
+    # These supplied files are trusted repository SQL. Their inner DO bodies
+    # stay byte-for-byte intact; psql owns the one outer transaction.
+    lines[code[0]] = ''
+    lines[code[-1]] = ''
+    bodies.append(''.join(lines))
+print('\n'.join(bodies))
+PY_UPGRADES
+    [[ "$?" == 0 ]] || return 1
+    local artificial
+    artificial=$(sqlite_constraint_parity_upgrade_sql) || return 1
+    # psql applies both -c and -f in their supplied order within -1.
+    migration_psql -1 -q -v "PG_SCHEMA=$PG_SCHEMA" -c "$artificial" -f "$temporary"
+)
+
 protect_sqlite_sources() {
     local shadow_dir="$1" source_file shadow_file
     [[ -n "${SQLITE_DB:-}" ]] || return 0
@@ -122,33 +266,145 @@ if missing:
 PY
 }
 
-destination_has_data() {
-    local table tables count accounts
-    count=$(migration_psql -tA -c "SELECT (SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE n.nspname = '$PG_SCHEMA' AND NOT c.convalidated) + (SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '$PG_SCHEMA' AND t.tgenabled NOT IN ('O','A'));") || return 2
-    [[ "$count" == 0 ]] || { echo "ERROR: Destination has unvalidated constraints or disabled triggers" >&2; return 2; }
-    tables=$(migration_psql -tA -c "SELECT tablename FROM pg_tables WHERE schemaname = '$PG_SCHEMA' ORDER BY tablename;") || return 2
-    for table in $tables; do
-        case "$table" in
-            schema_migrations|sqlite_column_types|maintenance_control) continue ;;
-        esac
-        count=$(migration_psql -tA -c "SELECT count(*) FROM $PG_SCHEMA.\"${table//\"/\"\"}\";") || return 2
-        [[ "$count" =~ ^[0-9]+$ ]] || return 2
-        [[ "$count" -gt 0 ]] || continue
-        if [[ "$table" == accounts && "$count" == 1 ]]; then
-            accounts=$(migration_psql -tA -c "SELECT count(*) FROM $PG_SCHEMA.accounts a WHERE to_jsonb(a) = jsonb_build_object('id', 1, 'name', 'Administrator', 'created_at', 1289520473, 'updated_at', 1782210228, 'default_audio_language', '', 'default_subtitle_language', '', 'auto_select_subtitle', 1, 'auto_select_audio', 1) || (SELECT coalesce(jsonb_object_agg(key, value), '{}'::jsonb) FROM jsonb_each(to_jsonb(a)) WHERE key NOT IN ('id','name','created_at','updated_at','default_audio_language','default_subtitle_language','auto_select_subtitle','auto_select_audio') AND value = 'null'::jsonb);") || return 2
-            [[ "$accounts" == 1 ]] && continue
-        fi
-        echo "Existing or partial PostgreSQL data in $table ($count rows); refusing implicit replacement." >&2
-        return 0
+# Recognize literal repository-owned bootstrap rows, never arbitrary accounts
+# or a database inferred empty solely from its metadata_items count. Functions
+# exist only for the current psql connection and add no persistent schema DDL.
+bootstrap_seed_functions_sql() {
+    local seed_file candidate migration_dir
+    migration_dir="$(dirname "${BASH_SOURCE[0]}")"
+    seed_file="$migration_dir/../schema/seed_data.sql"
+    for candidate in "${SHIM_DIR:-$migration_dir}/seed_data.sql" "${SHIM_DIR:-$migration_dir}/schema/seed_data.sql" "$migration_dir/../schema/seed_data.sql" "$migration_dir/schema/seed_data.sql"; do
+        if [[ -f "$candidate" ]]; then seed_file="$candidate"; break; fi
     done
-    return 1
+    python3 - "$seed_file" <<'PY_SEEDS'
+import json
+import pathlib
+import re
+import sqlite3
+import sys
+import uuid
+
+path = pathlib.Path(sys.argv[1])
+manifest = {}
+# Older bundles without a seed definition fail conservatively for existing
+# rows, while genuinely empty destinations remain usable.
+if path.is_file():
+    pending = ''
+    connection = sqlite3.connect(':memory:')
+    for line in path.read_text().splitlines(keepends=True):
+        pending += line
+        if not sqlite3.complete_statement(pending):
+            continue
+        statement = re.sub(r'(?m)^\s*--[^\n]*', '', pending).strip()
+        pending = ''
+        if not statement:
+            continue
+        match = re.fullmatch(r'INSERT INTO plex\.([a-z_][a-z_0-9]*)\s*\(([^)]*)\)\s*VALUES\s*\((.*)\);', statement, re.DOTALL)
+        if not match:
+            if re.match(r'^SELECT setval\(', statement):
+                continue
+            raise RuntimeError('Unsupported repository bootstrap statement')
+        table, names, values = match.groups()
+        columns = [name.strip().strip('"') for name in names.split(',')]
+        if any(not re.fullmatch(r'[a-z_][a-z_0-9]*', name) for name in columns) or len(set(columns)) != len(columns):
+            raise RuntimeError('Unsupported repository bootstrap columns')
+        # Evaluate only the trusted literal VALUES expression in an isolated
+        # in-memory SQLite connection; never execute INSERTs or setval.
+        row = connection.execute('SELECT ' + values).fetchone()
+        if len(row) != len(columns):
+            raise RuntimeError('Repository bootstrap value/column mismatch')
+        manifest.setdefault(table, []).append(dict(zip(columns, row)))
+    if re.sub(r'(?m)^\s*--[^\n]*', '', pending).strip():
+        raise RuntimeError('Incomplete repository bootstrap statement')
+    connection.close()
+encoded = json.dumps(manifest, ensure_ascii=True, separators=(',', ':'))
+delimiter = '$seed_' + uuid.uuid4().hex + '$'
+print("""
+CREATE OR REPLACE FUNCTION pg_temp.plex_pg_bootstrap_rows()
+RETURNS TABLE(target_table text,row_value jsonb) LANGUAGE sql IMMUTABLE AS $seed_rows$
+ SELECT definitions.key,source_rows.value FROM jsonb_each(""" + delimiter + encoded + delimiter + """::jsonb) definitions,
+ LATERAL jsonb_array_elements(definitions.value) source_rows;
+$seed_rows$;
+CREATE OR REPLACE FUNCTION pg_temp.plex_pg_is_bootstrap_row(target_table text, row_value jsonb)
+RETURNS boolean LANGUAGE sql STABLE AS $matcher$
+ SELECT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(coalesce((""" + delimiter + encoded + delimiter + """::jsonb)->target_table, '[]'::jsonb)) seed
+    WHERE row_value = seed.value ||
+      CASE WHEN target_table='tags' AND row_value ? 'search_vector'
+        THEN jsonb_build_object('search_vector', to_tsvector('simple', coalesce(seed.value->>'tag',''))::text)
+        ELSE '{}'::jsonb END ||
+      (SELECT coalesce(jsonb_object_agg(key,value), '{}'::jsonb)
+       FROM jsonb_each(row_value)
+       WHERE NOT seed.value ? key AND value='null'::jsonb
+         AND NOT (target_table='tags' AND key='search_vector'))
+ );
+$matcher$;
+CREATE OR REPLACE FUNCTION pg_temp.plex_pg_is_bootstrap_table(target_schema text, target_table text)
+RETURNS boolean LANGUAGE plpgsql VOLATILE AS $table_matcher$
+DECLARE matches boolean;
+BEGIN
+    -- Stop at the first real row instead of sorting every row in a large
+    -- existing library. Duplicate detection runs only for recognized seeds.
+    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.%I t WHERE NOT pg_temp.plex_pg_is_bootstrap_row($1,to_jsonb(t)))', target_schema,target_table)
+    INTO matches USING target_table;
+    IF matches THEN RETURN false; END IF;
+    EXECUTE format('SELECT NOT EXISTS(SELECT 1 FROM %I.%I t GROUP BY to_jsonb(t) HAVING count(*)>1)', target_schema,target_table)
+    INTO matches;
+    RETURN matches;
+END $table_matcher$;
+""")
+PY_SEEDS
+}
+
+destination_has_data() {
+    validate_migration_schema || return 2
+    local temporary result
+    temporary=$(mktemp "${TMPDIR:-/tmp}/plex-destination-check.XXXXXX") || return 2
+    if ! bootstrap_seed_functions_sql > "$temporary"; then
+        rm -f "$temporary"
+        return 2
+    fi
+    cat >> "$temporary" <<SQL
+CREATE OR REPLACE FUNCTION pg_temp.plex_pg_destination_has_data()
+RETURNS boolean LANGUAGE plpgsql AS \$check\$
+DECLARE item record;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='$PG_SCHEMA' AND NOT c.convalidated)
+       OR EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='$PG_SCHEMA' AND t.tgenabled NOT IN ('O','A')) THEN
+        RAISE EXCEPTION 'Destination has unvalidated constraints or disabled triggers';
+    END IF;
+    FOR item IN SELECT tablename FROM pg_tables WHERE schemaname='$PG_SCHEMA' ORDER BY tablename LOOP
+        IF item.tablename IN ('schema_migrations','sqlite_column_types','maintenance_control') THEN CONTINUE; END IF;
+        IF NOT pg_temp.plex_pg_is_bootstrap_table('$PG_SCHEMA',item.tablename) THEN
+            RAISE NOTICE 'Existing or partial PostgreSQL data in %; refusing implicit replacement', item.tablename;
+            RETURN true;
+        END IF;
+    END LOOP;
+    RETURN false;
+END \$check\$;
+SELECT pg_temp.plex_pg_destination_has_data();
+SQL
+    result=$(migration_psql -qAt -f "$temporary")
+    local status=$?
+    rm -f "$temporary"
+    [[ "$status" == 0 ]] || return 2
+    case "$result" in
+        t) return 0 ;;
+        f) return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 sequence_sync_sql() {
+    local seed_gate=""
+    if [[ "${1:-}" == bootstrap ]]; then
+        seed_gate="IF current_setting('plex.bootstrap_changed',true) IS DISTINCT FROM 'true' THEN RETURN; END IF;"
+    fi
     printf '%s\n' "
         DO \$do\$
         DECLARE rec record; maximum bigint; minimum bigint; initial bigint;
         BEGIN
+            $seed_gate
             FOR rec IN
                 SELECT table_schema, table_name, column_name,
                        pg_get_serial_sequence(format('%I.%I', table_schema, table_name), column_name) AS sequence_name
@@ -169,28 +425,66 @@ sequence_sync_sql() {
 }
 
 destination_guard_sql() {
+    bootstrap_seed_functions_sql || return 1
     printf '%s\n' "
         DO \$guard\$
-        DECLARE item record; row_count bigint; seed_count bigint;
+        DECLARE item record;
         BEGIN
             FOR item IN SELECT tablename FROM pg_tables WHERE schemaname = '$PG_SCHEMA' ORDER BY tablename LOOP
                 EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE', '$PG_SCHEMA', item.tablename);
             END LOOP;
+            IF EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='$PG_SCHEMA' AND NOT c.convalidated)
+               OR EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='$PG_SCHEMA' AND t.tgenabled NOT IN ('O','A')) THEN
+                RAISE EXCEPTION 'Destination has unvalidated constraints or disabled triggers';
+            END IF;
             FOR item IN SELECT tablename FROM pg_tables WHERE schemaname = '$PG_SCHEMA' ORDER BY tablename LOOP
                 IF item.tablename IN ('schema_migrations', 'sqlite_column_types', 'maintenance_control') THEN CONTINUE; END IF;
-                EXECUTE format('SELECT count(*) FROM %I.%I', '$PG_SCHEMA', item.tablename) INTO row_count;
-                IF row_count = 0 THEN CONTINUE; END IF;
-                IF item.tablename = 'accounts' AND row_count = 1 THEN
-                    SELECT count(*) INTO seed_count FROM $PG_SCHEMA.accounts a
-                    WHERE to_jsonb(a) = jsonb_build_object('id', 1, 'name', 'Administrator', 'created_at', 1289520473, 'updated_at', 1782210228, 'default_audio_language', '', 'default_subtitle_language', '', 'auto_select_subtitle', 1, 'auto_select_audio', 1) ||
-                        (SELECT coalesce(jsonb_object_agg(key, value), '{}'::jsonb) FROM jsonb_each(to_jsonb(a)) WHERE key NOT IN ('id','name','created_at','updated_at','default_audio_language','default_subtitle_language','auto_select_subtitle','auto_select_audio') AND value = 'null'::jsonb);
-                    IF seed_count = 1 THEN CONTINUE; END IF;
+                IF NOT pg_temp.plex_pg_is_bootstrap_table('$PG_SCHEMA',item.tablename) THEN
+                    RAISE EXCEPTION 'Destination changed or contains data: %', item.tablename;
                 END IF;
-                RAISE EXCEPTION 'Destination changed or contains data: %', item.tablename;
             END LOOP;
         END \$guard\$;
     "
 }
+
+# Native startup assumes the default account exists. Restore only missing
+# repository bootstrap rows under the same destination locks as import guards.
+# A real/changed destination is preserved; repeated complete bootstrap is a no-op.
+seed_fresh_pg_defaults() (
+    validate_migration_schema || return 1
+    local status temporary
+    if destination_has_data; then
+        return 0
+    else
+        status=$?
+        [[ "$status" == 1 ]] || return 1
+    fi
+    temporary=$(mktemp "${TMPDIR:-/tmp}/plex-bootstrap-seed.XXXXXX") || return 1
+    trap 'rm -f "$temporary"' EXIT
+    printf 'BEGIN;\n' > "$temporary" || return 1
+    destination_guard_sql >> "$temporary" || return 1
+    cat >> "$temporary" <<SQL
+DO \$seed_missing\$
+DECLARE seed record; columns text; inserted bigint; changed boolean := false;
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pg_temp.plex_pg_bootstrap_rows()) THEN
+        RAISE EXCEPTION 'Fresh bootstrap requires the trusted repository seed_data.sql';
+    END IF;
+    FOR seed IN SELECT * FROM pg_temp.plex_pg_bootstrap_rows() LOOP
+        SELECT string_agg(format('%I',key),', ' ORDER BY key) INTO columns FROM jsonb_object_keys(seed.row_value) key;
+        EXECUTE format('INSERT INTO %I.%I (%s) SELECT %s FROM jsonb_populate_record(NULL::%I.%I,\$1) seed_record WHERE NOT EXISTS(SELECT 1 FROM %I.%I existing WHERE to_jsonb(existing) @> \$1)',
+                       '$PG_SCHEMA',seed.target_table,columns,columns,'$PG_SCHEMA',seed.target_table,'$PG_SCHEMA',seed.target_table)
+        USING seed.row_value;
+        GET DIAGNOSTICS inserted = ROW_COUNT;
+        changed := changed OR inserted > 0;
+    END LOOP;
+    PERFORM set_config('plex.bootstrap_changed',changed::text,true);
+END \$seed_missing\$;
+SQL
+    sequence_sync_sql bootstrap >> "$temporary" || return 1
+    printf 'COMMIT;\n' >> "$temporary" || return 1
+    migration_psql -q -f "$temporary"
+)
 
 sync_all_sequences() {
     sequence_sync_sql | migration_psql -q
@@ -304,7 +598,137 @@ PY
     mv -f "${temporary}.plex-pg-shadow" "${db_file}.plex-pg-shadow" || return 1
 )
 
-check_and_migrate() {
+# Read file bytes only from the mounted source. WAL recovery and SQLite backup
+# happen in a private writable copy, never on the original read-only mount.
+snapshot_sqlite_sources() {
+    python3 - "$1" "$2" "${MIGRATION_SNAPSHOT_TIMEOUT:-300}" <<'PY_SNAPSHOT'
+import hashlib
+import os
+import pathlib
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+source, destination, timeout = sys.argv[1:]
+seconds = float(timeout)
+if not 0 < seconds <= 3600:
+    raise ValueError('MIGRATION_SNAPSHOT_TIMEOUT must be between 0 and 3600 seconds')
+deadline = time.monotonic() + seconds
+root = pathlib.Path(destination)
+root.mkdir(parents=True, exist_ok=True)
+originals = [(pathlib.Path(source), 'library.db'), (pathlib.Path(source[:-3] + '.blobs.db'), 'library.blobs.db')]
+paths = [pathlib.Path(str(path) + suffix) for path, _ in originals for suffix in ('', '-wal', '-shm', '-journal')]
+
+def bounded():
+    if time.monotonic() > deadline:
+        raise TimeoutError('SQLite source snapshot timed out')
+
+native_cli = os.environ.get('MIGRATION_PLEX_SQLITE')
+if native_cli:
+    if not pathlib.Path(native_cli).is_file() or not os.access(native_cli, os.X_OK):
+        raise RuntimeError('MIGRATION_PLEX_SQLITE must identify an executable official Plex SQLite CLI')
+else:
+    native_cli = next((path for path in (
+        '/usr/lib/plexmediaserver/Plex SQLite',
+        '/Applications/Plex Media Server.app/Contents/MacOS/Plex SQLite',
+    ) if pathlib.Path(path).is_file() and os.access(path, os.X_OK)), None)
+
+def validate_private_snapshot(target, tables, original):
+    bounded()
+    if native_cli:
+        script = '.bail on\n' + '\n'.join(
+            "PRAGMA integrity_check('" + table.replace("'", "''") + "');" for (table,) in tables
+        )
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(('PLEX_PG_', 'DYLD_')) and key not in {
+                           'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_LOADER_PATH', 'LD_AUDIT',
+                           'SQLITE_AUTO_EXTENSION', 'SQLITE_EXTENSIONS',
+                       }}
+        result = subprocess.run([native_cli, str(target)], input=script, text=True,
+                                capture_output=True, env=environment,
+                                timeout=max(.01, deadline - time.monotonic()))
+        if result.returncode or result.stdout.strip().splitlines() != ['ok'] * len(tables):
+            raise RuntimeError(f'Invalid native physical SQLite source: {original}: {result.stderr.strip()} {result.stdout.strip()}')
+    else:
+        with sqlite3.connect(target) as database:
+            for (table,) in tables:
+                bounded()
+                check = database.execute("PRAGMA integrity_check('" + table.replace("'", "''") + "')").fetchall()
+                if check != [('ok',)]:
+                    raise RuntimeError(f'Invalid physical SQLite source table: {original}: {table}: {check}')
+        database.close()
+
+def fingerprint():
+    result = {}
+    for path in paths:
+        bounded()
+        try:
+            before = path.stat()
+        except FileNotFoundError:
+            result[str(path)] = None
+            continue
+        if not path.is_file():
+            raise RuntimeError(f'Non-regular SQLite source: {path}')
+        digest = hashlib.sha256()
+        with path.open('rb') as handle:
+            while chunk := handle.read(1024 * 1024):
+                bounded()
+                digest.update(chunk)
+        after = path.stat()
+        state = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        if state(before) != state(after):
+            raise RuntimeError(f'SQLite source changed while hashing: {path}; stop Plex and writers before migration')
+        result[str(path)] = (state(after), digest.hexdigest())
+    return result
+
+try:
+    before = fingerprint()
+    if before[str(originals[0][0])] is None:
+        raise RuntimeError('Missing SQLite library source')
+    with tempfile.TemporaryDirectory(prefix='.sqlite-source-copy-', dir=root) as temporary:
+        raw = pathlib.Path(temporary)
+        for original, name in originals:
+            if before[str(original)] is None:
+                if any(before[str(pathlib.Path(str(original) + suffix))] is not None for suffix in ('-wal', '-shm', '-journal')):
+                    raise RuntimeError(f'Orphan SQLite source sidecar: {original}')
+                continue
+            for suffix in ('', '-wal', '-shm', '-journal'):
+                path = pathlib.Path(str(original) + suffix)
+                if before[str(path)] is None:
+                    continue
+                with path.open('rb') as reader, (raw / (name + suffix)).open('wb') as writer:
+                    while chunk := reader.read(1024 * 1024):
+                        bounded()
+                        writer.write(chunk)
+            if fingerprint() != before:
+                raise RuntimeError('SQLite source pair changed while copying; stop Plex and writers before migration')
+        for original, name in originals:
+            if before[str(original)] is None:
+                continue
+            target = root / name
+            with sqlite3.connect(raw / name, timeout=5) as connection, sqlite3.connect(target, timeout=5) as backup:
+                connection.backup(backup, pages=1024, progress=lambda *_: bounded(), sleep=.01)
+                backup.execute('PRAGMA journal_mode=DELETE')
+                tables = backup.execute("SELECT name FROM sqlite_master WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name").fetchall()
+            connection.close()
+            backup.close()
+            validate_private_snapshot(target, tables, original)
+        # A stable pair encompasses both library/artwork and committed WAL data.
+        # Changes during recovery/backup invalidate the entire acquisition.
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+        if fingerprint() != before:
+            raise RuntimeError('SQLite source pair changed during snapshot; stop Plex and writers before migration')
+except BaseException:
+    for _, name in originals:
+        for suffix in ('', '-wal', '-shm', '-journal'):
+            (root / (name + suffix)).unlink(missing_ok=True)
+    raise
+PY_SNAPSHOT
+}
+
+check_and_migrate() (
     # Check if SQLite database exists and has data
     if [[ ! -f "$SQLITE_DB" ]]; then
         echo -e "${BLUE}No existing Plex database found. Fresh install.${NC}"
@@ -312,7 +736,11 @@ check_and_migrate() {
     fi
 
     validate_migration_schema || return 1
-    local sqlite_count
+    local sqlite_count snapshot_dir original_source="$SQLITE_DB"
+    snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/plex-source-inspection.XXXXXX") || return 1
+    trap 'rm -rf "$snapshot_dir"' EXIT
+    snapshot_sqlite_sources "$SQLITE_DB" "$snapshot_dir" || return 1
+    SQLITE_DB="$snapshot_dir/library.db"
     sqlite_count=$(sqlite3 -readonly "$SQLITE_DB" "SELECT COUNT(*) FROM metadata_items;") || return 1
     [[ "$sqlite_count" =~ ^[0-9]+$ ]] || return 1
 
@@ -321,7 +749,7 @@ check_and_migrate() {
     echo -e "${YELLOW}========================================${NC}"
     echo ""
     echo "Found SQLite database with $sqlite_count items:"
-    echo "  $SQLITE_DB"
+    echo "  $original_source"
     echo ""
 
     # Show breakdown
@@ -377,7 +805,7 @@ check_and_migrate() {
 
     echo ""
     echo -e "${GREEN}=== Migration Complete ===${NC}"
-}
+)
 
 migrate_sqlite_to_pg() (
     set -o pipefail
@@ -396,24 +824,7 @@ migrate_sqlite_to_pg() (
     work_dir=$(mktemp -d "${TMPDIR:-/tmp}/plex-import.XXXXXX") || return 1
     trap 'status=$?; migration_psql -q -c "DROP SCHEMA IF EXISTS $staging CASCADE;" >&2 || status=1; rm -rf "$work_dir" || status=1; exit "$status"' EXIT
     local original_source="$SQLITE_DB"
-    python3 - "$original_source" "$work_dir" <<'PY'
-import pathlib
-import sqlite3
-import sys
-
-source, destination = sys.argv[1:]
-for original, snapshot in ((source, 'library.db'), (source[:-3] + '.blobs.db', 'library.blobs.db')):
-    if not pathlib.Path(original).is_file():
-        continue
-    connection = sqlite3.connect(pathlib.Path(original).resolve().as_uri() + '?mode=ro', uri=True)
-    backup = sqlite3.connect(str(pathlib.Path(destination) / snapshot))
-    connection.backup(backup)
-    if backup.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
-        raise RuntimeError(f'Invalid SQLite source: {original}')
-    backup.close()
-    connection.close()
-PY
-    [[ "$?" == 0 ]] || return 1
+    snapshot_sqlite_sources "$original_source" "$work_dir" || return 1
     SQLITE_DB="$work_dir/library.db"
     migration_psql -q -c "CREATE SCHEMA $staging;" || return 1
     tables=$(sqlite3 -readonly "$SQLITE_DB" "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%fts%' AND name NOT LIKE '%spellfix%' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name;") || return 1
@@ -426,7 +837,7 @@ PY
 
     for table in $tables; do
         [[ "$table" =~ ^[a-z_][a-z0-9_]*$ ]] || { echo "ERROR: Unsupported source table name: $table" >&2; return 1; }
-        case "$table" in schema_migrations|sqlite_column_types) continue ;; esac
+        case "$table" in sqlite_column_types) continue ;; esac
         local count
         count=$(sqlite3 -readonly "$SQLITE_DB" "SELECT COUNT(*) FROM \"$table\";") || return 1
         [[ "$count" =~ ^[0-9]+$ ]] || return 1
@@ -443,7 +854,7 @@ PY
             fi
 
             # Get PostgreSQL columns (exclude generated columns — COPY can't write to them)
-            local pg_cols
+            local pg_cols pg_col_types
             pg_cols=$(migration_psql -t -c "SELECT string_agg(column_name, ',') FROM information_schema.columns WHERE table_schema = '$schema' AND table_name = '$table' AND (is_generated = 'NEVER' OR is_generated IS NULL);" | tr -d ' ') || return 1
 
             if [[ -z "$pg_cols" ]]; then
@@ -451,7 +862,11 @@ PY
                 return 1
             fi
 
-            # Get column types from SQLite to detect BLOBs
+            pg_col_types=$(migration_psql -tA -c "SELECT column_name || '|' || udt_name FROM information_schema.columns WHERE table_schema = '$schema' AND table_name = '$table' AND (is_generated = 'NEVER' OR is_generated IS NULL);") || return 1
+
+            # Source Boolean affinity can contain Plex's textual t/f defaults.
+            # Destination types decide which values need strict normalization.
+            # Get column types from SQLite to detect BLOBs and Boolean affinity.
             local col_types
             col_types=$(sqlite3 -readonly "$SQLITE_DB" "PRAGMA table_info(\"$table\");" | cut -d'|' -f2,3) || return 1
 
@@ -463,9 +878,25 @@ PY
             for col in $sqlite_cols_raw; do
                 if echo ",$pg_cols," | grep -q ",$col,"; then
                     # Check if this column is a BLOB
-                    local col_type=$(echo "$col_types" | grep "^$col|" | cut -d'|' -f2)
+                    local col_type=$(echo "$col_types" | grep "^$col|" | cut -d'|' -f2 | tr '[:lower:]' '[:upper:]')
+                    local pg_col_type=$(echo "$pg_col_types" | grep "^$col|" | cut -d'|' -f2)
                     local select_expr
-                    if [[ "$col_type" == "BLOB" ]]; then
+                    if [[ ( "$col_type" == BOOLEAN || "$col_type" == BOOL ) && ( "$pg_col_type" == int2 || "$pg_col_type" == int4 || "$pg_col_type" == int8 || "$pg_col_type" == bool ) || "$pg_col_type" == bool ]]; then
+                        # SQLite Boolean affinity permits any INTEGER. Preserve
+                        # representable integers for integer destinations; a PG
+                        # BOOLEAN destination has the narrower 0/1 contract.
+                        local numeric_boolean numeric_boolean_value
+                        if [[ "$pg_col_type" == bool ]]; then
+                            numeric_boolean="typeof(\"$col\") IN ('integer','real') AND \"$col\" IN (0,1)"
+                            numeric_boolean_value="CAST(\"$col\" AS INTEGER)"
+                        else
+                            numeric_boolean="typeof(\"$col\") = 'integer'"
+                            numeric_boolean_value="\"$col\""
+                        fi
+                        # Unsupported representations fail COPY with their value
+                        # and column, instead of silently truncating REAL/text.
+                        select_expr="CASE WHEN \"$col\" IS NULL THEN NULL WHEN $numeric_boolean THEN $numeric_boolean_value WHEN typeof(\"$col\") = 'text' AND lower(\"$col\") IN ('t','true') THEN 1 WHEN typeof(\"$col\") = 'text' AND lower(\"$col\") IN ('f','false') THEN 0 ELSE '__UNREPRESENTABLE_SQLITE_BOOLEAN__:' || quote(\"$col\") END AS \"$col\""
+                    elif [[ "$col_type" == "BLOB" ]]; then
                         # Use hex() for BLOB columns, prefix with \x for PostgreSQL bytea
                         select_expr="CASE WHEN \"$col\" IS NOT NULL THEN '\\x' || hex(\"$col\") ELSE NULL END AS \"$col\""
                     elif [[ "$col" == *_at ]]; then
@@ -484,6 +915,14 @@ PY
                     fi
                 fi
             done
+
+            # Native migration history has four columns; PG's id is a shim
+            # surrogate. Assign it in the private stage without consuming the
+            # live destination sequence during COPY or a failed acquisition.
+            if [[ "$table" == schema_migrations ]] && ! echo "$sqlite_cols_raw" | grep -qx id && echo ",$pg_cols," | grep -q ',id,'; then
+                sqlite_select="$sqlite_select,row_number() OVER (ORDER BY \"version\") AS \"id\""
+                pg_cols_list="$pg_cols_list,\"id\""
+            fi
 
             if [[ -z "$sqlite_select" ]]; then
                 echo "ERROR: No common columns for $table" >&2
@@ -504,7 +943,7 @@ PY
             local log_dir="${LOG_DIR:-/var/log/plex-postgresql}"
             mkdir -p "$log_dir" || return 1
 
-            if python3 "$migrate_py" \
+            if MIGRATION_SQLITE_FROZEN=1 python3 "$migrate_py" \
                 "$SQLITE_DB" "$table" "$sqlite_select" "$pg_cols_list" "$staging" 2>>"$log_dir/migration_errors.log"; then
                 echo -e "${GREEN}OK${NC}"
                 migrated=$((migrated + 1))
@@ -555,7 +994,7 @@ PY
         migration_psql -q -c "CREATE TABLE IF NOT EXISTS $staging.blobs (LIKE $schema.blobs INCLUDING CONSTRAINTS INCLUDING GENERATED INCLUDING IDENTITY INCLUDING INDEXES); DELETE FROM $staging.blobs;" || return 1
         local migrate_py="${SHIM_DIR}/migrate_table.py"
         [[ -f "$migrate_py" ]] || migrate_py="$(dirname "${BASH_SOURCE[0]}")/migrate_table.py"
-        python3 "$migrate_py" "$blobs_db" blobs 'id, linked_type, linked_id, linked_guid, created_at, blob_type, blob' 'id, linked_type, linked_id, linked_guid, created_at, blob_type, blob' "$staging" || return 1
+        MIGRATION_SQLITE_FROZEN=1 python3 "$migrate_py" "$blobs_db" blobs 'id, linked_type, linked_id, linked_guid, created_at, blob_type, blob' 'id, linked_type, linked_id, linked_guid, created_at, blob_type, blob' "$staging" || return 1
         pg_blob_count=$(migration_psql -tA -c "SELECT count(*) FROM $staging.blobs;") || return 1
         [[ "$pg_blob_count" == "$blob_count" ]] || return 1
         printf 'DELETE FROM %s.blobs; INSERT INTO %s.blobs (id, linked_type, linked_id, linked_guid, created_at, blob_type, blob) SELECT id, linked_type, linked_id, linked_guid, created_at, blob_type, blob FROM %s.blobs;\n' "$schema" "$schema" "$staging" >> "$work_dir/activate.sql" || return 1

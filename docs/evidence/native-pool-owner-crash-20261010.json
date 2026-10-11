@@ -1,0 +1,110 @@
+{
+  "run_id": 38044492379,
+  "run_url": "https://github.com/cgnl/plex-postgresql/actions/runs/38044492379",
+  "source_sha": "1cbc2c7cd917c694f6ec84fa4977b1afa7e70838",
+  "lane": "linuxserver-amd64-pg15",
+  "candidate": "ghcr.io/cgnl/plex-postgresql-linuxserver@sha256:41f99f0fe1c29392fa0ad4b501d050c7225c60fce7b97c355eec8e17468ec6bd",
+  "plex_version": "1.43.4.10903-e5521bd8c",
+  "signal": 11,
+  "si_code": 1,
+  "si_code_meaning": "SEGV_MAPERR",
+  "fault_address_handle_offset": "0xb0",
+  "reaper_wait": {
+    "pid": 320,
+    "relation": "direct",
+    "status": "0x8b",
+    "signaled": 1,
+    "signal": 11,
+    "core": 1
+  },
+  "oom_counter_deltas": {
+    "memory.events.low": 0,
+    "memory.events.high": 0,
+    "memory.events.max": 0,
+    "memory.events.oom": 0,
+    "memory.events.oom_kill": 0,
+    "memory.events.oom_group_kill": 0
+  },
+  "core_bytes": 140079104,
+  "core_sha256": "14cf4475ee3f33d1e70e3c5658997e155f1cb7500982c408696b8dd33813e5e8",
+  "resolved_stack": [
+    {
+      "frame": 0,
+      "pc": "0x7f835bf596ef",
+      "module": "ld-musl-x86_64.so.1",
+      "module_offset": "0x906ef",
+      "symbol": "internal lock routine (stripped; __lock-shaped implementation)",
+      "instruction": "lock cmpxchgl %edx,(%rdi)"
+    },
+    {
+      "frame": 1,
+      "pc": "0x7f835bf5bc2a",
+      "module": "ld-musl-x86_64.so.1",
+      "module_offset": "0x92c2a",
+      "symbol": "pthread_kill + 39",
+      "return_stack_offset": "0x0"
+    },
+    {
+      "frame": 2,
+      "pc": "0x7f835ada32f6",
+      "module": "db_interpose_pg.so",
+      "module_offset": "0x39f2f6",
+      "symbol": "plex_pg_core::pg_client::pool_acquire::maintenance::reclaim_zombies_and_reap + 166",
+      "return_stack_offset": "0xa0"
+    },
+    {
+      "frame": 3,
+      "pc": "0x7f835adb51ca",
+      "module": "db_interpose_pg.so",
+      "module_offset": "0x3b11ca",
+      "symbol": "plex_pg_core::pg_client::pool_acquire::pool_get_connection_inner_excluding + 442",
+      "return_stack_offset": "0x150"
+    },
+    {
+      "frame": 4,
+      "pc": "0x7f835ad1844b",
+      "module": "db_interpose_pg.so",
+      "module_offset": "0x31444b",
+      "symbol": "plex_pg_core::db_interpose_column::metadata_support::ensure_pg_result_for_metadata + 171",
+      "return_stack_offset": "0x1f0"
+    },
+    {
+      "frame": 5,
+      "pc": "0x7f835ad19679",
+      "module": "db_interpose_pg.so",
+      "module_offset": "0x315679",
+      "symbol": "plex_pg_core::db_interpose_column::metadata_accessors::column_count_impl + 281",
+      "return_stack_offset": "0x2e0"
+    }
+  ],
+  "unwind_method": "LLDB recovered crash registers/module/symbols; manual ABI stack reconstruction validated saved return addresses, frame allocations and call sites through ensure_pg_result_for_metadata. column_count_impl return symbol recovered; full deeper automatic unwind unavailable.",
+  "dynamic_call_target_confirmed": "maintenance indirect call GOT resolves to exact musl pthread_kill entry 0x7f835bf5bc03; call signal operand zero",
+  "causal_hypothesis": "Pool zombie reclaimer calls pthread_kill(owner_thread,0) on a retained pthread handle whose thread descriptor is unmapped. musl pthread_kill forms handle+0xb0 lock address and faults in internal lock atomic access. Stale/expired pthread descriptor is strongly supported; exact owner exit/reuse event and lifecycle repair not yet established.",
+  "source_locations": {
+    "liveness_probe": "rust/plex-pg-core/src/pg_client/threading.rs:44",
+    "caller": "rust/plex-pg-core/src/pg_client/pool_acquire/maintenance.rs:26"
+  },
+  "gates": {
+    "phase": "concurrent-real-media",
+    "exit_code": 1,
+    "candidate": "ghcr.io/cgnl/plex-postgresql-linuxserver@sha256:41f99f0fe1c29392fa0ad4b501d050c7225c60fce7b97c355eec8e17468ec6bd",
+    "plex_version": "1.43.4.10903-e5521bd8c",
+    "variant": "linuxserver",
+    "arch": "amd64",
+    "restart_cycles_requested": 100,
+    "restart_cycles_completed": 0,
+    "soak_seconds_requested": 0,
+    "soak_seconds_completed": 0,
+    "soak_iterations": 0,
+    "live_postgres_recovery_verified": false,
+    "decoded_fixture_verified": true,
+    "real_movie_and_tv_playback_verified": true,
+    "real_media_full_decode_verified": true,
+    "native_import_and_rollback_verified": true,
+    "four_concurrent_real_media_clients_verified": false,
+    "workload_passed": false,
+    "promotion_allowed": false,
+    "missing_gate": "Full native matrix, scan/playback/watch-state/artwork and sustained outage workload"
+  },
+  "validation_limit": "The matched core identifies the stale descriptor probe on Linuxserver amd64/PG15. The logical-owner fix and full native matrix/5h50 soak are not yet certified."
+}

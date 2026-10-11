@@ -1,6 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rusqlite::ffi;
 use std::ffi::CString;
+use std::os::raw::c_char;
 use std::ptr;
 
 unsafe fn open_db() -> *mut ffi::sqlite3 {
@@ -12,15 +13,9 @@ unsafe fn open_db() -> *mut ffi::sqlite3 {
         panic!("sqlite3_open failed: {}", rc);
     }
 
-    let ddl = b"CREATE TABLE IF NOT EXISTS metadata_items (id INTEGER PRIMARY KEY, title TEXT);\0";
-    let mut err: *mut i8 = ptr::null_mut();
-    let rc = ffi::sqlite3_exec(
-        db,
-        ddl.as_ptr() as *const i8,
-        None,
-        ptr::null_mut(),
-        &mut err,
-    );
+    let ddl = c"CREATE TABLE IF NOT EXISTS metadata_items (id INTEGER PRIMARY KEY, title TEXT);";
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = ffi::sqlite3_exec(db, ddl.as_ptr(), None, ptr::null_mut(), &mut err);
     if rc != ffi::SQLITE_OK {
         if !err.is_null() {
             ffi::sqlite3_free(err as *mut _);
@@ -29,13 +24,7 @@ unsafe fn open_db() -> *mut ffi::sqlite3 {
     }
 
     if cpath.to_bytes() == b":memory:" {
-        let _ = ffi::sqlite3_exec(
-            db,
-            b"BEGIN;\0".as_ptr() as *const i8,
-            None,
-            ptr::null_mut(),
-            &mut err,
-        );
+        let _ = ffi::sqlite3_exec(db, c"BEGIN;".as_ptr(), None, ptr::null_mut(), &mut err);
         for i in 1..=1000 {
             let sql = format!(
                 "INSERT INTO metadata_items (id, title) VALUES ({}, 't{}');",
@@ -44,13 +33,7 @@ unsafe fn open_db() -> *mut ffi::sqlite3 {
             let csql = CString::new(sql).unwrap();
             let _ = ffi::sqlite3_exec(db, csql.as_ptr(), None, ptr::null_mut(), &mut err);
         }
-        let _ = ffi::sqlite3_exec(
-            db,
-            b"COMMIT;\0".as_ptr() as *const i8,
-            None,
-            ptr::null_mut(),
-            &mut err,
-        );
+        let _ = ffi::sqlite3_exec(db, c"COMMIT;".as_ptr(), None, ptr::null_mut(), &mut err);
     }
 
     db

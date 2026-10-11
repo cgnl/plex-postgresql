@@ -480,11 +480,14 @@ mod tests {
 
     #[test]
     fn sanitize_clone_aux_args_zeroes_unused_slots() {
+        let mut parent_tid: libc::pid_t = 0;
+        let mut tls = 0u8;
+        let mut child_tid: libc::pid_t = 0;
         let aux = sanitize_clone_aux_args(
             libc::SIGCHLD,
-            0x1usize as *mut libc::pid_t,
-            0x2usize as *mut libc::c_void,
-            0x3usize as *mut libc::pid_t,
+            std::ptr::from_mut(&mut parent_tid),
+            std::ptr::from_mut(&mut tls).cast::<libc::c_void>(),
+            std::ptr::from_mut(&mut child_tid),
         );
         assert!(aux.parent_tid.is_null());
         assert!(aux.tls.is_null());
@@ -493,9 +496,12 @@ mod tests {
 
     #[test]
     fn sanitize_clone_aux_args_preserves_requested_slots() {
-        let parent_tid = 0x11usize as *mut libc::pid_t;
-        let tls = 0x22usize as *mut libc::c_void;
-        let child_tid = 0x33usize as *mut libc::pid_t;
+        let mut parent_tid_storage: libc::pid_t = 0;
+        let mut tls_storage = 0u8;
+        let mut child_tid_storage: libc::pid_t = 0;
+        let parent_tid = std::ptr::from_mut(&mut parent_tid_storage);
+        let tls = std::ptr::from_mut(&mut tls_storage).cast::<libc::c_void>();
+        let child_tid = std::ptr::from_mut(&mut child_tid_storage);
         let aux = sanitize_clone_aux_args(
             libc::SIGCHLD
                 | libc::CLONE_PARENT_SETTID

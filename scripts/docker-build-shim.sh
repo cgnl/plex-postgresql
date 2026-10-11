@@ -116,8 +116,32 @@ cat > subreaper.c << 'SUBREAPER_EOF'
 #include <unistd.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 static volatile pid_t child_pid = 0;
 static volatile int got_sigterm = 0;
+static int exit_diagnostics = 0;
+static unsigned int exit_records = 0;
+static int exit_records_truncated = 0;
+static void report_exit(pid_t p,int st,int direct){
+  if(!exit_diagnostics) return;
+  if(exit_records>=64&&!direct){
+    if(!exit_records_truncated){
+      fprintf(stderr,"plex-pg-subreaper exit-records-truncated limit=64\n");
+      exit_records_truncated=1;
+    }
+    return;
+  }
+  int core=0;
+#ifdef WCOREDUMP
+  if(WIFSIGNALED(st)) core=WCOREDUMP(st)?1:0;
+#endif
+  fprintf(stderr,"plex-pg-subreaper child-exit pid=%ld relation=%s status=0x%x exited=%d exit_code=%d signaled=%d signal=%d core=%d\n",
+    (long)p,direct?"direct":"adopted",(unsigned int)st,
+    WIFEXITED(st)?1:0,WIFEXITED(st)?WEXITSTATUS(st):-1,
+    WIFSIGNALED(st)?1:0,WIFSIGNALED(st)?WTERMSIG(st):0,core);
+  exit_records++;
+}
 void fwd(int s){
   if(s==SIGTERM||s==SIGINT) got_sigterm=1;
   /* Forward to all processes in our process group */
@@ -125,6 +149,8 @@ void fwd(int s){
 }
 int main(int c,char**v){
   if(c<2){fprintf(stderr,"usage: subreaper cmd [args...]\n");return 1;}
+  const char *diagnostics=getenv("PLEX_PG_REAPER_DIAGNOSTICS");
+  exit_diagnostics=diagnostics&&strcmp(diagnostics,"1")==0;
   prctl(PR_SET_CHILD_SUBREAPER,1,0,0,0);
   signal(SIGTERM,fwd);signal(SIGINT,fwd);signal(SIGHUP,fwd);
   child_pid=fork();
@@ -137,6 +163,7 @@ int main(int c,char**v){
    * until there are no more children (ECHILD). */
   while((p=wait(&st))>0||(p<0&&errno==EINTR)){
     if(p<=0) continue;
+    report_exit(p,st,p==child_pid);
     if(p==child_pid){
       /* Record direct child exit code, but keep waiting for grandchildren */
       exit_code=WIFEXITED(st)?WEXITSTATUS(st):128+WTERMSIG(st);

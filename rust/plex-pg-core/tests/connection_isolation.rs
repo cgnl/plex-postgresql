@@ -1,8 +1,7 @@
 use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
 
-const SIM_POOL_SIZE: usize = 8;
 const SLOT_FREE: u8 = 0;
 const SLOT_READY: u8 = 1;
 
@@ -26,7 +25,7 @@ impl SimConnection {
 }
 
 struct SimSlot {
-    conn: Arc<SimConnection>,
+    conn: Rc<SimConnection>,
     state: AtomicU8,
     owner_thread: std::thread::ThreadId,
 }
@@ -36,7 +35,7 @@ struct SimPool {
 }
 
 thread_local! {
-    static TLS_CACHED_SLOT: Cell<Option<usize>> = Cell::new(None);
+    static TLS_CACHED_SLOT: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 impl SimPool {
@@ -44,7 +43,7 @@ impl SimPool {
         Self { slots: Vec::new() }
     }
 
-    fn add_conn(&mut self, conn: Arc<SimConnection>) {
+    fn add_conn(&mut self, conn: Rc<SimConnection>) {
         self.slots.push(SimSlot {
             conn,
             state: AtomicU8::new(SLOT_READY),
@@ -52,25 +51,28 @@ impl SimPool {
         });
     }
 
-    fn get_connection(&self) -> Option<Arc<SimConnection>> {
+    fn get_connection(&self) -> Option<Rc<SimConnection>> {
         let current = std::thread::current().id();
         if let Some(idx) = TLS_CACHED_SLOT.with(|c| c.get()) {
             if idx < self.slots.len() {
                 let slot = &self.slots[idx];
-                if slot.state.load(Ordering::Acquire) == SLOT_READY && slot.conn.is_pg_active {
-                    if !slot.conn.streaming_active.load(Ordering::Acquire) {
-                        return Some(slot.conn.clone());
-                    }
+                if slot.state.load(Ordering::Acquire) == SLOT_READY
+                    && slot.conn.is_pg_active
+                    && !slot.conn.streaming_active.load(Ordering::Acquire)
+                {
+                    return Some(slot.conn.clone());
                 }
             }
         }
 
         for (idx, slot) in self.slots.iter().enumerate() {
-            if slot.state.load(Ordering::Acquire) == SLOT_READY && slot.owner_thread == current {
-                if slot.conn.is_pg_active && !slot.conn.streaming_active.load(Ordering::Acquire) {
-                    TLS_CACHED_SLOT.with(|c| c.set(Some(idx)));
-                    return Some(slot.conn.clone());
-                }
+            if slot.state.load(Ordering::Acquire) == SLOT_READY
+                && slot.owner_thread == current
+                && slot.conn.is_pg_active
+                && !slot.conn.streaming_active.load(Ordering::Acquire)
+            {
+                TLS_CACHED_SLOT.with(|c| c.set(Some(idx)));
+                return Some(slot.conn.clone());
             }
         }
 
@@ -85,13 +87,13 @@ impl SimPool {
     }
 }
 
-fn sim_pqexec(conn: &Arc<SimConnection>) {
+fn sim_pqexec(conn: &Rc<SimConnection>) {
     if conn.streaming_active.load(Ordering::Acquire) {
         conn.results_consumed.set(conn.results_consumed.get() + 1);
     }
 }
 
-fn resolve_column_tables(pool: &SimPool, pg_conn: &Arc<SimConnection>) -> i32 {
+fn resolve_column_tables(pool: &SimPool, pg_conn: &Rc<SimConnection>) -> i32 {
     let mut use_conn = pg_conn.clone();
     if pg_conn.streaming_active.load(Ordering::Acquire) {
         if let Some(alt) = pool.get_connection() {
@@ -108,7 +110,7 @@ fn resolve_column_tables(pool: &SimPool, pg_conn: &Arc<SimConnection>) -> i32 {
     use_conn.id
 }
 
-fn preload_decltype_cache(pool: &SimPool, pg_conn: &Arc<SimConnection>) -> i32 {
+fn preload_decltype_cache(pool: &SimPool, pg_conn: &Rc<SimConnection>) -> i32 {
     let mut use_conn = pg_conn.clone();
     if pg_conn.streaming_active.load(Ordering::Acquire) {
         if let Some(alt) = pool.get_connection() {
@@ -128,8 +130,8 @@ fn preload_decltype_cache(pool: &SimPool, pg_conn: &Arc<SimConnection>) -> i32 {
 #[test]
 fn pool_skips_streaming_connection_in_fast_path() {
     let mut pool = SimPool::new();
-    let conn1 = Arc::new(SimConnection::new(1));
-    let conn2 = Arc::new(SimConnection::new(2));
+    let conn1 = Rc::new(SimConnection::new(1));
+    let conn2 = Rc::new(SimConnection::new(2));
 
     pool.add_conn(conn1.clone());
     pool.add_conn(conn2.clone());
@@ -144,8 +146,8 @@ fn pool_skips_streaming_connection_in_fast_path() {
 #[test]
 fn resolve_column_tables_uses_alternate_connection_when_streaming() {
     let mut pool = SimPool::new();
-    let conn1 = Arc::new(SimConnection::new(10));
-    let conn2 = Arc::new(SimConnection::new(20));
+    let conn1 = Rc::new(SimConnection::new(10));
+    let conn2 = Rc::new(SimConnection::new(20));
 
     pool.add_conn(conn1.clone());
     pool.add_conn(conn2.clone());
@@ -158,8 +160,8 @@ fn resolve_column_tables_uses_alternate_connection_when_streaming() {
 #[test]
 fn preload_decltype_cache_uses_alternate_connection_when_streaming() {
     let mut pool = SimPool::new();
-    let conn1 = Arc::new(SimConnection::new(30));
-    let conn2 = Arc::new(SimConnection::new(40));
+    let conn1 = Rc::new(SimConnection::new(30));
+    let conn2 = Rc::new(SimConnection::new(40));
 
     pool.add_conn(conn1.clone());
     pool.add_conn(conn2.clone());
@@ -171,7 +173,7 @@ fn preload_decltype_cache_uses_alternate_connection_when_streaming() {
 
 #[test]
 fn sim_pqexec_on_streaming_marks_consumed() {
-    let conn = Arc::new(SimConnection::new(55));
+    let conn = Rc::new(SimConnection::new(55));
     conn.streaming_active.store(true, Ordering::Release);
     sim_pqexec(&conn);
     assert_eq!(conn.results_consumed.get(), 1);

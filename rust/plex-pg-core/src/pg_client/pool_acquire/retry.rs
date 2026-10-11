@@ -32,9 +32,14 @@ pub(super) fn phase6_retry(ctx: &AcquireCtx<'_>) -> *mut c_void {
     }
 
     log_error(&format!(
-        "Pool: no available slots after {} retries (all {} slots busy)",
+        "Pool: no connection after {} retries ({} slots configured, {})",
         max_retries,
-        ctx.pm.configured_size.load(Ordering::Relaxed)
+        ctx.pm.configured_size.load(Ordering::Relaxed),
+        if ctx.connect_failed.get() {
+            "PostgreSQL unreachable"
+        } else {
+            "all busy"
+        }
     ));
     retry_count_set(0);
     std::ptr::null_mut()

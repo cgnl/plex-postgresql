@@ -4,10 +4,7 @@ use std::os::raw::{c_char, c_int};
 #[test]
 fn cxa_demangle_known_types_if_available() {
     unsafe {
-        let sym = libc::dlsym(
-            libc::RTLD_DEFAULT,
-            b"__cxa_demangle\0".as_ptr() as *const c_char,
-        );
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, c"__cxa_demangle".as_ptr());
         if sym.is_null() {
             return;
         }
@@ -51,10 +48,7 @@ fn cxa_demangle_known_types_if_available() {
 #[test]
 fn cxa_demangle_invalid_name_returns_error_if_available() {
     unsafe {
-        let sym = libc::dlsym(
-            libc::RTLD_DEFAULT,
-            b"__cxa_demangle\0".as_ptr() as *const c_char,
-        );
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, c"__cxa_demangle".as_ptr());
         if sym.is_null() {
             return;
         }

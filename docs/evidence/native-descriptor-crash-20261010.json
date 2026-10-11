@@ -1,0 +1,45 @@
+{
+  "run_id": 38047664458,
+  "run_url": "https://github.com/cgnl/plex-postgresql/actions/runs/38047664458",
+  "source_sha": "e40b40a4f018457cb4145c51bce06d2bd9436b4b",
+  "lane": "plexinc-arm64-pg18",
+  "candidate": "ghcr.io/cgnl/plex-postgresql-plexinc@sha256:568f51e9b43253439f53d027e396ed431d3c815368bf8ee540f75e7c00c92ce9",
+  "plex_version": "1.43.4.10903-e5521bd8c",
+  "phase": "live-postgres-recovery",
+  "restart_cycles_completed": 100,
+  "workload_before_failure": "all restart cycles, media decodes, concurrent clients, import/rollback and outage read passed",
+  "host_pms_pid": 179966,
+  "crash_tid": 447,
+  "crash_thread": "main thread (Plex Media Serv)",
+  "signal": 11,
+  "si_code_meaning": "SEGV_MAPERR",
+  "crash_timestamp_utc": "2026-10-10T11:52:15Z",
+  "core": {
+    "bytes": 150089728,
+    "shim_in_backtrace": false,
+    "frames": [
+      "Plex Media Server ___lldb_unnamed_symbol7557 + 4  (ldr x9, [x9, x1, lsl #3]; column-pointer array read)",
+      "Plex Media Server ___lldb_unnamed_symbol7509 + 540 (column string getter, w1=1)",
+      "Plex Media Server ___lldb_unnamed_symbol34694/34680/34693/34697/34685 (SOCI row handling)",
+      "Plex Media Server ___lldb_unnamed_symbol21381 + 68",
+      "ld-musl-aarch64.so.1"
+    ],
+    "caller_context": [
+      "soci::details::prepare_temp_type(soci::session&)",
+      "soci::details::statement_impl::fetch() returned true",
+      "column read with index 1 faulted"
+    ],
+    "faulting_query": "select metadata_type, count(*) from metadata_items group by metadata_type",
+    "fault_mechanism": "statement was published without column descriptors: sqlite3_step produced rows while sqlite3_column_count returned 0, so the row's column-pointer array was uninitialized when SOCI read column 1 after fetch"
+  },
+  "oom": "host MemAvailable 14909516 kB, no cgroup OOM events",
+  "symbolication": {
+    "method": "offline LLDB with target.exec-search-paths over the exact candidate image's PMS ELF, musl loader and db_interpose_pg.so",
+    "evidence_dir": "/tmp/e40-plexinc-arm64-pg18-artifact",
+    "stack_file": "container/host-pms-179966-stack.txt",
+    "core_file": "container/host-pms-179966.core"
+  },
+  "matrix_context": "7 of 8 candidate probes and 5 of 6 soaks passed on e40b40a; this lane was the only failure",
+  "fix": "ba9ecff describes prepared statements before publishing row producers",
+  "regression": "rust/plex-pg-core/tests/metadata_descriptor_runtime.rs::metadata_descriptor_is_atomic_across_empty_results_and_postgres_outage"
+}

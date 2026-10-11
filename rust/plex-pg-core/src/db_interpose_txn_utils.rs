@@ -15,7 +15,7 @@ unsafe fn skip_leading_sql_noise_ptr(sql: *const c_char) -> *const c_char {
         return EMPTY.as_ptr() as *const c_char;
     }
 
-    let mut p = sql as *const u8;
+    let mut p = sql.cast::<u8>();
 
     loop {
         // Skip whitespace

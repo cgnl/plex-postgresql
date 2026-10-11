@@ -1,6 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rusqlite::ffi;
 use std::ffi::CString;
+use std::os::raw::c_char;
 use std::ptr;
 
 unsafe fn open_db() -> *mut ffi::sqlite3 {
@@ -12,15 +13,9 @@ unsafe fn open_db() -> *mut ffi::sqlite3 {
         panic!("sqlite3_open failed: {}", rc);
     }
 
-    let ddl = b"CREATE TABLE IF NOT EXISTS metadata_items (id INTEGER PRIMARY KEY, title TEXT, rating INTEGER, parent_id INTEGER, updated_at INTEGER);\0";
-    let mut err: *mut i8 = ptr::null_mut();
-    let rc = ffi::sqlite3_exec(
-        db,
-        ddl.as_ptr() as *const i8,
-        None,
-        ptr::null_mut(),
-        &mut err,
-    );
+    let ddl = c"CREATE TABLE IF NOT EXISTS metadata_items (id INTEGER PRIMARY KEY, title TEXT, rating INTEGER, parent_id INTEGER, updated_at INTEGER);";
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = ffi::sqlite3_exec(db, ddl.as_ptr(), None, ptr::null_mut(), &mut err);
     if rc != ffi::SQLITE_OK {
         if !err.is_null() {
             ffi::sqlite3_free(err as *mut _);
@@ -29,25 +24,13 @@ unsafe fn open_db() -> *mut ffi::sqlite3 {
     }
 
     if cpath.to_bytes() == b":memory:" {
-        let _ = ffi::sqlite3_exec(
-            db,
-            b"BEGIN;\0".as_ptr() as *const i8,
-            None,
-            ptr::null_mut(),
-            &mut err,
-        );
+        let _ = ffi::sqlite3_exec(db, c"BEGIN;".as_ptr(), None, ptr::null_mut(), &mut err);
         for i in 1..=1000 {
             let sql = format!("INSERT INTO metadata_items (id, title, rating, parent_id, updated_at) VALUES ({}, 't{}', {}, {}, {});", i, i, i % 10, i % 5, 123456 + i);
             let csql = CString::new(sql).unwrap();
             let _ = ffi::sqlite3_exec(db, csql.as_ptr(), None, ptr::null_mut(), &mut err);
         }
-        let _ = ffi::sqlite3_exec(
-            db,
-            b"COMMIT;\0".as_ptr() as *const i8,
-            None,
-            ptr::null_mut(),
-            &mut err,
-        );
+        let _ = ffi::sqlite3_exec(db, c"COMMIT;".as_ptr(), None, ptr::null_mut(), &mut err);
     }
 
     db
@@ -87,7 +70,7 @@ fn bench_shim(c: &mut Criterion) {
                 i = i.wrapping_add(1);
                 let sql = format!("SELECT * FROM metadata_items WHERE id = {}", i);
                 let csql = CString::new(sql).unwrap();
-                let mut err: *mut i8 = ptr::null_mut();
+                let mut err: *mut c_char = ptr::null_mut();
                 let rc = ffi::sqlite3_exec(db, csql.as_ptr(), None, ptr::null_mut(), &mut err);
                 if !err.is_null() {
                     ffi::sqlite3_free(err as *mut _);
@@ -99,7 +82,7 @@ fn bench_shim(c: &mut Criterion) {
         let cached_sql = CString::new("SELECT id, title FROM metadata_items WHERE id = 1").unwrap();
         c.bench_function("shim_exec_cached_sql", |b| {
             b.iter(|| {
-                let mut err: *mut i8 = ptr::null_mut();
+                let mut err: *mut c_char = ptr::null_mut();
                 let rc =
                     ffi::sqlite3_exec(db, cached_sql.as_ptr(), None, ptr::null_mut(), &mut err);
                 if !err.is_null() {

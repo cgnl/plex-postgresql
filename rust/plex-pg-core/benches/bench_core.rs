@@ -46,8 +46,7 @@ fn bench_core(c: &mut Criterion) {
     c.bench_function("core_string_replace", |b| {
         b.iter(|| {
             let input = CString::new(replace_sql).unwrap();
-            let ptr =
-                unsafe { rust_simple_str_replace(input.as_ptr(), old.as_ptr(), new_str.as_ptr()) };
+            let ptr = rust_simple_str_replace(input.as_ptr(), old.as_ptr(), new_str.as_ptr());
             if !ptr.is_null() {
                 unsafe { libc::free(ptr as *mut libc::c_void) };
             }
@@ -56,9 +55,9 @@ fn bench_core(c: &mut Criterion) {
 
     const CACHE_SIZE: usize = 64;
     let mut cache = [(0u64, false); CACHE_SIZE];
-    for i in 0..CACHE_SIZE {
+    for (i, entry) in cache.iter_mut().enumerate() {
         let key = fnv1a_hash(&(i as u64).to_le_bytes());
-        cache[i] = (key, true);
+        *entry = (key, true);
     }
 
     c.bench_function("core_cache_lookup", |b| {

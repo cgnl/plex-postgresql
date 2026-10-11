@@ -15,10 +15,7 @@ fn connect() -> Option<Client> {
         }
     }
 
-    match cfg.connect(NoTls) {
-        Ok(client) => Some(client),
-        Err(_) => None,
-    }
+    cfg.connect(NoTls).ok()
 }
 
 fn bench_pipeline(c: &mut Criterion) {
@@ -37,7 +34,7 @@ fn bench_pipeline(c: &mut Criterion) {
     let mut batch_sql = String::new();
     for i in 0..BATCH {
         if i > 0 {
-            batch_sql.push_str(";");
+            batch_sql.push(';');
         }
         batch_sql.push_str("SELECT 1");
     }

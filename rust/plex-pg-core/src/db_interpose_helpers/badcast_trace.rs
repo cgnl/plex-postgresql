@@ -47,7 +47,7 @@ pub fn rust_read_first_line_trim_to_buf(
     let bytes = trimmed.as_bytes();
     let n = bytes.len().min(out_len - 1);
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, n);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast::<u8>(), n);
         *out.add(n) = 0;
     }
     1

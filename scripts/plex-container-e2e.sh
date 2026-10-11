@@ -22,6 +22,8 @@ live_recovery_verified=0
 decoded_fixture_verified=0
 real_media_verified=0
 real_media_full_decode_verified=0
+native_roundtrip_verified=0
+concurrent_real_media_verified=0
 real_media_sample_seconds=0
 if ((soak_seconds > 60)); then real_media_sample_seconds=20; fi
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -43,20 +45,371 @@ negative_config="$fixture-negative-config"
 password=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 phase="setup"
 
+# Reuse the same bounded, environment-free collector in shell checkpoints and
+# the concurrent coordinator. This file is evidence, not a product component.
+cat > "$EVIDENCE_DIR/pms-lifecycle-probe.py" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import time
+
+
+def process_info(directory):
+    raw = (directory / "stat").read_text()
+    fields = raw.rsplit(")", 1)[1].split()
+    result = {"pid": int(directory.name), "state": fields[0],
+              "parent_pid": int(fields[1]), "start_ticks": int(fields[19])}
+    allowed = {"State", "PPid", "VmRSS", "VmHWM", "VmPeak", "Threads", "CoreDumping"}
+    result["status"] = {key: value.strip() for line in (directory / "status").read_text().splitlines()
+                        if ":" in line for key, value in [line.split(":", 1)] if key in allowed}
+    try:
+        result["core_limits"] = [line for line in (directory / "limits").read_text().splitlines()
+                                 if line.startswith(("Max core file size", "Max file size"))]
+        result["coredump_filter"] = (directory / "coredump_filter").read_text()[:64].strip()
+    except OSError:
+        result["core_limits_available"] = False
+    return result
+
+
+def memory_info():
+    roots = [Path("/sys/fs/cgroup"), Path("/sys/fs/cgroup/memory")]
+    names = ("memory.events", "memory.events.local", "memory.current", "memory.peak", "memory.max",
+             "memory.oom_control", "memory.failcnt", "memory.usage_in_bytes",
+             "memory.max_usage_in_bytes", "memory.limit_in_bytes")
+    files = {}
+    for root in roots:
+        for name in names:
+            path = root / name
+            try:
+                if path.is_file():
+                    with path.open() as source:
+                        files[name] = source.read(4096).strip()
+            except OSError:
+                pass
+    counters = {}
+    for name in ("memory.events", "memory.oom_control"):
+        for line in files.get(name, "").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                counters[name + "." + parts[0]] = int(parts[1])
+    if files.get("memory.failcnt", "").isdigit():
+        counters["memory.failcnt"] = int(files["memory.failcnt"])
+    return {"files": files, "counters": counters}
+
+
+def core_info():
+    result = {}
+    for key, filename in (("core_pattern", "/proc/sys/kernel/core_pattern"),
+                          ("core_uses_pid", "/proc/sys/kernel/core_uses_pid"),
+                          ("suid_dumpable", "/proc/sys/fs/suid_dumpable")):
+        try:
+            with Path(filename).open() as source:
+                result[key] = source.read(4096).strip()
+        except OSError:
+            result[key + "_available"] = False
+    result["core_pattern_piped"] = result.get("core_pattern", "").startswith("|")
+    return result
+
+
+def dump_index(root=Path("/run/plex-temp")):
+    result = {"root": str(root), "selected": [], "skipped": [], "scan_truncated": False,
+              "max_files": 8, "max_file_bytes": 64 * 1024 * 1024,
+              "max_total_bytes": 128 * 1024 * 1024, "selected_bytes": 0}
+    if not root.is_dir() or root.is_symlink():
+        result["available"] = False
+        return result
+    result["available"] = True
+    deadline = time.monotonic() + 2
+    for index, path in enumerate(root.rglob("*")):
+        if index >= 256 or time.monotonic() > deadline:
+            result["scan_truncated"] = True
+            break
+        if not (path.name.lower().endswith(".dmp") or path.name == "core" or path.name.startswith("core.")):
+            continue
+        reason = None
+        try:
+            if path.is_symlink() or not path.is_file():
+                reason = "not_regular_file"
+                size = 0
+            else:
+                size = path.stat().st_size
+                if size > result["max_file_bytes"]:
+                    reason = "file_size_limit"
+                elif len(result["selected"]) >= result["max_files"]:
+                    reason = "file_count_limit"
+                elif result["selected_bytes"] + size > result["max_total_bytes"]:
+                    reason = "total_size_limit"
+        except OSError:
+            reason, size = "unreadable", 0
+        entry = {"path": str(path), "bytes": size}
+        if reason:
+            entry["reason"] = reason
+            if len(result["skipped"]) < 16:
+                result["skipped"].append(entry)
+            else:
+                result["skipped_records_truncated"] = True
+        else:
+            result["selected"].append(entry)
+            result["selected_bytes"] += size
+    return result
+
+
+def read_dump(path, expected_size):
+    path = Path(path)
+    relative = path.relative_to("/run/plex-temp")
+    if ".." in relative.parts or not (path.name.lower().endswith(".dmp") or path.name == "core" or path.name.startswith("core.")):
+        raise ValueError("Unexpected transient dump path")
+    limit = 64 * 1024 * 1024
+    if not 0 <= expected_size <= limit:
+        raise ValueError("Invalid transient dump size")
+    directory = descriptor = None
+    try:
+        directory = os.open("/run/plex-temp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for part in relative.parts[:-1]:
+            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = following
+        descriptor = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != expected_size or before.st_size > limit:
+            raise ValueError("Transient dump changed or exceeded size limit")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = None
+            data = source.read(limit + 1)
+            after = os.fstat(source.fileno())
+        if len(data) != expected_size or len(data) > limit or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise ValueError("Transient dump changed during bounded read")
+        return data
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory is not None:
+            os.close(directory)
+
+
+def snapshot():
+    result = {"time": time.monotonic(), "pms": [], "parents": [],
+              "scan_complete": True, "memory": memory_info(), "core": core_info()}
+    deadline = time.monotonic() + 2
+    try:
+        entries = Path("/proc").iterdir()
+        for directory in entries:
+            if time.monotonic() > deadline:
+                result["scan_complete"] = False
+                break
+            if not directory.name.isdigit():
+                continue
+            try:
+                try:
+                    executable = os.readlink(directory / "exe")
+                except OSError:
+                    # Inspect only argv[0] to identify PMS, never return args.
+                    with (directory / "cmdline").open("rb") as source:
+                        executable = source.read(4096).split(b"\0", 1)[0].decode(errors="replace")
+                if executable.endswith("/Plex Media Server"):
+                    process = process_info(directory)
+                    result["pms"].append(process)
+                    try:
+                        parent = process_info(Path("/proc") / str(process["parent_pid"]))
+                        if parent not in result["parents"]:
+                            result["parents"].append(parent)
+                    except (OSError, ValueError, IndexError):
+                        pass
+            except (OSError, ValueError, IndexError):
+                continue
+    except OSError:
+        result["scan_complete"] = False
+    return result
+
+
+def compare(before, after):
+    old = {(process["pid"], process["start_ticks"]) for process in before["pms"]}
+    new = {(process["pid"], process["start_ticks"]) for process in after["pms"]}
+    counters = after["memory"]["counters"]
+    previous = before["memory"]["counters"]
+    delta = {key: max(0, value - previous.get(key, value)) for key, value in counters.items()}
+    complete = before["scan_complete"] and after["scan_complete"]
+    non_live = [(process["pid"], process["start_ticks"], process["state"])
+                for process in after["pms"] if process.get("state") in ("Z", "X", "x")]
+    return {"observation_complete": complete, "same_pms_processes": complete and bool(old) and old == new and not non_live,
+            "lost_pms": sorted(old - new) if complete else [],
+            "new_pms": sorted(new - old) if complete else [],
+            "pms_absent": complete and bool(old) and not new,
+            "non_live_pms": non_live,
+            "oom_counter_deltas": delta}
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--read-dump":
+        sys.stdout.buffer.write(read_dump(sys.argv[2], int(sys.argv[3])))
+    else:
+        print(json.dumps(dump_index() if sys.argv[1:] == ["--dump-index"] else snapshot()))
+PY
+
+capture_pms_lifecycle() {
+    local stage="$1"
+    [[ $(docker inspect --format '{{index .Config.Labels "plex-pg-canary"}}' "$plex" 2>/dev/null) == "$fixture" ]] || return 0
+    python3 - "$plex" "$EVIDENCE_DIR/$stage-pms-lifecycle.json" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+try:
+    probe = subprocess.run(["docker", "exec", sys.argv[1], "python3", "/tmp/plex-pms-lifecycle.py"],
+                           capture_output=True, text=True, timeout=10)
+    result = json.loads(probe.stdout) if probe.returncode == 0 else {"available": False, "exit_code": probe.returncode}
+    # Host PIDs correlate container namespace snapshots with kernel OOM logs.
+    # comm contains executable names only; arguments and environment are absent.
+    top = subprocess.run(["docker", "top", sys.argv[1], "-eo", "pid,ppid,stat,rss,comm"],
+                         capture_output=True, text=True, timeout=5)
+    result["host_processes"] = top.stdout[-8192:] if top.returncode == 0 else "unavailable"
+except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+    result = {"available": False, "error_type": type(error).__name__}
+Path(sys.argv[2]).write_text(json.dumps(result, indent=2) + "\n")
+PY
+}
+
+capture_host_failure() {
+    python3 - "$EVIDENCE_DIR" <<'PY'
+import json
+from pathlib import Path
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+root = Path(sys.argv[1])
+probe = runpy.run_path(str(root / "pms-lifecycle-probe.py"))
+result = {"memory": probe["memory_info"](), "core": probe["core_info"](), "kernel": {"available": False}}
+try:
+    allowed = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
+    result["host_memory"] = {key: value.strip() for line in Path("/proc/meminfo").read_text().splitlines()
+                             if ":" in line for key, value in [line.split(":", 1)] if key in allowed}
+except OSError:
+    pass
+if shutil.which("dmesg"):
+    try:
+        output = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5)
+        privileged_read = False
+        denied = re.search(r"permission denied|not permitted|access denied", output.stderr, re.I)
+        if output.returncode != 0 and denied and shutil.which("sudo"):
+            output = subprocess.run(["sudo", "-n", "dmesg"], capture_output=True, text=True, timeout=5)
+            privileged_read = True
+        lines = [line for line in output.stdout.splitlines()
+                 if re.search(r"out of memory|oom.kill|killed process|memory cgroup|segfault|general protection fault|plex media", line, re.I)]
+        result["kernel"] = {"available": output.returncode == 0, "exit_code": output.returncode,
+                            "noninteractive_privileged_read": privileged_read,
+                            "filtered_tail": "\n".join(lines[-100:])[-32768:]}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        result["kernel"]["error_type"] = type(error).__name__
+(root / "host-failure-memory.json").write_text(json.dumps(result, indent=2) + "\n")
+PY
+}
+
+capture_transient_dumps() {
+    python3 - "$1" "$fixture" "$EVIDENCE_DIR/$1-diagnostics" <<'PY'
+import json
+from pathlib import Path, PurePosixPath
+import subprocess
+import sys
+container, fixture, destination = sys.argv[1:]
+root = Path(destination)
+root.mkdir(parents=True, exist_ok=True)
+record = {"available": False, "copied": [], "copy_failures": []}
+try:
+    owned = subprocess.run(["docker", "inspect", "--format", '{{index .Config.Labels "plex-pg-canary"}}', container],
+                           capture_output=True, text=True, timeout=5)
+    if owned.returncode != 0 or owned.stdout.strip() != fixture:
+        raise RuntimeError("Container ownership was not verified")
+    probe = subprocess.run(["docker", "exec", container, "python3", "/tmp/plex-pms-lifecycle.py", "--dump-index"],
+                           capture_output=True, text=True, timeout=5)
+    if probe.returncode == 0:
+        record = json.loads(probe.stdout)
+        record.update({"copied": [], "copy_failures": []})
+        dump_root = root / "transient-dumps"
+        transferred = 0
+        for index, entry in enumerate(record.get("selected", [])[:8]):
+            path = PurePosixPath(entry["path"])
+            relative = path.relative_to("/run/plex-temp")
+            if ".." in relative.parts or not (path.name.lower().endswith(".dmp") or path.name == "core" or path.name.startswith("core.")):
+                raise RuntimeError("Unexpected transient dump path")
+            dump_root.mkdir(exist_ok=True)
+            copied = dump_root / (str(index + 1) + "-" + path.name)
+            partial = copied.with_name(copied.name + ".partial")
+            promoted = False
+            try:
+                if not isinstance(entry["bytes"], int) or not 0 <= entry["bytes"] <= 64 * 1024 * 1024:
+                    raise ValueError("Invalid indexed dump size")
+                if transferred + entry["bytes"] > 128 * 1024 * 1024:
+                    raise ValueError("Transient dump total size limit")
+                transfer = subprocess.run(["docker", "exec", container, "python3", "/tmp/plex-pms-lifecycle.py",
+                                           "--read-dump", str(path), str(entry["bytes"])],
+                                          capture_output=True, timeout=10)
+                if transfer.returncode != 0 or len(transfer.stdout) != entry["bytes"] or len(transfer.stdout) > 64 * 1024 * 1024:
+                    raise ValueError("Transient dump source changed or bounded transfer failed")
+                if partial.is_symlink() or copied.is_symlink():
+                    raise ValueError("Unexpected transient dump evidence symlink")
+                partial.write_bytes(transfer.stdout)
+                partial.replace(copied)
+                promoted = True
+                transferred += len(transfer.stdout)
+                record["copied"].append({"path": str(path), "evidence": str(copied.relative_to(root)), "bytes": len(transfer.stdout)})
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                record["copy_failures"].append({"path": str(path), "reason": type(error).__name__})
+            finally:
+                partial.unlink(missing_ok=True)
+                if not promoted:
+                    copied.unlink(missing_ok=True)
+    else:
+        record["probe_exit_code"] = probe.returncode
+except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+    record["collection_error_type"] = type(error).__name__
+(root / "transient-dump-index.json").write_text(json.dumps(record, indent=2) + "\n")
+PY
+}
+
+compare_pms_lifecycle() {
+    python3 - "$EVIDENCE_DIR" "$1" "$2" <<'PY'
+import json
+from pathlib import Path
+import runpy
+import sys
+root = Path(sys.argv[1])
+before = json.loads((root / (sys.argv[2] + "-pms-lifecycle.json")).read_text())
+after = json.loads((root / (sys.argv[3] + "-pms-lifecycle.json")).read_text())
+if "pms" in before and "pms" in after:
+    probe = runpy.run_path(str(root / "pms-lifecycle-probe.py"))
+    result = probe["compare"](before, after)
+else:
+    result = {"observation_complete": False}
+(root / (sys.argv[3] + "-pms-transition.json")).write_text(json.dumps(result, indent=2) + "\n")
+PY
+}
+
 cleanup() {
     status=$?
     trap - EXIT
-    for container in "$plex" "$negative" "$postgres"; do
+    capture_pms_lifecycle cleanup || true
+    if ((status != 0)); then capture_host_failure || true; fi
+    # systemd-coredump runs on the host. Resolve symbols while the owned
+    # supervisor still keeps /proc/<container-init>/root available.
+    if ((status != 0)); then
+        python3 "$script_dir/plex-host-core-diagnostic.py" "$EVIDENCE_DIR" "$plex" "$fixture" || true
+    fi
+    for container in "$plex" "$negative" "$fixture-source" "$fixture-imported" "$fixture-restored" "$postgres"; do
         if [[ $(docker inspect --format '{{index .Config.Labels "plex-pg-canary"}}' "$container" 2>/dev/null) == "$fixture" ]]; then
             docker logs "$container" > "$EVIDENCE_DIR/$container.log" 2>&1 || true
             docker inspect --format '{{json .State}}' "$container" > "$EVIDENCE_DIR/$container-state.json" || true
             mkdir -p "$EVIDENCE_DIR/$container-diagnostics"
+            if ((status != 0)); then capture_transient_dumps "$container" || true; fi
             docker cp "$container:/config/Library/Application Support/Plex Media Server/Crash Reports" "$EVIDENCE_DIR/$container-diagnostics/" 2>/dev/null || true
             docker cp "$container:/config/Library/Application Support/Plex Media Server/Logs" "$EVIDENCE_DIR/$container-diagnostics/" 2>/dev/null || true
             docker rm -fv "$container" >/dev/null || true
         fi
     done
-    for volume in "$config" "$negative_config"; do
+    for volume in "$config" "$negative_config" "$fixture-source-config" "$fixture-imported-config" "$fixture-restored-config"; do
         if [[ $(docker volume inspect --format '{{index .Labels "plex-pg-canary"}}' "$volume" 2>/dev/null) == "$fixture" ]]; then
             docker volume rm "$volume" >/dev/null || true
         fi
@@ -67,11 +420,11 @@ cleanup() {
     if [[ $(docker network inspect --format '{{index .Labels "plex-pg-canary"}}' "$download_network" 2>/dev/null) == "$fixture" ]]; then
         docker network rm "$download_network" >/dev/null || true
     fi
-    python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" "$real_media_verified" "$real_media_full_decode_verified" <<'PY'
+    python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" "$real_media_verified" "$real_media_full_decode_verified" "$native_roundtrip_verified" "$concurrent_real_media_verified" <<'PY'
 import json
 import sys
 from pathlib import Path
-path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded, real_media, full_decode = sys.argv[1:]
+path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded, real_media, full_decode, roundtrip, concurrent = sys.argv[1:]
 Path(path).write_text(json.dumps({
     "phase": phase, "exit_code": int(status), "candidate": image,
     "plex_version": version, "variant": variant, "arch": arch,
@@ -82,6 +435,9 @@ Path(path).write_text(json.dumps({
     "decoded_fixture_verified": decoded == '1',
     "real_movie_and_tv_playback_verified": real_media == '1',
     "real_media_full_decode_verified": full_decode == '1',
+    "native_import_and_rollback_verified": roundtrip == '1',
+    "four_concurrent_real_media_clients_verified": concurrent == '1',
+    "workload_passed": status == '0' and phase == 'native-workload-complete',
     "promotion_allowed": False,
     "missing_gate": "Full native matrix, scan/playback/watch-state/artwork and sustained outage workload",
 }, indent=2) + "\n")
@@ -138,6 +494,7 @@ start_plex() {
         -e VERSION=docker -e PLEX_PG_HOST=postgres -e PLEX_PG_PORT=5432 \
         -e PLEX_PG_DATABASE=plex -e PLEX_PG_USER=plex -e "PLEX_PG_PASSWORD=$password" \
         -e PLEX_PG_SCHEMA=plex -e PLEX_PG_LOG_LEVEL=DEBUG -e MIGRATION_INTERACTIVE=0 \
+        -e PLEX_PG_REAPER_DIAGNOSTICS=1 \
         "$candidate_id" >/dev/null
 }
 
@@ -219,6 +576,8 @@ print("Actual PMS processes load db_interpose_pg.so:", [p.name for p in processe
 phase="first-start"
 start_plex "$plex" "$config"
 assert_ready "$plex" first-start
+docker cp "$EVIDENCE_DIR/pms-lifecycle-probe.py" "$plex:/tmp/plex-pms-lifecycle.py"
+capture_pms_lifecycle first-start
 phase="media-bootstrap"
 docker exec "$plex" mkdir -p /config/runtime-fixture-media
 # Plex installs its own H.264/AAC codecs on first analysis. Permit outbound
@@ -328,10 +687,13 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 url = "http://127.0.0.1:32400/library/sections/" + sys.argv[1] + "/all"
+last_body = b""
+last_error = "Analyzed fixture metadata not yet available"
 for attempt in range(90):
     try:
         with urllib.request.urlopen(url, timeout=3) as response:
             body = response.read()
+        last_body = body
         videos = [video for video in ET.fromstring(body).iter("Video")
                   if any(part.get("file") == sys.argv[2] for part in video.iter("Part"))]
         if len(videos) > 1:
@@ -342,6 +704,14 @@ for attempt in range(90):
                                   and any(part.get("file") == sys.argv[2] for part in media.iter("Part"))
                                   for media in videos[0].iter("Media")):
             video = videos[0]
+            # The scanner commits dimensions before generated thumbnail/art
+            # URLs. Poll publication as part of readiness, then certify both
+            # native routes and their actual image payloads below.
+            missing_images = [attribute for attribute in ("thumb", "art") if not video.get(attribute)]
+            if missing_images:
+                last_error = "Native " + "/".join(missing_images) + " route not yet published"
+                time.sleep(2)
+                continue
             parts = [part for part in video.iter("Part") if part.get("file") == sys.argv[2]]
             if len(parts) != 1 or not parts[0].get("key", "").startswith("/library/parts/"):
                 raise SystemExit("Scanned media lacks a unique native file route")
@@ -379,11 +749,12 @@ for attempt in range(90):
             print("PASS native media-file bytes, decoded frames and thumbnail/art routes", file=sys.stderr)
             print(body.decode())
             break
-    except (urllib.error.URLError, TimeoutError):
-        pass
+    except (urllib.error.URLError, TimeoutError) as error:
+        last_error = str(error)
     time.sleep(2)
 else:
-    raise SystemExit("Actual scanner never exposed analyzed fixture media through Plex API")
+    print(last_body.decode(errors="replace"))
+    raise SystemExit("Actual scanner never exposed analyzed fixture media and native artwork through Plex API: " + last_error)
 PY
     assert_no_crash_reports "$plex"
     docker exec "$postgres" psql -X -U plex -d plex -v ON_ERROR_STOP=1 -Atc \
@@ -456,10 +827,233 @@ assert_real_media() {
     [[ $(cat "$EVIDENCE_DIR/$stage-tv-shadow.txt") == 0 ]] || { echo "TV metadata leaked to SQLite" >&2; return 1; }
     assert_no_crash_reports "$plex"
 }
+assert_concurrent_real_media() {
+    local stage="$1" output="/tmp/concurrent-real-media-$1" status=0
+    docker exec -i "$plex" python3 - "$section_id" "$tv_section_id" "$bbb_file" \
+        "$tv_season/The Beverly Hillbillies - S01E01 - The Clampetts Strike Oil.mp4" \
+        "$tv_season/The Beverly Hillbillies - S01E02 - Getting Settled.mp4" "$output" <<'PY' || status=1
+import json
+import os
+from pathlib import Path
+import signal
+import runpy
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+movie_section, tv_section, movie, episode1, episode2, destination = sys.argv[1:]
+output = Path(destination)
+output.mkdir(parents=True, exist_ok=False)
+gate = output / "start"
+lifecycle = runpy.run_path("/tmp/plex-pms-lifecycle.py")
+baseline = lifecycle["snapshot"]()
+result = {"passed": False, "clients_requested": 4, "sample_seconds": 20, "decoder_input_rate": "realtime",
+          "browser_playback_verified": False, "server_transcoding_verified": False,
+          "workload": [], "postgres_sessions": [],
+          "pms_lifecycle": {"before": baseline, "during": []}}
+clients = []
+logs = []
+workload_errors = []
+done = threading.Event()
+base = "http://127.0.0.1:32400"
+
+def request(path, params=None):
+    url = base + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=10) as response:
+        body = response.read(8 * 1024 * 1024 + 1)
+    if len(body) > 8 * 1024 * 1024:
+        raise RuntimeError("Oversized workload metadata response")
+    return body
+
+def mixed_workload(key):
+    try:
+        started = time.monotonic()
+        request("/library/sections/" + tv_section + "/refresh", {"force": 1})
+        result["workload"].append({"action": "tv_rescan", "start": started,
+                                   "end": time.monotonic(), "passed": True})
+        for iteration in range(60):
+            if done.is_set():
+                break
+            if iteration in (5, 20, 40):
+                started = time.monotonic()
+                request("/library/sections/" + tv_section + "/refresh", {"force": 1})
+                result["workload"].append({"action": "tv_rescan", "start": started,
+                                           "end": time.monotonic(), "passed": True})
+            started = time.monotonic()
+            root = ET.fromstring(request("/library/metadata/" + key))
+            if not any(video.get("ratingKey") == key for video in root.iter("Video")):
+                raise RuntimeError("Concurrent metadata read lost real movie identity")
+            action = "scrobble" if iteration % 2 == 0 else "unscrobble"
+            request("/:/" + action, {"key": key, "identifier": "com.plexapp.plugins.library"})
+            watched = list(ET.fromstring(request("/library/metadata/" + key)).iter("Video"))
+            if len(watched) != 1 or (int(watched[0].get("viewCount", "0")) > 0) != (action == "scrobble"):
+                raise RuntimeError("Concurrent real-media watch write was not visible through Plex API")
+            result["workload"].append({"action": "metadata_read_and_" + action,
+                                       "start": started, "end": time.monotonic(), "passed": True})
+            done.wait(0.1)
+    except Exception as error:
+        workload_errors.append(str(error))
+
+# Record the real native decoder process interval, excluding metadata setup
+# and codec version checks. Its input is the Plex HTTP original-file route.
+client_code = r'''
+import json, os, runpy, subprocess, sys, time
+from pathlib import Path
+gate, output, *arguments = sys.argv[1:]
+deadline = time.monotonic() + 15
+while not Path(gate).exists():
+    if time.monotonic() > deadline: raise RuntimeError("Concurrent client start gate timed out")
+    time.sleep(0.01)
+original_run = subprocess.run
+def timed_run(command, *args, **kwargs):
+    if "-progress" not in command:
+        return original_run(command, *args, **kwargs)
+    # Read HTTP media at playback speed to sustain a meaningful bounded load
+    # rather than racing four decoders through the sample as fast as possible.
+    command = list(command)
+    command.insert(command.index("-i"), "-re")
+    started = time.monotonic()
+    try:
+        return original_run(command, *args, **kwargs)
+    finally:
+        Path(output, "decoder-interval.json").write_text(json.dumps({"start": started, "end": time.monotonic()}))
+subprocess.run = timed_run
+sys.argv = ["/tmp/verify-bbb-playback.py", *arguments]
+runpy.run_path(sys.argv[0], run_name="__main__")
+'''
+pg_environment = os.environ.copy()
+for name in ("HOST", "PORT", "DATABASE", "USER", "PASSWORD"):
+    pg_environment["PG" + name] = os.environ["PLEX_PG_" + name]
+workload = None
+try:
+    listing = ET.fromstring(request("/library/sections/" + movie_section + "/all"))
+    movies = [video for video in listing.iter("Video")
+              if any(part.get("file") == movie for part in video.iter("Part"))]
+    if len(movies) != 1:
+        raise RuntimeError("Concurrent burst lacks unique genuine BBB metadata")
+    key = movies[0].get("ratingKey")
+    fixtures = [(movie_section, movie, []),
+                (tv_section, episode1, ["--kind", "episode", "--season", "1", "--episode", "1"]),
+                (tv_section, episode2, ["--kind", "episode", "--season", "1", "--episode", "2"]),
+                (movie_section, movie, [])]
+    for index, (section, media, options) in enumerate(fixtures, 1):
+        directory = output / ("client-" + str(index))
+        directory.mkdir()
+        log = (directory / "client.log").open("wb")
+        logs.append(log)
+        clients.append(subprocess.Popen([sys.executable, "-c", client_code, str(gate), str(directory),
+                                         section, media, str(directory), *options, "--sample-seconds", "20"],
+                                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True))
+    gate.touch()
+    workload = threading.Thread(target=mixed_workload, args=(key,), daemon=True)
+    workload.start()
+    deadline = time.monotonic() + 180
+    next_lifecycle = time.monotonic()
+    while any(client.poll() is None for client in clients):
+        if time.monotonic() > deadline:
+            raise RuntimeError("Concurrent real-media burst exceeded 180 seconds")
+        count = subprocess.run(["psql", "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c",
+                                "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
+                                "AND client_addr IS NOT NULL AND pid<>pg_backend_pid()"],
+                               env=pg_environment, capture_output=True, text=True, timeout=10, check=True)
+        result["postgres_sessions"].append({"time": time.monotonic(), "count": int(count.stdout.strip())})
+        if time.monotonic() >= next_lifecycle and len(result["pms_lifecycle"]["during"]) < 32:
+            current = lifecycle["snapshot"]()
+            result["pms_lifecycle"]["during"].append({"snapshot": current,
+                                                     "transition": lifecycle["compare"](baseline, current)})
+            next_lifecycle = time.monotonic() + 1
+        time.sleep(0.1)
+    done.set()
+    workload.join(timeout=25)
+    if workload.is_alive() or workload_errors:
+        raise RuntimeError("Concurrent metadata/watch workload failed: " + "; ".join(workload_errors))
+    if any(client.returncode != 0 for client in clients):
+        raise RuntimeError("Concurrent real-media client failed; see client logs")
+    results = []
+    for index in range(1, 5):
+        directory = output / ("client-" + str(index))
+        playback = json.loads((directory / "bbb-playback.json").read_text())
+        interval = json.loads((directory / "decoder-interval.json").read_text())
+        if not (playback.get("passed") and playback["decode"]["completed"]
+                and playback["decode"]["input"] == "plex_http"
+                and playback["delivery"]["sample_seconds"] == 20):
+            raise RuntimeError("Concurrent client did not complete real HTTP audio/video decoding")
+        results.append({"client": index, "interval": interval, "media": playback["media"],
+                        "passed": True, "playback_evidence": "client-" + str(index) + "/bbb-playback.json"})
+    overlap_start = max(item["interval"]["start"] for item in results)
+    overlap_end = min(item["interval"]["end"] for item in results)
+    result["clients"] = results
+    result["four_client_overlap_seconds"] = max(0, overlap_end - overlap_start)
+    if overlap_end <= overlap_start:
+        raise RuntimeError("Four real HTTP decoder processes did not overlap")
+    mixed_overlap = [event for event in result["workload"]
+                     if event["start"] < overlap_end and event["end"] > overlap_start]
+    if not any(event["action"].startswith("metadata_read_and_") for event in mixed_overlap):
+        raise RuntimeError("Metadata/watch workload did not overlap all four HTTP clients")
+    if not any(event["action"] == "tv_rescan" for event in mixed_overlap):
+        raise RuntimeError("Real TV rescan did not overlap all four HTTP clients")
+    if not any(sample["count"] > 0 and overlap_start <= sample["time"] <= overlap_end
+               for sample in result["postgres_sessions"]):
+        raise RuntimeError("No PostgreSQL session observation during four-client overlap")
+    result["mixed_workload_overlap_events"] = len(mixed_overlap)
+    result["passed"] = True
+except Exception as error:
+    result["error"] = str(error)
+    print("FAIL concurrent real-media burst: " + str(error), file=sys.stderr)
+finally:
+    done.set()
+    final_snapshot = lifecycle["snapshot"]()
+    result["pms_lifecycle"]["after"] = final_snapshot
+    result["pms_lifecycle"]["transition"] = lifecycle["compare"](baseline, final_snapshot)
+    transitions = [result["pms_lifecycle"]["transition"],
+                   *(item["transition"] for item in result["pms_lifecycle"]["during"])]
+    result["pms_process_survived_burst"] = all(item["same_pms_processes"] for item in transitions)
+    if result["passed"] and not result["pms_process_survived_burst"]:
+        result["passed"] = False
+        result["error"] = "Actual PMS PID/start-time identity changed during concurrent real-media burst"
+    for client in clients:
+        if client.poll() is None:
+            os.killpg(client.pid, signal.SIGTERM)
+            try:
+                client.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(client.pid, signal.SIGKILL)
+                client.wait(timeout=5)
+    for log in logs:
+        log.close()
+    (output / "concurrent-playback.json").write_text(json.dumps(result, indent=2) + "\n")
+if result["passed"]:
+    print("PASS four overlapping real H264/audio HTTP clients with TV scan and metadata/watch workload")
+sys.exit(0 if result["passed"] else 1)
+PY
+    mkdir -p "$EVIDENCE_DIR/$stage-concurrent-real-media"
+    docker cp "$plex:$output/." "$EVIDENCE_DIR/$stage-concurrent-real-media/" || status=1
+    ((status == 0)) || return 1
+    assert_no_crash_reports "$plex"
+}
+
 assert_real_media first-start "$real_media_sample_seconds"
 real_media_verified=1
 if ((real_media_sample_seconds == 0)); then real_media_full_decode_verified=1; fi
+if ((real_media_sample_seconds == 0)); then
+    phase="native-import-and-rollback"
+    : "${BASE_PLEX_IMAGE:?digest-pinned original Plex base required for native source/rollback proof}"
+    python3 "$script_dir/plex-native-roundtrip.py" --candidate "$candidate_id" \
+        --base-image "$BASE_PLEX_IMAGE" --postgres "$postgres" --network "$network" \
+        --fixture "$fixture" --evidence-dir "$EVIDENCE_DIR/native-roundtrip" \
+        --media-cache "$media_cache" --expected-version "$EXPECTED_PLEX_VERSION"
+    native_roundtrip_verified=1
+fi
+capture_pms_lifecycle before-download-network-disconnect
 docker network disconnect "$download_network" "$plex"
+capture_pms_lifecycle after-download-network-disconnect
+compare_pms_lifecycle before-download-network-disconnect after-download-network-disconnect
 phase="watch-state"
 metadata_id=$(docker exec "$postgres" psql -X -U plex -d plex -v ON_ERROR_STOP=1 -Atc \
     "SELECT metadata.id FROM plex.metadata_items metadata JOIN plex.media_items media ON media.metadata_item_id=metadata.id JOIN plex.media_parts part ON part.media_item_id=media.id WHERE metadata.library_section_id=$section_id AND part.file='$media_file';")
@@ -499,6 +1093,11 @@ PY
 }
 set_watch_state scrobble
 assert_watch_state watched 1
+phase="concurrent-real-media"
+assert_concurrent_real_media smoke
+concurrent_real_media_verified=1
+set_watch_state scrobble
+assert_watch_state concurrent-smoke-watched 1
 phase="restart"
 for ((cycle=1; cycle<=restart_cycles; cycle++)); do
     stage=restart
@@ -506,6 +1105,7 @@ for ((cycle=1; cycle<=restart_cycles; cycle++)); do
     phase="$stage"
     docker restart "$plex" >/dev/null
     assert_ready "$plex" "$stage"
+    capture_pms_lifecycle "$stage"
     assert_section_routing "$stage"
     assert_scanned_media "$stage"
     assert_watch_state "$stage" 1
@@ -531,6 +1131,7 @@ if ((soak_seconds > 0)); then
         done
         ((reader_failure == 0)) || { echo "Concurrent soak reader failed" >&2; exit 1; }
         assert_real_media "$stage" 20
+        assert_concurrent_real_media "$stage"
         set_watch_state unscrobble
         assert_watch_state "$stage-unwatched" 0
         set_watch_state scrobble
@@ -609,6 +1210,6 @@ done
 docker restart "$negative" >/dev/null
 assert_ready "$negative" recovery
 assert_no_crash_reports "$negative"
-phase="workload-smoke-complete-certification-incomplete"
-echo "API routing/persistence and container smoke completed. PROMOTION BLOCKED: full native workload certification is incomplete." >&2
-exit 1
+phase="native-workload-complete"
+echo "PASS native workload; complete matrix certification is evaluated separately."
+exit 0

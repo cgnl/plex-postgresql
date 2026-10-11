@@ -374,7 +374,7 @@ pub(super) fn prepare_v2_internal_impl(
         rc
     };
 
-    unsafe {
+    let registered = unsafe {
         clear_connection_error_state(db);
         maybe_register_pg_stmt(
             effective_pg_conn,
@@ -385,12 +385,15 @@ pub(super) fn prepare_v2_internal_impl(
             is_write,
             &mut pre_trans,
             &mut have_pre_trans,
-        );
-    }
+        )
+    };
 
     if have_pre_trans {
         unsafe { sql_translation_free(&mut pre_trans as *mut SqlTranslation) };
     }
 
+    if !registered {
+        return SQLITE_ERROR;
+    }
     rc
 }

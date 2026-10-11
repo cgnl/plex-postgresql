@@ -189,7 +189,7 @@ fn dummy_sql_many_params() {
 #[test]
 fn shadow_elimination_memory_db_opens() -> Result<()> {
     let conn = Connection::open_in_memory()?;
-    let mut stmt = conn.prepare("SELECT 1 WHERE 0")?;
+    let stmt = conn.prepare("SELECT 1 WHERE 0")?;
     assert_eq!(stmt.parameter_count(), 0);
     Ok(())
 }
@@ -197,7 +197,7 @@ fn shadow_elimination_memory_db_opens() -> Result<()> {
 #[test]
 fn shadow_elimination_dummy_with_params() -> Result<()> {
     let conn = Connection::open_in_memory()?;
-    let mut stmt = conn.prepare(
+    let stmt = conn.prepare(
         "SELECT 1 WHERE ? IS NOT NULL AND ? IS NOT NULL AND ? IS NOT NULL AND ? IS NOT NULL AND ? IS NOT NULL",
     )?;
     assert_eq!(stmt.parameter_count(), 5);

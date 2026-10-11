@@ -168,7 +168,14 @@ pub fn translate(sqlite_sql: &str) -> Result<Translation, String> {
         pipeline.apply(stmt, &mut ctx);
     }
 
-    let sql = stmts.iter().map(emit::emit).collect::<Vec<_>>().join("; ");
+    let sql = stmts
+        .iter()
+        .map(|stmt| {
+            upsert::emit_supported_replace(stmt)
+                .map(|replacement| replacement.unwrap_or_else(|| emit::emit(stmt)))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .join("; ");
 
     let validation_mode =
         parse_output_validation_mode(env_utils::env_string(VALIDATE_MODE_ENV).as_deref());

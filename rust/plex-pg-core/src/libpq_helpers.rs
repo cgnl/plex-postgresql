@@ -446,7 +446,7 @@ unsafe fn read_pg_int(res: *const PGresult, row: c_int, col: c_int) -> Option<i3
     if ptr.is_null() || len <= 0 {
         return None;
     }
-    let s = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+    let s = std::slice::from_raw_parts(ptr.cast::<u8>(), len as usize);
     std::str::from_utf8(s).ok()?.trim().parse::<i32>().ok()
 }
 
