@@ -104,6 +104,7 @@ mod tests {
             pool_size: 4,
             db_path: std::ptr::null(),
             exclude_conn: std::ptr::null(),
+            connect_failed: &std::cell::Cell::new(false),
         };
         reclaim_zombies_and_reap(&ctx);
         assert_eq!(pm.slots[0].owner_thread.load(Ordering::Acquire), 7);
@@ -147,6 +148,7 @@ mod tests {
                         pool_size: 1,
                         db_path: std::ptr::null(),
                         exclude_conn: std::ptr::null(),
+                        connect_failed: &std::cell::Cell::new(false),
                     };
                     barrier.wait();
                     for _ in 0..1000 {

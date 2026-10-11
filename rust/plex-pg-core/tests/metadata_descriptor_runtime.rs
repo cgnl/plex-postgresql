@@ -122,6 +122,7 @@ unsafe fn dlerror() -> String {
 struct ProxyState {
     online: bool,
     streams: Vec<TcpStream>,
+    refused: usize,
 }
 
 struct PgProxy {
@@ -139,6 +140,7 @@ impl PgProxy {
         let state = Arc::new(Mutex::new(ProxyState {
             online: true,
             streams: Vec::new(),
+            refused: 0,
         }));
         let running = Arc::new(AtomicBool::new(true));
         let worker_state = Arc::clone(&state);
@@ -149,6 +151,7 @@ impl PgProxy {
                     Ok((client, _)) => {
                         let mut state = worker_state.lock().unwrap();
                         if !state.online {
+                            state.refused += 1;
                             continue;
                         }
                         let server = TcpStream::connect(&upstream).unwrap();
@@ -174,6 +177,11 @@ impl PgProxy {
             running,
             worker: Some(worker),
         }
+    }
+
+    /// Connections the proxy dropped while offline.
+    fn refused(&self) -> usize {
+        self.state.lock().unwrap().refused
     }
 
     fn set_online(&self, online: bool) {
@@ -332,6 +340,7 @@ fn metadata_descriptor_is_atomic_across_empty_results_and_postgres_outage() {
         );
 
         proxy.set_online(false);
+        let refused_before = proxy.refused();
         for attempt in 0..8 {
             let (outage_rc, outage_stmt) = api.prepare_query(db);
             assert_ne!(
@@ -345,6 +354,14 @@ fn metadata_descriptor_is_atomic_across_empty_results_and_postgres_outage() {
             );
         }
 
+        // Each failed prepare may run two descriptor rounds, each one acquire
+        // of 1 + 3 retry rounds (PLEX_PG_RETRY_DELAYS) with one fresh connect
+        // per round. More means the pool is storming every slot or growing.
+        let outage_connects = proxy.refused() - refused_before;
+        assert!(
+            outage_connects <= 8 * 2 * 4,
+            "{outage_connects} connection attempts for 8 prepares during the outage"
+        );
         observer
             .batch_execute("INSERT INTO metadata_items VALUES (10, 2), (11, 2), (12, 7)")
             .unwrap();

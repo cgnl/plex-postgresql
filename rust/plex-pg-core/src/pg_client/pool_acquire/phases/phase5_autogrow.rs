@@ -11,6 +11,10 @@ use super::common::{
 };
 
 pub(crate) fn phase5_autogrow(ctx: &AcquireCtx<'_>) -> AcquireDecision {
+    // Growth adds capacity; it cannot help while PostgreSQL is unreachable.
+    if ctx.connect_failed.get() {
+        return AcquireDecision::Continue;
+    }
     let current_size = ctx.pm.configured_size.load(Ordering::Relaxed);
     let runtime_max = ctx.pm.pool_max();
     if current_size >= runtime_max {

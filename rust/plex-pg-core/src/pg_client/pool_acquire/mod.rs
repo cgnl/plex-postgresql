@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 
@@ -46,6 +47,7 @@ pub(super) fn pool_get_connection_inner_excluding(
 
     remember_library_path(pm, &selected_path);
 
+    let connect_failed = Cell::new(false);
     let ctx = AcquireCtx {
         pm,
         current_thread,
@@ -53,6 +55,7 @@ pub(super) fn pool_get_connection_inner_excluding(
         pool_size: pm.pool_size(),
         db_path,
         exclude_conn,
+        connect_failed: &connect_failed,
     };
 
     if let AcquireDecision::Return(conn) = phase1_existing_ready(&ctx) {

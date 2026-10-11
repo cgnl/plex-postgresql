@@ -15,6 +15,9 @@ use crate::log_info_lazy;
 pub(crate) fn phase3_create_empty(ctx: &AcquireCtx<'_>) -> AcquireDecision {
     for i in 0..ctx.pool_size {
         let slot = &ctx.pm.slots[i];
+        if ctx.connect_failed.get() {
+            break;
+        }
         if !slot.conn.load(Ordering::Acquire).is_null() {
             continue;
         }
@@ -35,6 +38,7 @@ pub(crate) fn phase3_create_empty(ctx: &AcquireCtx<'_>) -> AcquireDecision {
 
         log_error(&format!("Pool: failed to create connection for slot {}", i));
         release_failed_new_connection(slot, new_conn);
+        ctx.connect_failed.set(true);
     }
 
     AcquireDecision::Continue
