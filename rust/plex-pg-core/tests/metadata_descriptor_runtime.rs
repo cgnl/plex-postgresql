@@ -214,10 +214,9 @@ fn pipe(mut reader: TcpStream, mut writer: TcpStream) {
 unsafe fn assert_descriptor(api: Api, stmt: Handle) {
     assert_eq!((api.column_count)(stmt), 2);
     // Aggregate expressions carry no declared type, as in SQLite itself.
-    for (index, expected_name, expected_type) in [
-        (0, "metadata_type", Some("INTEGER")),
-        (1, "count", None),
-    ] {
+    for (index, expected_name, expected_type) in
+        [(0, "metadata_type", Some("INTEGER")), (1, "count", None)]
+    {
         let name = (api.column_name)(stmt, index);
         let decltype = (api.column_decltype)(stmt, index);
         assert!(!name.is_null(), "column {index} has no name");

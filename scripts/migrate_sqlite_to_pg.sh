@@ -12,6 +12,8 @@ PG_USER="${PLEX_PG_USER:-plex}"
 PG_SCHEMA="${PLEX_PG_SCHEMA:-plex}"
 
 PSQL="psql -h $PG_HOST -p $PG_PORT -U $PG_USER -d $PG_DATABASE"
+# migrate_table.py streams through plain psql; point it at the same database.
+export PGHOST="$PG_HOST" PGPORT="$PG_PORT" PGUSER="$PG_USER" PGDATABASE="$PG_DATABASE"
 
 echo "=== Plex SQLite to PostgreSQL Migration ==="
 echo "SQLite: $SQLITE_DB"
@@ -40,41 +42,65 @@ $PSQL -f "$(dirname "$0")/../schema/plex_schema.sql"
 echo "Step 2b: Applying PostgreSQL compatibility functions..."
 $PSQL -f "$(dirname "$0")/../schema/pg_compat_functions.sql"
 
-echo "Step 3: Exporting tables from SQLite..."
+echo "Step 3: Snapshotting the SQLite sources..."
+
+# Every table must come from one consistent point in time, and the live files
+# are never read again. The snapshot refuses sources that change underneath it.
+SNAPSHOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/plex-migration-source.XXXXXXXX")
+trap 'rm -rf "$SNAPSHOT_DIR"' EXIT
+if ! bash -c 'source "$1"; snapshot_sqlite_sources "$2" "$3"' sqlite-source-snapshot \
+    "$(dirname "$0")/migrate_lib.sh" "$SQLITE_DB" "$SNAPSHOT_DIR"; then
+    echo "ERROR: Could not snapshot $SQLITE_DB; stop Plex and retry (raise MIGRATION_SNAPSHOT_TIMEOUT for large libraries)"
+    exit 1
+fi
+SOURCE_DB="$SNAPSHOT_DIR/library.db"
+export MIGRATION_SQLITE_FROZEN=1
+
+echo "Step 4: Exporting tables from SQLite..."
 
 # Get list of tables
-TABLES=$(sqlite3 "$SQLITE_DB" ".tables" | tr -s ' ' '\n' | grep -v '^$' | sort)
+TABLES=$(sqlite3 "$SOURCE_DB" ".tables" | tr -s ' ' '\n' | grep -v '^$' | sort)
+MIGRATE_LOG="${LOG_DIR:-/tmp}/migration_errors.log"
+mkdir -p "$(dirname "$MIGRATE_LOG")" 2>/dev/null || true
+FAILED_TABLES=()
 
 for TABLE in $TABLES; do
     echo "  Migrating: $TABLE"
 
     # Get column names
-    COLUMNS=$(sqlite3 "$SQLITE_DB" "PRAGMA table_info($TABLE);" | cut -d'|' -f2 | tr '\n' ',' | sed 's/,$//')
+    COLUMNS=$(sqlite3 "$SOURCE_DB" "PRAGMA table_info($TABLE);" | cut -d'|' -f2 | tr '\n' ',' | sed 's/,$//')
 
     # Use Python bridge for data transfer (avoids CSV truncation of large TEXT fields)
     $PSQL -c "TRUNCATE $PG_SCHEMA.$TABLE CASCADE;" 2>/dev/null || true
-    MIGRATE_LOG="${LOG_DIR:-/tmp}/migration_errors.log"
-    mkdir -p "$(dirname "$MIGRATE_LOG")" 2>/dev/null || true
-    python3 "$(dirname "$0")/migrate_table.py" \
-        "$SQLITE_DB" "$TABLE" "*" "$COLUMNS" "$PG_SCHEMA" 2>>"$MIGRATE_LOG" || true
+    if ! python3 "$(dirname "$0")/migrate_table.py" \
+        "$SOURCE_DB" "$TABLE" "*" "$COLUMNS" "$PG_SCHEMA" 2>>"$MIGRATE_LOG"; then
+        FAILED_TABLES+=("$TABLE")
+    fi
 done
 
+if ((${#FAILED_TABLES[@]})); then
+    echo ""
+    echo "ERROR: ${#FAILED_TABLES[@]} table(s) failed to migrate: ${FAILED_TABLES[*]}"
+    echo "PostgreSQL is incomplete; do not start Plex against it. Details: $MIGRATE_LOG"
+    exit 1
+fi
+
 echo ""
-echo "Step 4: Updating sequences..."
+echo "Step 5: Updating sequences..."
 $PSQL -c "
 SELECT setval(pg_get_serial_sequence('$PG_SCHEMA.metadata_items', 'id'),
        COALESCE((SELECT MAX(id) FROM $PG_SCHEMA.metadata_items), 1));
 " 2>/dev/null || true
 
 # ============================================================================
-# Step 5: Migrate blobs from blobs.db (binary data requires special handling)
+# Step 6: Migrate blobs from blobs.db (binary data requires special handling)
 # ============================================================================
 echo ""
-echo "Step 5: Migrating blobs (binary data)..."
+echo "Step 6: Migrating blobs (binary data)..."
 
-BLOBS_DB="${SQLITE_DB%.db}.blobs.db"
+BLOBS_DB="$SNAPSHOT_DIR/library.blobs.db"
 if [[ -f "$BLOBS_DB" ]]; then
-    echo "  Found: $BLOBS_DB"
+    echo "  Found: ${SQLITE_DB%.db}.blobs.db"
 
     # Get blob count
     BLOB_COUNT=$(sqlite3 "$BLOBS_DB" "SELECT count(*) FROM blobs;")
@@ -126,7 +152,7 @@ if [[ -f "$BLOBS_DB" ]]; then
         rm -f /tmp/blobs_meta.csv /tmp/blob_batch.sql
     fi
 else
-    echo "  No blobs.db found at: $BLOBS_DB"
+    echo "  No blobs.db found at: ${SQLITE_DB%.db}.blobs.db"
     echo "  Skipping blob migration"
 fi
 
