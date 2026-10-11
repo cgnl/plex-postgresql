@@ -81,7 +81,6 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
             log_clear_bindings_anomaly("finalize on unknown stmt", p_stmt);
         }
 
-        let mut is_pg_only = 0;
         let mut is_pg_value = 0;
         let mut final_sql: *const c_char = ptr::null();
 
@@ -89,7 +88,6 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         if !pg_stmt.is_null() {
             let pg_stmt_ref = &*pg_stmt;
             is_pg_value = pg_stmt_ref.is_pg;
-            is_pg_only = if pg_stmt_ref.is_pg == 2 { 1 } else { 0 };
             final_sql = if !pg_stmt_ref.pg_sql.is_null() {
                 pg_stmt_ref.pg_sql
             } else {
@@ -114,7 +112,6 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
             if !cached.is_null() {
                 let cached_ref = &*cached;
                 is_pg_value = cached_ref.is_pg;
-                is_pg_only = if cached_ref.is_pg == 2 { 1 } else { 0 };
                 if final_sql.is_null() {
                     final_sql = if !cached_ref.pg_sql.is_null() {
                         cached_ref.pg_sql
@@ -141,12 +138,12 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
             }
         }
 
-        let mut rc = SQLITE_OK;
-        if is_pg_only == 0 {
-            rc = orig_sqlite3_finalize
-                .map(|f| f(p_stmt))
-                .unwrap_or(SQLITE_ERROR);
-        }
+        // Every handle, PostgreSQL-routed reads included, is a real SQLite
+        // statement (the dummy shadow), so it must always be finalized or it
+        // leaks and keeps sqlite3_close() returning SQLITE_BUSY.
+        let rc = orig_sqlite3_finalize
+            .map(|f| f(p_stmt))
+            .unwrap_or(SQLITE_ERROR);
         clear_prepared_stmt(p_stmt);
         rc
     }
