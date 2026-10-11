@@ -1,5 +1,12 @@
 use super::*;
 
+/// Step-time cached reads wrap a real SQLite statement for the original SQL
+/// and never get a descriptor, so between results (after reset) SQLite's own
+/// metadata is the right answer. Dummy shadows always carry a descriptor.
+fn uses_sqlite_metadata(pg_stmt: &PgStmt) -> bool {
+    pg_stmt.is_cached != 0 && pg_stmt.result.is_null() && pg_stmt.descriptor.is_null()
+}
+
 pub(super) fn column_count_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
     let raw_pg_stmt = pg_find_any_stmt(p_stmt);
     if !raw_pg_stmt.is_null() && unsafe { (&*raw_pg_stmt).is_pg != 0 } {
@@ -11,7 +18,9 @@ pub(super) fn column_count_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         if !pg_stmt.cached_result.is_null() {
             return unsafe { (*pg_stmt.cached_result).num_cols };
         }
-        return pg_stmt.num_cols;
+        if !uses_sqlite_metadata(pg_stmt) {
+            return pg_stmt.num_cols;
+        }
     }
     get_orig_sqlite3_column_count()
         .map(|f| unsafe { f(p_stmt) })
@@ -45,7 +54,7 @@ pub(super) fn column_name_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
             );
             use_orig = false;
         } else {
-            use_orig = false;
+            use_orig = uses_sqlite_metadata(pg_stmt);
         }
     }
 
@@ -151,5 +160,20 @@ mod tests {
         }
         crate::pg_statement::rust_stmt_unregister(shadow as usize);
         crate::pg_statement::rust_stmt_free(stmt);
+    }
+
+    #[test]
+    fn only_descriptorless_cached_reads_use_sqlite_metadata() {
+        let mut stmt = PgStmt::new();
+        stmt.is_pg = 2;
+        assert!(
+            !uses_sqlite_metadata(&stmt),
+            "dummy shadows must not leak SQLite shape"
+        );
+        stmt.is_cached = 1;
+        assert!(uses_sqlite_metadata(&stmt), "cached read after reset");
+        stmt.result = ptr::dangling_mut();
+        assert!(!uses_sqlite_metadata(&stmt), "a live result owns the shape");
+        stmt.result = ptr::null_mut();
     }
 }
