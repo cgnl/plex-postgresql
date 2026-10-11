@@ -200,6 +200,16 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                             0,
                         )
                     } else if replacement {
+                        // The failed Parse aborted the replacement savepoint, so this attempt
+                        // fails; record an existing server statement so the next one reuses it.
+                        if is_duplicate_prepared_stmt(prep_res) {
+                            crate::pg_client::rust_stmt_cache_add(
+                                exec_conn as *mut c_void,
+                                sql_hash,
+                                stmt_name_buf.as_ptr(),
+                                0,
+                            );
+                        }
                         prep_res
                     } else if is_duplicate_prepared_stmt(prep_res) {
                         crate::pg_client::rust_stmt_cache_add(

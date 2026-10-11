@@ -189,6 +189,17 @@ pub(crate) fn exec_via_postgres(
                                     && crate::libpq_helpers::rust_pq_result_status(prep_res)
                                         != PGRES_COMMAND_OK
                                 {
+                                    // The failed Parse aborted the replacement savepoint, so
+                                    // this attempt fails; record an existing server statement
+                                    // so the next one reuses it.
+                                    if is_duplicate_prepared_stmt(prep_res) {
+                                        crate::pg_client::rust_stmt_cache_add(
+                                            pg_conn as *mut c_void,
+                                            norm_hash,
+                                            stmt_name_c.as_ptr(),
+                                            norm.param_count,
+                                        );
+                                    }
                                     return prep_res;
                                 }
                                 let ok = crate::libpq_helpers::rust_pq_result_status(prep_res)
