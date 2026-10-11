@@ -99,7 +99,7 @@ for binary in "Plex Media Server" "Plex Media Scanner"; do
     original="$PLEX_DIR/$binary"
     [[ ! -f "$original.original" ]] || original="$original.original"
     if ! LD_PRELOAD="$SHIM_SOURCE" \
-        LD_LIBRARY_PATH="$LOADER_CHECK_DIR:${RUNTIME_DIR:-$SHIM_INSTALL_DIR}:$PLEX_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        LD_LIBRARY_PATH="$LOADER_CHECK_DIR:$PLEX_DIR/lib:${RUNTIME_DIR:-$SHIM_INSTALL_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         "$PLEX_DIR/lib/libc.so" --list "$original"; then
         echo "ERROR: Plex cannot load the selected shim and runtime libraries" >&2
         exit 1
@@ -157,7 +157,7 @@ SCRIPT_DIR="$(dirname "$0")"
 SERVER_BINARY="$SCRIPT_DIR/Plex Media Server.original"
 
 # PostgreSQL shim
-export LD_LIBRARY_PATH="$SHIM_INSTALL_DIR:$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$SCRIPT_DIR/lib:$SHIM_INSTALL_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_PRELOAD="$SHIM_PATH${LD_PRELOAD:+:$LD_PRELOAD}"
 export PLEX_PG_HOST="${PLEX_PG_HOST:-localhost}"
 export PLEX_PG_PORT="${PLEX_PG_PORT:-5432}"
@@ -202,7 +202,7 @@ SCRIPT_DIR="$(dirname "$0")"
 SCANNER_ORIGINAL="$SCRIPT_DIR/Plex Media Scanner.original"
 
 # Ensure PostgreSQL shim is loaded
-export LD_LIBRARY_PATH="$SHIM_INSTALL_DIR:$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$SCRIPT_DIR/lib:$SHIM_INSTALL_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_PRELOAD="$SHIM_PATH${LD_PRELOAD:+:$LD_PRELOAD}"
 
 # Execute the original scanner

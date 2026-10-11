@@ -528,6 +528,12 @@ python3 scripts/export_pg_to_sqlite.py --schema plex \
 Verify the exported pair in an isolated instance of the matching Plex build,
 including library identity, watched state, search, artwork and decoded playback,
 before installing it. Keep the original database pair and PostgreSQL backup.
+When an export replaces existing files, it first retains them in a private
+`.pg-to-sqlite-backup-*` directory inside the output directory and prints the
+backup paths. `--yes` skips confirmation but keeps these backups. Stop all
+consumers before publication and retain the backup pair until the exported
+library has been verified. Publication is sequential with rollback on ordinary
+errors; replacing both files is not crash-atomic.
 `--native-rollback` remains unavailable until the complete acceptance matrix is
 certified.
 

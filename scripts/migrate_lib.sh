@@ -601,7 +601,7 @@ PY
 # Read file bytes only from the mounted source. WAL recovery and SQLite backup
 # happen in a private writable copy, never on the original read-only mount.
 snapshot_sqlite_sources() {
-    python3 - "$1" "$2" "${MIGRATION_SNAPSHOT_TIMEOUT:-300}" <<'PY_SNAPSHOT'
+    python3 - "$1" "$2" "${MIGRATION_SNAPSHOT_TIMEOUT:-3600}" <<'PY_SNAPSHOT'
 import hashlib
 import os
 import pathlib
@@ -613,8 +613,8 @@ import time
 
 source, destination, timeout = sys.argv[1:]
 seconds = float(timeout)
-if not 0 < seconds <= 3600:
-    raise ValueError('MIGRATION_SNAPSHOT_TIMEOUT must be between 0 and 3600 seconds')
+if not 0 < seconds <= 86400:
+    raise ValueError('MIGRATION_SNAPSHOT_TIMEOUT must be greater than 0 and at most 86400 seconds')
 deadline = time.monotonic() + seconds
 root = pathlib.Path(destination)
 root.mkdir(parents=True, exist_ok=True)

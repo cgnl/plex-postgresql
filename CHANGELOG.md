@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Retain existing SQLite export files in durable backups before replacement, including exports confirmed with `--yes`.
+- Allow one hour by default for private migration snapshots, with a configurable upper bound of 24 hours for large libraries on slow storage.
+- Load Plex's libraries before shim dependencies consistently in Linux wrappers and container startup.
+- Test the native ZIP's packaged migration helpers against real SQLite library/blob files and an isolated PostgreSQL destination.
 - Obtain prepared-statement column descriptors through privately named PREPARE/DESCRIBE/DEALLOCATE rounds instead of executing statements for metadata, and refuse to publish row-producing statements without descriptors, preventing native Plex SIGSEGVs that read column metadata after PostgreSQL outage recovery.
 
 ## [1.3.22]
