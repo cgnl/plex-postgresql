@@ -139,7 +139,7 @@ RUN printf '%s\n' \
       'export LANG=C.utf8' \
       'export LC_ALL=C.utf8' \
       'export LC_CTYPE=C.utf8' \
-      'export LD_LIBRARY_PATH="/usr/local/lib/plex-postgresql:/usr/lib/plexmediaserver/lib:$LD_LIBRARY_PATH"' \
+      'export LD_LIBRARY_PATH="/usr/lib/plexmediaserver/lib:/usr/local/lib/plex-postgresql${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
       'export LD_PRELOAD="/usr/local/lib/plex-postgresql/db_interpose_pg.so"' \
       'if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then' \
       '  export OPENSSL_armcap="${PLEX_PG_OPENSSL_ARMCAP:-0}"' \

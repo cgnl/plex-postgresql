@@ -460,14 +460,14 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -eu
-          docker buildx build --platform "linux/$ARCH" --target builder \
+          docker buildx build --platform "linux/$ARCH" --target release-payload \
             --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
             --output type=local,dest=bundle-root .
           mkdir -p "bundle/libs/$BUNDLE_ARCH" bundle/scripts bundle/schema
           cp "bundle-root/libs/db_interpose_pg.so" "bundle/db_interpose_pg-linux-$BUNDLE_ARCH.so"
           cp -L bundle-root/libs/*.so* "bundle/libs/$BUNDLE_ARCH/"
           rm "bundle/libs/$BUNDLE_ARCH/db_interpose_pg.so"
-          cp scripts/install_wrappers_linux.sh scripts/migrate_lib.sh bundle/scripts/
+          cp scripts/install_wrappers_linux.sh scripts/migrate_lib.sh scripts/migrate_table.py scripts/seed_shadow_table_from_pg.py bundle/scripts/
           cp schema/*.sql bundle/schema/
           (cd bundle && zip -r ../native-bundle.zip .)
       - name: Verify the ZIP on the unmodified pinned Plex image
@@ -476,6 +476,7 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.arch }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           EVIDENCE_DIR: evidence/native-bundle
+          POSTGRES_IMAGE: ${{ needs.resolve.outputs.postgres15_image }}
         run: bash scripts/test-native-linux-bundle.sh native-bundle.zip
       - uses: actions/upload-artifact@v4
         if: always()

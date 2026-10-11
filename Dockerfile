@@ -53,6 +53,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 RUN nm -D --defined-only /libs/db_interpose_pg.so > /libs/default-exports.txt && \
     awk '$3 ~ /^(vfork|__cxa_throw)(@.*)?$/ || $3 ~ /create_simple_converter/ { print "Forbidden default export: " $3; rejected=1 } END { exit rejected }' /libs/default-exports.txt
 
+# Export only release libraries, excluding the compiler filesystem.
+FROM scratch AS release-payload
+COPY --from=builder /libs /libs
+
 # Runtime stage
 FROM ${PLEX_BASE_IMAGE}
 
@@ -111,7 +115,11 @@ COPY scripts/docker-entrypoint.sh /usr/local/lib/plex-postgresql/docker-entrypoi
 RUN chmod +x /usr/local/lib/plex-postgresql/docker-entrypoint.sh
 
 # Create s6-overlay init script to run our initialization
-RUN mkdir -p /etc/s6-overlay/s6-rc.d/init-plex-postgresql && \
+# Linuxserver's chown initialization deletes TMPDIR. It must finish before
+# migration creates temporary SQL there, including on repeated container starts.
+RUN test -f /etc/s6-overlay/s6-rc.d/init-plex-chown/run && \
+    mkdir -p /etc/s6-overlay/s6-rc.d/init-plex-postgresql/dependencies.d && \
+    touch /etc/s6-overlay/s6-rc.d/init-plex-postgresql/dependencies.d/init-plex-chown && \
     echo "oneshot" > /etc/s6-overlay/s6-rc.d/init-plex-postgresql/type && \
     echo "/usr/local/lib/plex-postgresql/docker-entrypoint.sh" > /etc/s6-overlay/s6-rc.d/init-plex-postgresql/up && \
     chmod +x /etc/s6-overlay/s6-rc.d/init-plex-postgresql/up && \

@@ -11,6 +11,7 @@ regenerated index/source count and MATCH checks. Other errors fail closed.
 schema and native search/watchstate/playlist/artwork verification are available.
 Publication replaces two files sequentially with rollback on ordinary errors;
 it is not crash-atomic as a pair. Consumers must be stopped during publication.
+Existing outputs are retained in a durable backup directory before replacement.
 """
 
 import argparse
@@ -513,20 +514,34 @@ def check_outputs(output):
 
 def promote(stage, output):
     check_outputs(output)
+    check_outputs(stage)
     promoted = []
     backups = {}
     for name in (LIBRARY, ARTWORK):
-        destination = output / name
-        if destination.exists():
-            backup = stage / (name + ".previous")
-            os.link(destination, backup)
-            backups[name] = backup
         os.chmod(stage / name, 0o600)
         with (stage / name).open("rb") as source:
             os.fsync(source.fileno())
     directory = os.open(output, os.O_RDONLY)
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
     try:
+        existing = [name for name in (LIBRARY, ARTWORK) if (output / name).exists()]
+        if existing:
+            backup_directory = Path(tempfile.mkdtemp(prefix=".pg-to-sqlite-backup-", dir=output))
+            for name in existing:
+                backup = backup_directory / name
+                os.link(output / name, backup)
+                backups[name] = backup
+                with backup.open("rb") as source:
+                    os.fsync(source.fileno())
+            backup_fd = os.open(backup_directory, os.O_RDONLY)
+            try:
+                os.fsync(backup_fd)
+            finally:
+                os.close(backup_fd)
+            os.fsync(directory)
+            print("Existing output backups retained: " + json.dumps(
+                {name: str(path) for name, path in backups.items()}, sort_keys=True), flush=True)
+        check_outputs(output)
         try:
             for name in (LIBRARY, ARTWORK):
                 os.replace(stage / name, output / name)
@@ -535,7 +550,9 @@ def promote(stage, output):
         except BaseException:
             for name in reversed(promoted):
                 if name in backups:
-                    os.replace(backups[name], output / name)
+                    rollback = stage / (name + ".rollback")
+                    os.link(backups[name], rollback)
+                    os.replace(rollback, output / name)
                 else:
                     (output / name).unlink()
             os.fsync(directory)
@@ -543,6 +560,7 @@ def promote(stage, output):
     finally:
         os.close(directory)
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    return backups
 
 
 def main():
