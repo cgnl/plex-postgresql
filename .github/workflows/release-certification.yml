@@ -1,0 +1,119 @@
+name: Frozen compatibility release certification
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Frozen regular VERSION/changelog leaf SHA"
+        type: string
+        required: true
+      upstream_profile_json:
+        description: "Validated immutable profile JSON"
+        type: string
+        required: true
+      profile_id:
+        type: string
+        required: true
+      mode:
+        type: choice
+        options: [full, probe]
+        default: full
+permissions:
+  contents: read
+concurrency:
+  group: compatibility-release-certification
+  cancel-in-progress: false
+jobs:
+  freeze:
+    runs-on: ubuntu-24.04
+    outputs:
+      profiles: ${{ steps.profiles.outputs.profiles }}
+      history_count: ${{ steps.profiles.outputs.history_count }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require immutable source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - id: profiles
+        env:
+          LATEST_JSON: ${{ inputs.upstream_profile_json }}
+          PROFILE_ID: ${{ inputs.profile_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          sys.path.insert(0, 'scripts')
+          from issue_release_certificate import certification_profiles
+          latest = json.loads(os.environ['LATEST_JSON'])
+          assert latest['id'] == os.environ['PROFILE_ID']
+          profiles = certification_profiles(latest, json.load(open('.github/plex-compatibility-profiles.json')))
+          matrix = [{'id': profile['id'], 'json': json.dumps(profile, separators=(',', ':'))} for profile in profiles]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('profiles=' + json.dumps(matrix[1:], separators=(',', ':')) + '\n')
+              output.write('history_count=' + str(len(matrix) - 1) + '\n')
+          PY
+  acceptance:
+    needs: freeze
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      version: ${{ inputs.source_sha }}
+      upstream_profile_json: ${{ inputs.upstream_profile_json }}
+      profile_id: ${{ inputs.profile_id }}
+      mode: ${{ inputs.mode }}
+      payload_profile_id: ${{ inputs.profile_id }}
+    permissions:
+      contents: read
+      packages: write
+  historical-acceptance:
+    needs: [freeze, acceptance]
+    if: always() && needs.freeze.result == 'success' && needs.freeze.outputs.history_count != '0'
+    uses: ./.github/workflows/docker-publish.yml
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        profile: ${{ fromJSON(needs.freeze.outputs.profiles) }}
+    with:
+      version: ${{ inputs.source_sha }}
+      upstream_profile_json: ${{ matrix.profile.json }}
+      profile_id: ${{ matrix.profile.id }}
+      mode: ${{ inputs.mode }}
+      payload_profile_id: ${{ inputs.profile_id }}
+    permissions:
+      contents: read
+      packages: write
+  bootstrap-status:
+    needs: acceptance
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo 'Native evidence produced. Publication requires independent certificate validation and real repository trust bootstrap; no release authority is enabled.' >> "$GITHUB_STEP_SUMMARY"
+  certificate:
+    needs: [acceptance, historical-acceptance]
+    if: always() && inputs.mode == 'full' && needs.acceptance.result == 'success' && (needs.historical-acceptance.result == 'success' || needs.historical-acceptance.result == 'skipped')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: certification-evidence
+      - name: Validate every cell and bind final artifact bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROFILE_JSON: ${{ inputs.upstream_profile_json }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 scripts/issue_release_certificate.py --evidence certification-evidence --profile-json "$PROFILE_JSON" --source-sha "$SOURCE_SHA" --policy .github/plex-compatibility-policy.json --output certificate/certificate.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-certificate
+          path: certificate/certificate.json
+          if-no-files-found: error
+          retention-days: 90

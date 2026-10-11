@@ -1,19 +1,39 @@
 name: CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact generated proposal commit to test
+        type: string
+        required: true
   pull_request:
   push:
     branches:
       - main
       - develop
 
+permissions:
+  contents: read
+
 jobs:
+  validate-source:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
   scripts:
+    needs: validate-source
     name: Validate shell scripts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
 
       - name: Bash syntax check
         run: |
@@ -33,11 +53,15 @@ jobs:
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 
   unit-tests:
+    needs: validate-source
     name: Unit tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -48,6 +72,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build
+        if: github.event_name != 'workflow_dispatch' || inputs.source_sha == github.sha
         uses: actions/cache@v4
         with:
           path: |
@@ -66,11 +91,15 @@ jobs:
         run: make ci-test
 
   unit-tests-macos:
+    needs: validate-source
     name: Unit tests (macOS)
     runs-on: macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
 
       - name: Install PostgreSQL headers/libs
         run: |
@@ -81,6 +110,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build
+        if: github.event_name != 'workflow_dispatch' || inputs.source_sha == github.sha
         uses: actions/cache@v4
         with:
           path: |
@@ -97,11 +127,15 @@ jobs:
           cargo test --lib
 
   clippy:
+    needs: validate-source
     name: Clippy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -112,6 +146,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build
+        if: github.event_name != 'workflow_dispatch' || inputs.source_sha == github.sha
         uses: actions/cache@v4
         with:
           path: |
@@ -126,11 +161,15 @@ jobs:
           cargo clippy -- -D warnings
 
   ffi-header:
+    needs: validate-source
     name: FFI header
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -145,6 +184,7 @@ jobs:
         run: make ffi-header-check
 
   linux-build-amd64:
+    needs: validate-source
     name: Build Linux amd64 shim
     runs-on: ubuntu-latest
     steps:
@@ -161,6 +201,9 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

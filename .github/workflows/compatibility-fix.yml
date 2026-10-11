@@ -1,0 +1,87 @@
+name: Propose Plex compatibility fix
+on:
+  workflow_dispatch:
+    inputs:
+      fix_request:
+        description: Sanitized demonstrated-regression request JSON
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      fix_request:
+        type: string
+        required: true
+    secrets:
+      OPENAI_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+concurrency:
+  group: compatibility-fix-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      patch: ${{ steps.codex.outputs.final-message }}
+      configured: ${{ steps.prepare.outputs.configured }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate request and prepare trusted prompt
+        id: prepare
+        env:
+          FIX_REQUEST: ${{ inputs.fix_request }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 scripts/plex_compatibility_fix.py prepare
+          if [ -n "$OPENAI_API_KEY" ]; then
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
+            echo 'fix-generation-unconfigured: add a limited-budget OPENAI_API_KEY repository secret. Deterministic compatibility reporting remains available.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # Last step: no repository write/package/release credentials enter generation.
+      - name: Generate structured runtime proposal
+        if: steps.prepare.outputs.configured == 'true'
+        id: codex
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # reviewed v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: fix-prompt.md
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          allow-bots: true
+          output-schema: >-
+            {"type":"object","additionalProperties":false,"required":["base_sha","fingerprint","explanation","changes"],"properties":{"base_sha":{"type":"string"},"fingerprint":{"type":"string"},"explanation":{"type":"string"},"changes":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","base_blob_sha","content"],"properties":{"path":{"type":"string"},"base_blob_sha":{"type":["string","null"]},"content":{"type":"string"}}}}}}
+  post:
+    needs: generate
+    if: needs.generate.outputs.configured == 'true' && needs.generate.outputs.patch != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate same-run output and create restricted draft PR
+        env:
+          FIX_REQUEST: ${{ inputs.fix_request }}
+          GENERATED_PATCH: ${{ needs.generate.outputs.patch }}
+          POST_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 scripts/plex_compatibility_fix.py post

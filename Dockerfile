@@ -4,6 +4,7 @@
 
 ARG BUILDER_IMAGE=alpine:3.15
 ARG PLEX_BASE_IMAGE=linuxserver/plex:latest
+ARG RUNTIME_PAYLOAD=builder
 FROM ${BUILDER_IMAGE} AS builder
 
 ARG PLEX_PG_SANITIZE
@@ -53,6 +54,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 RUN nm -D --defined-only /libs/db_interpose_pg.so > /libs/default-exports.txt && \
     awk '$3 ~ /^(vfork|__cxa_throw)(@.*)?$/ || $3 ~ /create_simple_converter/ { print "Forbidden default export: " $3; rejected=1 } END { exit rejected }' /libs/default-exports.txt
 
+# The default remains the local builder. Certification supplies an immutable
+# named build context containing the already-tested native payload.
+FROM scratch AS export-payload
+COPY --from=builder /libs /libs
+
+FROM ${RUNTIME_PAYLOAD} AS runtime-payload
+
 # Runtime stage
 FROM ${PLEX_BASE_IMAGE}
 
@@ -88,9 +96,10 @@ RUN ARCH=$(uname -m) && \
     ln -sf /usr/lib/plexmediaserver/lib/libc.so /usr/local/lib/plex-postgresql/libc.musl-${MUSL_ARCH}.so.1 && \
     echo "Created symlink: libc.musl-${MUSL_ARCH}.so.1 -> /usr/lib/plexmediaserver/lib/libc.so"
 
-COPY --from=builder /libs/*.so* /usr/local/lib/plex-postgresql/
-COPY --from=builder /libs/subreaper /usr/local/bin/subreaper
-COPY --from=builder /libs/default-exports.txt /usr/local/lib/plex-postgresql/
+COPY --from=runtime-payload /libs/*.so* /usr/local/lib/plex-postgresql/
+COPY --from=runtime-payload /libs/subreaper /usr/local/bin/subreaper
+COPY --from=runtime-payload /libs/default-exports.txt /usr/local/lib/plex-postgresql/
+RUN chmod 755 /usr/local/bin/subreaper
 
 COPY schema/plex_schema.sql /usr/local/lib/plex-postgresql/
 COPY schema/sqlite_schema.sql /usr/local/lib/plex-postgresql/

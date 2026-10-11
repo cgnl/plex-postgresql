@@ -21,6 +21,7 @@
 # ============================================================================
 ARG BUILDER_IMAGE=alpine:3.15
 ARG PLEX_BASE_IMAGE=plexinc/pms-docker:latest
+ARG RUNTIME_PAYLOAD=builder
 FROM ${BUILDER_IMAGE} AS builder
 
 RUN apk add --no-cache \
@@ -69,6 +70,11 @@ RUN nm -D --defined-only /libs/db_interpose_pg.so > /libs/default-exports.txt &&
 # ============================================================================
 # Stage 2: Runtime with plexinc/pms-docker
 # ============================================================================
+FROM scratch AS export-payload
+COPY --from=builder /libs /libs
+
+FROM ${RUNTIME_PAYLOAD} AS runtime-payload
+
 FROM ${PLEX_BASE_IMAGE}
 
 ENV VERSION=docker
@@ -101,9 +107,10 @@ RUN ARCH=$(uname -m) && \
     ln -sf /usr/lib/plexmediaserver/lib/libc.so \
         /usr/local/lib/plex-postgresql/libc.musl-${MUSL_ARCH}.so.1
 
-COPY --from=builder /libs/*.so* /usr/local/lib/plex-postgresql/
-COPY --from=builder /libs/subreaper /usr/local/bin/subreaper
-COPY --from=builder /libs/default-exports.txt /usr/local/lib/plex-postgresql/
+COPY --from=runtime-payload /libs/*.so* /usr/local/lib/plex-postgresql/
+COPY --from=runtime-payload /libs/subreaper /usr/local/bin/subreaper
+COPY --from=runtime-payload /libs/default-exports.txt /usr/local/lib/plex-postgresql/
+RUN chmod 755 /usr/local/bin/subreaper
 
 # Copy schema files
 COPY schema/plex_schema.sql /usr/local/lib/plex-postgresql/
@@ -161,7 +168,8 @@ RUN printf '%s\n' \
 # IMPORTANT: Use a compiled binary, NOT a shell script. A shell script
 # would invoke 'sh' which inherits LD_PRELOAD, loads our shim constructor,
 # and causes interference. A simple compiled binary just calls _exit(0).
-COPY --from=builder /libs/noop /usr/lib/plexmediaserver/CrashUploader
+COPY --from=runtime-payload /libs/noop /usr/lib/plexmediaserver/CrashUploader
+RUN chmod 755 /usr/lib/plexmediaserver/CrashUploader
 
 # Default PostgreSQL connection settings (override with -e flags)
 ENV PLEX_PG_HOST=postgres

@@ -1,9 +1,6 @@
 name: Release Linux Artifacts
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -18,7 +15,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -76,7 +73,6 @@ jobs:
           name: linux-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
-
   package-linux-zip:
     name: Package Linux zip bundle
     runs-on: ubuntu-latest
@@ -131,22 +127,3 @@ jobs:
             plex-postgresql-*-linux.zip
             plex-postgresql-*-linux.zip.sha256
           if-no-files-found: error
-
-  upload-release:
-    name: Upload artifacts to GitHub Release
-    runs-on: ubuntu-latest
-    needs: package-linux-zip
-    steps:
-      - name: Download zip artifact
-        uses: actions/download-artifact@v4
-        with:
-          path: release-assets
-
-      - name: Upload assets to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.package-linux-zip.outputs.tag }}
-          files: |
-            release-assets/linux-release-zip/plex-postgresql-*-linux.zip
-            release-assets/linux-release-zip/plex-postgresql-*-linux.zip.sha256
-          overwrite_files: false

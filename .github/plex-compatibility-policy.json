@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "maxHistoricalProfiles": 2,
+  "maxActiveCertifications": 1,
+  "maxPendingFingerprints": 1,
+  "maxAutomaticInfrastructureRetries": 1,
+  "maxAutomaticAssertionRetries": 0,
+  "fixtureManifest": "scripts/media-fixtures.json",
+  "profileLedger": ".github/plex-compatibility-profiles.json",
+  "historyUnavailablePolicy": "report-and-block",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "variants": ["plexinc", "linuxserver"]
+}

@@ -4,17 +4,167 @@ on:
   schedule:
     - cron: "0 */6 * * *"
   workflow_dispatch:
+    inputs:
+      retry:
+        description: "Explicitly retry a previously recorded fingerprint"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: plex-compatibility-monitor
   cancel-in-progress: false
 
 jobs:
-  candidate:
-    name: Resolve, build and probe candidates (no release)
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      profile_id: ${{ steps.plan.outputs.profile_id }}
+      profile_json: ${{ steps.plan.outputs.profile_json }}
+      profiles: ${{ steps.plan.outputs.profiles }}
+      history_count: ${{ steps.plan.outputs.history_count }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Resolve immutable inputs without building
+        run: python3 scripts/check-upstream-updates.py --output evidence/upstream-candidate.json --profile-output evidence/profile-latest.json
+      - name: Plan latest and explicitly validated historical inputs
+        id: plan
+        run: |
+          source_sha=$(git rev-parse HEAD)
+          python3 scripts/plex_compatibility.py plan --snapshot evidence/upstream-candidate.json --source-sha "$source_sha" --output evidence/discovery-plan.json
+          python3 - <<'PY'
+          import json, os
+          plan = json.load(open('evidence/discovery-plan.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('source_sha=' + plan['source_sha'] + '\n')
+              output.write('profile_id=' + plan['latest_profile_id'] + '\n')
+              output.write('profile_json=' + json.dumps(plan['profiles'][0], separators=(',', ':')) + '\n')
+              profiles = [{'id': profile['id'], 'json': json.dumps(profile, separators=(',', ':'))} for profile in plan['profiles']]
+              output.write('profiles=' + json.dumps(profiles[1:], separators=(',', ':')) + '\n')
+              output.write('history_count=' + str(len(profiles) - 1) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Discovery fingerprint: `' + plan['fingerprint'] + '`\n\n')
+              summary.write('Latest image versions are unverified until native probes measure them.\n\n')
+              summary.write('Historical input profiles: ' + str(plan['historical_coverage_count']) + '.\n\n')
+              summary.write('Automatic publication remains disabled pending genuine bootstrap certification and authorization.\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plex-compatibility-discovery
+          path: evidence
+          if-no-files-found: error
+          retention-days: 90
+
+  claim:
+    needs: discover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    outputs:
+      action: ${{ steps.claim.outputs.action }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.discover.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: plex-compatibility-discovery
+          path: evidence
+      - name: Persist deduplicated bounded attempt ownership
+        id: claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          EXPLICIT_RETRY: ${{ inputs.retry || false }}
+        run: |
+          retry_arg=()
+          if [ "$EXPLICIT_RETRY" = true ]; then retry_arg=(--retry); fi
+          python3 scripts/plex_compatibility.py claim --plan evidence/discovery-plan.json --repository "$REPOSITORY" --run-id "$RUN_ID" "${retry_arg[@]}"
+
+  probe:
+    needs: [discover, claim]
+    if: needs.claim.outputs.action == 'start-probe'
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker-publish.yml
-    secrets: inherit
+    with:
+      version: ${{ needs.discover.outputs.source_sha }}
+      upstream_profile_json: ${{ needs.discover.outputs.profile_json }}
+      profile_id: ${{ needs.discover.outputs.profile_id }}
+      payload_profile_id: ${{ needs.discover.outputs.profile_id }}
+      mode: probe
+
+  historical-probe:
+    needs: [discover, claim, probe]
+    if: always() && needs.claim.outputs.action == 'start-probe' && needs.discover.outputs.history_count != '0'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        profile: ${{ fromJSON(needs.discover.outputs.profiles) }}
+    with:
+      version: ${{ needs.discover.outputs.source_sha }}
+      upstream_profile_json: ${{ matrix.profile.json }}
+      profile_id: ${{ matrix.profile.id }}
+      payload_profile_id: ${{ needs.discover.outputs.profile_id }}
+      mode: probe
+
+  record:
+    needs: [discover, claim, probe, historical-probe]
+    if: always() && needs.claim.outputs.action == 'start-probe'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.discover.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: plex-compatibility-discovery
+          path: evidence
+      - name: Download typed latest and historical observations from this run
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: '*-compatibility-observation'
+          path: observation
+      - name: Record terminal result without inventing a breaking change
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PROBE_RESULT: ${{ needs.probe.result == 'success' && (needs.historical-probe.result == 'success' || needs.historical-probe.result == 'skipped') && 'success' || 'failure' }}
+        run: |
+          run_url="https://github.com/$REPOSITORY/actions/runs/$RUN_ID"
+          category=$(python3 scripts/plex_compatibility.py observe --plan evidence/discovery-plan.json --observations-root observation --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT")
+          python3 scripts/plex_compatibility.py complete --plan evidence/discovery-plan.json --repository "$REPOSITORY" --run-id "$RUN_ID" --result "$PROBE_RESULT" --run-url "$run_url" --category "$category"
+          python3 scripts/plex_compatibility.py report-pr --plan evidence/discovery-plan.json --repository "$REPOSITORY" --category "$category" --run-url "$run_url"
+          python3 scripts/plex_compatibility.py dispatch-followup --plan evidence/discovery-plan.json --repository "$REPOSITORY" --category "$category" --run-url "$run_url"
+          printf 'Probe result: %s; typed observation: %s. Full source-bound certification is still required.\n' "$PROBE_RESULT" "$category" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep failed probes visible
+        if: needs.probe.result != 'success' || (needs.historical-probe.result != 'success' && needs.historical-probe.result != 'skipped')
+        run: exit 1
