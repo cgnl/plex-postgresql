@@ -86,5 +86,10 @@ export PLEX_PG_RETRY_DELAYS=10,20,50
             export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static"
         fi
     fi
-    cargo test --manifest-path "$repo/rust/plex-pg-core/Cargo.toml" --release --test metadata_descriptor_runtime -- --ignored --exact metadata_descriptor_is_atomic_across_empty_results_and_postgres_outage --nocapture
+    cargo test --manifest-path "$repo/rust/plex-pg-core/Cargo.toml" --release --test metadata_descriptor_runtime --no-run --message-format=json >"$fixture/build.json"
 )
+test_binary=$(sed -n 's/.*"executable":"\([^"]*metadata_descriptor_runtime-[^"]*\)".*/\1/p' "$fixture/build.json" | tail -n 1)
+[[ -n "$test_binary" && -x "$test_binary" ]] || { echo "metadata_descriptor_runtime test binary not found" >&2; exit 1; }
+# The shim only activates in a process named like the Plex server.
+cp "$test_binary" "$fixture/Plex Media Server"
+"$fixture/Plex Media Server" --ignored --exact metadata_descriptor_is_atomic_across_empty_results_and_postgres_outage --nocapture

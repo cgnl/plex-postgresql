@@ -3,7 +3,9 @@
 //! Run this ignored test with a musl test binary and a shim built from the
 //! same source revision. `METADATA_DESCRIPTOR_RUNTIME_SQLITE` must name the
 //! SQLite library used by that shim. The upstream database must be disposable
-//! and carry the marker checked below.
+//! and carry the marker checked below. The shim only activates inside a
+//! process named `Plex Media Server`, so run the built test binary under that
+//! name (scripts/run-metadata-descriptor-e2e.sh does this).
 
 use libc::{c_char, c_int, c_void};
 use postgres::{Config, NoTls};
@@ -50,13 +52,16 @@ unsafe fn symbol<T: Copy>(library: Handle, name: &str) -> T {
 
 impl Api {
     unsafe fn load(sqlite_path: &str, shim_path: &str) -> Self {
+        // Load the shim before SQLite, as LD_PRELOAD does: its constructor
+        // resolves the real SQLite through RTLD_NEXT, which only finds
+        // libraries loaded after the shim.
+        let shim_path_c = CString::new(shim_path).unwrap();
+        let shim = libc::dlopen(shim_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+        assert!(!shim.is_null(), "shim dlopen failed: {}", dlerror());
+
         let sqlite_path = CString::new(sqlite_path).unwrap();
         let sqlite = libc::dlopen(sqlite_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
         assert!(!sqlite.is_null(), "SQLite dlopen failed: {}", dlerror());
-
-        let shim_path_c = CString::new(shim_path).unwrap();
-        let shim = libc::dlopen(shim_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-        assert!(!shim.is_null(), "shim dlopen failed: {}", dlerror());
         let api = Self {
             open: symbol(shim, "sqlite3_open"),
             close: symbol(shim, "sqlite3_close"),
@@ -200,16 +205,17 @@ fn pipe(mut reader: TcpStream, mut writer: TcpStream) {
 
 unsafe fn assert_descriptor(api: Api, stmt: Handle) {
     assert_eq!((api.column_count)(stmt), 2);
+    // Aggregate expressions carry no declared type, as in SQLite itself.
     for (index, expected_name, expected_type) in [
-        (0, "metadata_type", "INTEGER"),
-        (1, "count", "dt_integer(8)"),
+        (0, "metadata_type", Some("INTEGER")),
+        (1, "count", None),
     ] {
         let name = (api.column_name)(stmt, index);
         let decltype = (api.column_decltype)(stmt, index);
         assert!(!name.is_null(), "column {index} has no name");
-        assert!(!decltype.is_null(), "column {index} has no declared type");
         assert_eq!(CStr::from_ptr(name).to_str().unwrap(), expected_name);
-        assert_eq!(CStr::from_ptr(decltype).to_str().unwrap(), expected_type);
+        let decltype = (!decltype.is_null()).then(|| CStr::from_ptr(decltype).to_str().unwrap());
+        assert_eq!(decltype, expected_type, "column {index} declared type");
     }
 }
 
