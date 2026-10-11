@@ -8,8 +8,10 @@ A small shim library that catches Plex SQLite calls and sends them to PostgreSQL
 
 ## Current validation status
 
-**v1.3.21 is a regular release.** v1.3.22 is being prepared from the follow-up fixes in draft [PR #31](https://github.com/cgnl/plex-postgresql/pull/31)
-are still undergoing final certification. The complete native matrix and 5h50
+**v1.3.21 is a regular release.** [PR #31](https://github.com/cgnl/plex-postgresql/pull/31)
+is merged; follow-up fixes for v1.3.22 are in draft
+[PR #32](https://github.com/cgnl/plex-postgresql/pull/32).
+The complete native matrix and 5h50
 soak remain pending. Native PlexInc/arm64/PG18 now passes genuine SQLite import,
 normal restart, both search routes, export and restoration into vanilla Plex,
 with watched state, server/media identity and source hashes preserved. The two
@@ -45,10 +47,21 @@ fixes, plus real movie/TV acceptance tooling. See [the changelog](CHANGELOG.md).
 
 [📥 Download v1.3.21](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.21) | [📋 Full Changelog](CHANGELOG.md)
 
-Linux and macOS release zips are built by GitHub Actions on tag push via `.github/workflows/release-linux-artifacts.yml` and `.github/workflows/release-macos-artifacts.yml`.
+New automatic releases require a certificate for the exact tested source and
+Linux ZIP/image bytes. Tag pushes no longer independently publish assets.
+Automatic publication is disabled until genuine bootstrap certification and
+reviewed trust configuration exist. New macOS assets require a separate native
+acceptance gate.
 Pull requests and `main`/`develop` pushes run `.github/workflows/ci.yml` (script validation + Linux amd64 build check + full test suite + FFI header verification).
-The current `.github/workflows/docker-publish.yml` probes uniquely tagged GHCR
-candidates and blocks production promotion. The image repositories are:
+The compatibility monitor checks public Plex releases every six hours and
+deduplicates unchanged inputs. Short probes detect regressions; full native
+certification gates publication. Up to two validated older Plex profiles can be
+required. Demonstrated failures can produce a separate draft code-fix PR when
+the API secret is configured; fixes are never automatically merged. Historical
+coverage currently starts empty and fix generation is unconfigured. See
+[compatibility automation and setup](docs/plex-compatibility.md).
+
+The candidate image repositories are:
 - `ghcr.io/cgnl/plex-postgresql-linuxserver`
 - `ghcr.io/cgnl/plex-postgresql-plexinc`
 

@@ -1,164 +1,158 @@
-# Plex compatibility and fail-closed releases
+# Automated Plex compatibility and releases
 
-## Current policy
+## Current configuration
 
-The goal is compatibility with the newest **public Linux Plex release**, not a
-promise of compatibility with unknown future binaries or Plex Pass betas. The
-official `https://plex.tv/api/downloads/5.json` Linux version observed on
-2026-10-09 is `1.43.4.10903-e5521bd8c`. Every candidate run fetches this API again;
-that observed version is not hardcoded as a permanent supported version.
+The monitor checks the newest **public Linux Plex release** every six hours.
+Plex Pass betas are outside this policy. The schedule starts discovery; it does
+not promise a completed certification or release every six hours.
 
-**Promotion is disabled.** Scheduled monitoring and the Docker publish workflow
-build candidates only. They do not bump `VERSION`, rewrite `CHANGELOG.md`, update
-the approved digest baseline, create Git tags, create GitHub releases, or update
-production version/architecture/`latest` image tags. Digest changes indicate work
-to investigate, never compatibility. Missing inputs, missing drivers, skipped
-jobs, failed builds, unsupported architectures, and incomplete gates cannot
-produce a successful release workflow. The terminal promotion-blocked job fails
-even when every implemented probe passes. There is no environment-variable bypass.
+Automatic publication is currently disabled because no reviewed
+`.github/release-trust.json` has been installed. This trust file is the
+authoritative publication gate. The historical profile ledger is empty, so coverage starts
+with latest only. There is no configured `OPENAI_API_KEY` repository secret;
+automated fix generation reports `fix-generation-unconfigured` until one is
+provided. These are configuration gaps, not evidence of compatibility.
 
-## Candidate inputs and evidence
+## Discovery and historical coverage
 
-`scripts/check-upstream-updates.py` resolves the official Linux version and both
-official Debian architecture records, then resolves Docker Hub manifest indexes
-for LinuxServer Plex, Plex Inc Plex, Alpine 3.15, and PostgreSQL 15/16/18 Bookworm.
-Registry response digests are checked against the returned manifest bytes; both
-Linux amd64 and arm64 platform digests must exist. Any resolution failure fails
-the run rather than retaining an old digest or skipping an architecture.
+`check-updates.yml` resolves the official Plex download API and immutable image
+manifests for Plex Inc, LinuxServer, the builder and PostgreSQL. Fingerprints
+include the source, policy, fixtures and pinned profile inputs. Unchanged
+attempts, including recorded failures, are deduplicated. The ledger keeps one
+active attempt and one replaceable pending fingerprint; superseded inputs remain
+visible. Infrastructure retries are bounded; assertion failures require
+investigation or an explicit retry.
 
-The workflow resolves these inputs once, records the exact source commit, and
-builds each of the eight variant/architecture/PostgreSQL 15-or-18 candidates once using pinned
-runtime and builder image refs. Candidate tags include the run ID, attempt, and
-architecture. Tests pull the build action's immutable output digest, never a
-mutable candidate tag; subsequent starts use the resulting immutable image ID.
-Artifacts record the source SHA, upstream snapshot, candidate digest, build
-metadata, installed/runtime Plex version, process/shim evidence, fixture logs,
-and phase/result. Candidate artifacts and images are **not approved releases**.
+Native tests must measure the actual Plex binary version in both variants on
+amd64 and arm64. Images that lag the official version produce
+`waiting-for-image`, not a compatibility regression or approval. Digest changes
+alone never prove support. Missing historical artifacts are reported rather than
+silently replaced with latest.
 
-Image pinning does not pin apt/apk repositories, Rust's stable channel, or the
-Dockerfile syntax frontend. Exact rebuild reproducibility is not claimed. A
-future promoter must reuse the tested output digests, not rebuild those inputs.
+Maintainers can add up to two distinct older public releases to
+`.github/plex-compatibility-profiles.json`. Each profile must pass validation and
+contain immutable inputs available for both architectures and variants.
+Historical records do not certify new code: every release must test every
+required profile against the **same current frozen source**.
 
-## Runtime downloads
+## Probe versus full certification
 
-Both Dockerfiles default to `VERSION=docker`. LinuxServer must use its bundled
-Plex binary, not fetch a new one at startup. Plex Inc's independent
-`50-plex-update` init hook is removed at build time because its version mechanism
-does not rely on the LinuxServer `VERSION` convention. A missing expected hook
-fails the build so upstream layout changes require review. Do not override
-`VERSION` or reintroduce a startup updater in deployed candidates.
+The reusable `docker-publish.yml` accepts a pinned profile and source SHA.
+`probe` mode exercises a shorter workload and cannot issue a release
+certificate. For each profile, `full` mode requires:
 
-The container probe uses an internal Docker network with **no external egress**,
-no production configuration, no Plex claim/token, unique labelled containers and
-volumes, and container-loopback HTTP checks without published host ports. This also prevents
-startup from quietly replacing the tested Plex binary. Cleanup targets only its
-own labelled resources, including anonymous container volumes, and retains logs.
+- Eight native container lanes: Plex Inc and LinuxServer, amd64 and arm64,
+  PostgreSQL 15 and 18.
+- 100 restart cycles per lane and a separate **21,000-second (5h50) soak** using
+  the same immutable candidate image.
+- Four native ZIP installation lanes covering both variants and architectures,
+  including a real SQLite-to-PostgreSQL migration.
+- Matching source, actual Plex version, workload and artifact evidence across
+  all required lanes.
 
-## Implemented probes
+Profiles run sequentially with bounded matrix concurrency. Setup, builds,
+restarts and ZIP checks add time beyond the soak. Missing, failed, cancelled or
+skipped required evidence prevents certification.
 
-`scripts/plex-container-e2e.sh` requires immutable candidate and PostgreSQL refs
-and native execution. It checks image architecture, `VERSION=docker`, and the
-installed package against the observed official version. A lagging upstream
-image fails; it is not upgraded during the test to disguise that lag.
+The fixture libraries contain Big Buck Bunny and two episodes of The Beverly
+Hillbillies. Tests exercise scanning, server file delivery, range seeking,
+video/audio decoding, watch-state persistence, import/export and database outage
+recovery. See [runtime E2E](runtime-e2e.md) for attribution and assertions. This
+does not establish browser/client playback, every media format, server-side
+transcoding or macOS compatibility.
 
-It starts the actual candidate with isolated PostgreSQL, requires real Plex
-`/identity` readiness and matching version, verifies the actual PMS process maps
-contain `db_interpose_pg.so`, and observes remote PostgreSQL sessions. It creates
-an empty movie library through the real Plex HTTP API, requires exactly one
-matching PostgreSQL row and no matching row in read-only shadow SQLite, then
-requires the real Plex API to return that library. It repeats the routing and
-persistence checks after restarting the same candidate/configuration. It then stops
-PostgreSQL, starts a fresh-config candidate, rejects HTTP readiness throughout an
-80-second observation window, and requires recovery after PostgreSQL returns and
-the candidate restarts. The driver also generates a two-second uncompressed AVI
-using Python and the candidate's existing Plex Transcoder, requests an actual
-library scan, and requires analyzed media through the Plex API plus exactly one
-joined PostgreSQL metadata/media/part row and no matching shadow SQLite part.
-It repeats the media assertions after restart, compares the native media-file
-route's bytes with the fixture, decodes that download using the bundled Plex
-Transcoder and compares all 20 RGB frames with the generated pixels, and checks
-thumbnail/art image responses. The
-watch-state gate marks the fixture watched, checks API/PG persistence across
-restart and absence of watched shadow rows, then marks it unwatched and verifies
-the reset. This tests one local personal-media workload, not general scan-format
-coverage, client playback/seek/transcoding protocols, audio, multiple users or sustained mixed load.
-Adding a gate is not evidence it passed; startup failure prevents later checks.
-Even
-their successful completion returns nonzero until full certification exists.
-Readiness checks also reject native `.dmp` crash reports in the fresh fixture,
-including reports left by a process that restarted and later became HTTP-ready.
-Reports remain in the evidence directory during cleanup.
+Candidates use isolated configuration and disposable PostgreSQL, with no
+production library or Plex claim token. Runtime updater hooks are disabled;
+tests cannot quietly replace the pinned Plex binary. Crash reports remain
+evidence even if the process subsequently becomes HTTP-ready.
 
-The separate eight-cell soak job reuses each digest only after its 100-cycle
-native smoke evidence passes source/version/architecture/PostgreSQL matching.
-`PLEX_E2E_SOAK_SECONDS=21000` requests 5h50 of monotonic elapsed time. The loop
-mixes scan requests, four concurrent media/file/art readers, watched/unwatched
-writes and PG/shadow identity checks, records resource samples, and rejects PMS
-process replacement. Its 360-minute job limit includes setup and cleanup;
-slow setup or interrupted/incomplete observations remain failures. This fixture
-workload does not establish all playback protocols, media formats or multi-user
-coverage. Promotion remains blocked for those outstanding gates.
+## Failure reports and separate fix PRs
 
-The workflow additionally requires
-`scripts/run-runtime-e2e.sh --reconnect` against a digest-pinned disposable
-PostgreSQL service and the same source SHA. Missing driver or any driver failure
-fails this job. Its host-built shared artifact is useful independent runtime
-coverage, **not proof for the container-built artifact or actual Plex workload**.
+Reporting distinguishes infrastructure failures, image lag, demonstrated
+regressions and insufficient evidence. A failed job alone does not justify
+calling an upstream release a breaking change. Reports and changelog entries
+link to observed evidence and avoid inventing a root cause.
 
-Both Linux Docker builders run `nm -D --defined-only` on the actual final
-`/libs/db_interpose_pg.so` and fail if `vfork`, `__cxa_throw` or
-`create_simple_converter` is exported,
-including versioned symbols. The symbol listing travels with the candidate image
-and is retained/rechecked by the container probe. The existing builder invokes
-Cargo with `--features interpose` only.
+A demonstrated regression can request a **separate draft code-fix PR** through
+`compatibility-fix.yml`. Codex generation uses a pinned action, a trusted prompt,
+read-only repository permissions, no persisted checkout credentials and a
+restricted sandbox. A separate posting job validates the structured proposal
+against its exact base and fingerprint. Only allowed runtime and regression-test
+paths can change; workflows, publication helpers, dependencies, symlinks and
+binary patches are rejected.
 
-Default Linux artifacts must not export `__cxa_throw`: the Rust exception hook is
-an opt-in `exception-hook` Cargo feature, not a default release feature. The
-unsafe Rust vfork wrapper has been removed by the runtime owner. This pipeline
-does not enable that feature or restore the wrapper. Passing symbol validation
-alone is not an inferred compatibility claim.
+Generated fixes are never automatically merged. They need review and normal
+unprivileged CI; a merged fix then requires fresh full certification. Without an
+API secret, reporting continues but no generated fix is claimed. Configure
+`OPENAI_API_KEY` as a GitHub repository secret using a dedicated API project with
+a limited budget and appropriate billing. A sandbox and patch allowlist reduce
+risk but do not make untrusted generation risk-free; use a scoped API proxy
+where available.
 
-The unnecessary `create_simple_converter` pass-through wrapper is removed:
-Boost returns a nontrivial C++ `std::unique_ptr`, not the plain pointer declared
-by that Rust wrapper. The original C++ implementation now receives the call
-directly, avoiding a redundant and incorrectly typed ABI boundary.
+## Exact tested releases
 
-## Remaining release blockers
+Staging freezes `VERSION` and a factual `CHANGELOG.md` entry **before** full
+certification. The certificate binds that source leaf, required profiles,
+completed native evidence, final ZIP hashes and candidate image digests. A green
+probe or ordinary PR check cannot substitute for it.
 
-- Execute the implemented real API mutation/persistence gate on all eight native
-  candidate lanes; initialization and an open session alone are insufficient.
-- Exercise scanning, playback, watch state, playlists and artwork in addition to
-  the empty-library mutation, with database-side persistence evidence.
-- Execute the implemented running-server PostgreSQL restart/read/write recovery
-  gate on every native cell, without restarting or replacing the PMS process.
-- Exercise the exact candidate shared artifact with runtime routing/reconnect
-  coverage on every supported architecture and variant.
-- Execute and review all eight native container lanes in external CI. A local
-  smoke attempt is not release certification or a guarantee of future support.
-- Implement one promotion barrier requiring explicit successful results and
-  complete digest-bound evidence from **all** runtime/container gates. Only then
-  compose versioned and `latest` manifests from the **same tested digests**.
-  No rebuild, new upstream lookup, mutable tag resolution, or digest-only release.
+`publish-certified-release.yml` independently authenticates the issuing
+repository, trusted workflow and revision, run attempt, successful conclusion,
+source and artifact ownership through GitHub. It starts automatically when
+certification completes successfully, or accepts a manual certificate run ID;
+both paths require the same trust validation. It reuses certified bytes and
+immutable image digests instead of rebuilding. Existing tags or assets must
+match exactly, otherwise publication fails. Concurrent main changes or rewritten
+staging commits require fresh staging and certification. Preserve the tested
+leaf with a fast-forward or a merge retaining its ancestry and tree. Publication
+also rechecks current upstream inputs. A newer upstream release supersedes a
+stale candidate and blocks its publication rather than calling it latest.
 
-The Linux/macOS artifact workflows still build and retain candidate bundles,
-but now have explicit failing certification jobs before GitHub Release uploads.
-Manually creating a `v*` tag cannot bypass this block. Replace these blockers only
-with passing workload gates tied to the exact packaged artifacts; do not remove
-them just because the separate host-built runtime driver passes.
+The publisher creates a **regular release**, not a prerelease. Automated assets
+are **Linux-certified only**. No new macOS asset is published until a separate
+native macOS gate and exact-byte certificate exist. Previously published macOS
+assets remain available. Legacy tag workflows no longer independently upload
+release assets, so creating a tag cannot bypass certificate validation.
 
-## Local probe
+## Bootstrap and operation
 
-Resolve to a temporary snapshot, build one native candidate with its pinned
-`BUILDER_IMAGE` and `PLEX_BASE_IMAGE`, then supply `CANDIDATE_IMAGE` as its local
-`sha256:` image ID (or a registry `@sha256:` ref), `POSTGRES_IMAGE` from the snapshot,
-`EXPECTED_PLEX_VERSION`, `EXPECTED_ARCH`, `VARIANT`, and a disposable `EVIDENCE_DIR`:
+Before enabling automatic publication:
+
+1. Merge and validate the trusted automation workflows and policy.
+2. Resolve an immutable latest profile and stage the versioned candidate.
+3. Run full `release-certification.yml` on the default branch with the frozen
+   `source_sha`, profile JSON and profile ID.
+4. Review genuine native evidence and artifact retention. Use the bootstrap
+   helper below to prepare trust configuration from the successful run.
+5. Review and merge that configuration as `.github/release-trust.json`. Configure
+   the `certified-release` environment according to repository governance.
+
+Run the helper from a reviewed, committed default-branch checkout. Its committed
+workflow and helper blobs must match the files that executed the issuing run;
+uncommitted local edits do not count as reviewed execution bytes. Supply the
+actual successful certification run ID and its immutable latest profile:
 
 ```sh
-python3 scripts/check-upstream-updates.py --output /tmp/upstream-candidate.json
-bash scripts/plex-container-e2e.sh
+export GH_TOKEN="$(gh auth token)"
+python3 scripts/bootstrap_release_trust.py \
+  --repository cgnl/plex-postgresql \
+  --run-id ACTUAL_CERTIFICATION_RUN_ID \
+  --latest-profile /tmp/profile-latest.json \
+  --output /tmp/release-trust.json
+unset GH_TOKEN
 ```
 
-The probe deliberately fails at `workload-smoke-complete-certification-incomplete` even if all
-implemented checks pass. Inspect `result.json` and logs, not merely the exit code.
-Never use a production database/configuration or treat HTTP readiness alone as
-compatibility approval.
+The helper performs read-only GitHub API checks and writes a local file for a
+configuration PR. It authenticates the completed default-branch run, certificate
+bytes, reviewed execution surface and required coverage. It refuses to overwrite
+an existing output file and never enables publication remotely. Do not replace
+the run ID with ordinary PR checks or construct a certificate manually. Adding
+or changing trusted execution files requires review and appropriate trust
+refresh; missing matching evidence remains a publication blocker.
+
+Certificates and CI artifacts have retention limits. Missing or expired assets
+cannot be rebuilt as substitutes; retain certified bytes durably or recertify.
+An explicit monitor dispatch with `retry: true` requests a retry of a recorded
+fingerprint. Job summaries and the ledger expose waiting, failed, superseded and
+unconfigured states. Implemented workflows and unit tests are not a claim that
+a live generated fix, complete certificate or automatic release has succeeded.

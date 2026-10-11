@@ -1,0 +1,64 @@
+name: Publish authenticated certified Linux bytes
+on:
+  workflow_run:
+    workflows: [Frozen compatibility release certification]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      certificate_run_id:
+        description: "Completed trusted certification run"
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: certified-release-publication
+  cancel-in-progress: false
+jobs:
+  configuration:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-24.04
+    outputs:
+      enabled: ${{ steps.trust.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - id: trust
+        run: |
+          if [[ ! -f .github/release-trust.json ]]; then
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'release-publication-unconfigured: genuine certificate bootstrap and reviewed release-trust.json are required.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python3 -c 'import json; assert json.load(open(".github/release-trust.json")).get("enabled") is True'
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+  publish:
+    needs: configuration
+    if: needs.configuration.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    environment: certified-release
+    permissions:
+      contents: write
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Fetch inert certificate from the requested run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.certificate_run_id || github.event.workflow_run.id }}
+        run: |
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name release-certificate --dir certificate
+          echo "CERTIFICATE_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+      - name: Independently authenticate provenance and publish existing bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          python3 scripts/publish_certified_release.py --certificate certificate/certificate.json --trust .github/release-trust.json --certificate-run-id "$CERTIFICATE_RUN_ID" --execute

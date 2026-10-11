@@ -3,10 +3,22 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact generated proposal commit to test
+        type: string
+        required: true
 permissions:
   contents: read
 jobs:
+  validate-source:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
   runtime-e2e:
+    needs: validate-source
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -23,6 +35,9 @@ jobs:
           chmod 600 "$docker_config/config.json"
           echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
       - name: Start the owned PostgreSQL fixture
         id: postgres
         env:
@@ -87,6 +102,7 @@ jobs:
           rm "$RUNTIME_E2E_CONTAINER_FILE"
 
   metadata-descriptor-e2e:
+    needs: validate-source
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -103,6 +119,9 @@ jobs:
           chmod 600 "$docker_config/config.json"
           echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
       - name: Start the owned PostgreSQL fixture
         id: postgres
         env:

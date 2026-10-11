@@ -12,6 +12,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from plex_compatibility import make_profile
+
 
 PLEX_API = "https://plex.tv/api/downloads/5.json"
 IMAGES = {
@@ -68,6 +70,7 @@ def resolve_image(repo, tag):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("upstream-candidate.json"))
+    parser.add_argument("--profile-output", type=Path)
     args = parser.parse_args()
     api_body, _ = fetch(PLEX_API)
     linux = json.loads(api_body)["computer"]["Linux"]
@@ -103,6 +106,9 @@ def main():
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     temporary.write_text(json.dumps(snapshot, indent=2) + "\n")
     temporary.replace(args.output)
+    if args.profile_output:
+        from plex_compatibility import write_json
+        write_json(args.profile_output, make_profile(snapshot))
     print(json.dumps(snapshot, indent=2))
     if "GITHUB_OUTPUT" in os.environ:
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:

@@ -1,9 +1,6 @@
 name: Release macOS Artifacts
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -18,7 +15,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -67,7 +64,6 @@ jobs:
             db_interpose_pg-arm64.dylib
             db_interpose_pg.dylib
           if-no-files-found: error
-
   package-macos-zip:
     name: Package macOS zip bundle
     runs-on: macos-14
@@ -119,22 +115,3 @@ jobs:
             plex-postgresql-*-macos.zip
             plex-postgresql-*-macos.zip.sha256
           if-no-files-found: error
-
-  upload-release:
-    name: Upload macOS zip to GitHub Release
-    runs-on: ubuntu-latest
-    needs: package-macos-zip
-    steps:
-      - name: Download zip artifact
-        uses: actions/download-artifact@v4
-        with:
-          path: release-assets
-
-      - name: Upload assets to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.package-macos-zip.outputs.tag }}
-          files: |
-            release-assets/macos-release-zip/plex-postgresql-*-macos.zip
-            release-assets/macos-release-zip/plex-postgresql-*-macos.zip.sha256
-          overwrite_files: false

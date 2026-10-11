@@ -1,25 +1,50 @@
 name: Native Plex Acceptance Matrix
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
         description: "Source ref to probe; never publishes release tags"
         required: true
         type: string
+      upstream_profile:
+        description: "Checked-in immutable profile JSON path"
+        type: string
+      upstream_profile_json:
+        description: "Immutable profile JSON (exclusive with path)"
+        type: string
+      profile_id:
+        description: "Profile artifact namespace"
+        type: string
+      mode:
+        type: choice
+        options: [full, probe]
+        default: full
   workflow_call:
+    outputs:
+      failure_category:
+        value: ${{ jobs.native-acceptance.outputs.failure_category }}
     inputs:
       version:
         description: "Source ref to probe; never publishes release tags"
         required: false
         type: string
+      upstream_profile:
+        type: string
+      upstream_profile_json:
+        type: string
+      profile_id:
+        type: string
+      mode:
+        type: string
+        default: full
+      payload_profile_id:
+        description: "Shared latest payload namespace for sequential historical profiles"
+        type: string
 
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 jobs:
   resolve:
@@ -37,17 +62,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.version || github.ref }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Authenticate candidate before any privileged build/test job
+        env:
+          CANDIDATE: ${{ inputs.version || github.sha }}
+          TRUSTED: ${{ github.sha }}
+          MODE: ${{ inputs.mode || 'full' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_REF" = 'refs/heads/${{ github.event.repository.default_branch }}'
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/${{ github.event.repository.default_branch }}" --jq .sha)" = "$TRUSTED"
+          python3 scripts/validate_certification_source.py --candidate "$CANDIDATE" --trusted "$TRUSTED" --mode "$MODE"
+          git checkout --detach "$CANDIDATE"
       - name: Record exact source
         id: source
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          PROFILE_ID: ${{ inputs.profile_id }}
+          MODE: ${{ inputs.mode || 'full' }}
+        run: |
+          [[ "$MODE" == full || "$MODE" == probe ]]
+          [[ -z "$PROFILE_ID" || "$PROFILE_ID" =~ ^[A-Za-z0-9-]+$ ]]
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Resolve all upstream inputs once
         id: inputs
-        run: python3 scripts/check-upstream-updates.py --output evidence/upstream-candidate.json
+        env:
+          PROFILE_PATH: ${{ inputs.upstream_profile }}
+          PROFILE_JSON: ${{ inputs.upstream_profile_json }}
+          PROFILE_ID: ${{ inputs.profile_id }}
+        run: |
+          if [[ -n "$PROFILE_JSON" ]]; then
+            test -z "$PROFILE_PATH"
+            python3 scripts/release_certificate.py --profile-json "$PROFILE_JSON" --profile-id "$PROFILE_ID" --output evidence/upstream-candidate.json
+          elif [[ -n "$PROFILE_PATH" ]]; then
+            python3 scripts/release_certificate.py --profile "$PROFILE_PATH" --profile-id "$PROFILE_ID" --output evidence/upstream-candidate.json
+          else
+            test -z "$PROFILE_ID"
+            python3 scripts/check-upstream-updates.py --output evidence/upstream-candidate.json
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: upstream-candidate
+          name: ${{ inputs.profile_id && format('{0}-upstream-candidate', inputs.profile_id) || 'upstream-candidate' }}
           path: evidence/upstream-candidate.json
           if-no-files-found: error
 
@@ -65,7 +121,7 @@ jobs:
         run: python3 scripts/prepare-media-fixtures.py media-fixture-cache
       - uses: actions/upload-artifact@v4
         with:
-          name: pinned-real-media
+          name: ${{ inputs.profile_id && format('{0}-pinned-real-media', inputs.profile_id) || 'pinned-real-media' }}
           path: media-fixture-cache
           compression-level: 0
           if-no-files-found: error
@@ -153,11 +209,15 @@ jobs:
 
   candidate:
     name: Probe ${{ matrix.variant }} / ${{ matrix.arch }} / PG${{ matrix.postgres }}
-    needs: [resolve, media-fixtures]
+    needs: [resolve, media-fixtures, linux-bundle]
+    permissions:
+      contents: read
+      packages: write
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy: &native_strategy
       fail-fast: false
+      max-parallel: 8
       matrix:
         include:
           - variant: linuxserver
@@ -215,11 +275,11 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: pinned-real-media
+          name: ${{ inputs.profile_id && format('{0}-pinned-real-media', inputs.profile_id) || 'pinned-real-media' }}
           path: media-fixture-cache
       - uses: actions/download-artifact@v4
         with:
-          name: upstream-candidate
+          name: ${{ inputs.profile_id && format('{0}-upstream-candidate', inputs.profile_id) || 'upstream-candidate' }}
           path: evidence
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -234,11 +294,16 @@ jobs:
           VARIANT: ${{ matrix.variant }}
           ARCH: ${{ matrix.arch }}
           POSTGRES_MAJOR: ${{ matrix.postgres }}
+          PROFILE_ID: ${{ inputs.profile_id }}
         run: |
           set -eu
           IMAGE="ghcr.io/${REPOSITORY_OWNER,,}/plex-postgresql-${VARIANT}"
           echo "repository=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "tag=$IMAGE:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}-pg${POSTGRES_MAJOR}" >> "$GITHUB_OUTPUT"
+          echo "tag=$IMAGE:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PROFILE_ID:-legacy}-${ARCH}-pg${POSTGRES_MAJOR}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ (inputs.payload_profile_id || inputs.profile_id) && format('{0}-', inputs.payload_profile_id || inputs.profile_id) || '' }}runtime-payload-${{ matrix.arch }}
+          path: certified-payload
       - name: Build once; push candidate only
         id: build
         uses: docker/build-push-action@v6
@@ -252,6 +317,24 @@ jobs:
           build-args: |
             BUILDER_IMAGE=${{ needs.resolve.outputs.builder_image }}
             PLEX_BASE_IMAGE=${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
+            RUNTIME_PAYLOAD=certified_payload
+          build-contexts: |
+            certified_payload=./certified-payload
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.profile_id && format('{0}-linux-release-zip', inputs.profile_id) || 'linux-release-zip' }}
+          path: release-bundle
+      - name: Bind the container payload to exact certified bundle bytes
+        env:
+          CANDIDATE: ${{ steps.image.outputs.repository }}@${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker pull "$CANDIDATE"
+          container=$(docker create "$CANDIDATE")
+          trap 'docker rm -v "$container"' EXIT
+          docker cp "$container:/usr/local/lib/plex-postgresql" container-payload
+          bundle=$(find release-bundle -maxdepth 1 -name '*.zip' -type f)
+          python3 scripts/verify_candidate_payload.py --bundle "$bundle" --directory container-payload --arch "$ARCH" --output evidence/payload-binding.json
       - name: Prepare offline crash diagnostics
         run: |
           if ! command -v gdb >/dev/null; then
@@ -273,7 +356,7 @@ jobs:
           VARIANT: ${{ matrix.variant }}
           EVIDENCE_DIR: evidence/container
           PLEX_E2E_MEDIA_CACHE_DIR: ${{ github.workspace }}/media-fixture-cache
-          PLEX_E2E_RESTART_CYCLES: '100'
+          PLEX_E2E_RESTART_CYCLES: ${{ inputs.mode == 'probe' && '1' || '100' }}
         run: bash scripts/plex-container-e2e.sh
       - name: Preserve candidate digest and build metadata
         if: always()
@@ -294,7 +377,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: candidate-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
+          name: ${{ inputs.profile_id && format('{0}-', inputs.profile_id) || '' }}candidate-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
           path: evidence
           if-no-files-found: error
 
@@ -323,11 +406,11 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: pinned-real-media
+          name: ${{ inputs.profile_id && format('{0}-pinned-real-media', inputs.profile_id) || 'pinned-real-media' }}
           path: media-fixture-cache
       - uses: actions/download-artifact@v4
         with:
-          name: candidate-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
+          name: ${{ inputs.profile_id && format('{0}-', inputs.profile_id) || '' }}candidate-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
           path: prior-evidence
       - name: Require completed 100-cycle smoke on the exact source and digest
         env:
@@ -337,6 +420,7 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.arch }}
           EXPECTED_POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REQUIRED_CYCLES: ${{ inputs.mode == 'probe' && '1' || '100' }}
         run: |
           python3 - <<'PY'
           import json, os, re
@@ -352,6 +436,8 @@ jobs:
           if (root / 'postgres-ref.txt').read_text().strip() != os.environ['EXPECTED_POSTGRES_IMAGE']:
               raise SystemExit('PostgreSQL evidence mismatch')
           expected = {'candidate': image, 'plex_version': os.environ['EXPECTED_PLEX_VERSION'], 'variant': os.environ['EXPECTED_VARIANT'], 'arch': os.environ['EXPECTED_ARCH'], 'phase': 'native-workload-complete', 'exit_code': 0, 'workload_passed': True, 'restart_cycles_requested': 100, 'restart_cycles_completed': 100, 'live_postgres_recovery_verified': True, 'decoded_fixture_verified': True, 'real_movie_and_tv_playback_verified': True, 'real_media_full_decode_verified': True, 'native_import_and_rollback_verified': True, 'four_concurrent_real_media_clients_verified': True, 'promotion_allowed': False}
+          expected['restart_cycles_requested'] = int(os.environ['REQUIRED_CYCLES'])
+          expected['restart_cycles_completed'] = int(os.environ['REQUIRED_CYCLES'])
           if any(result.get(key) != value for key, value in expected.items()):
               raise SystemExit('Prior native smoke failed or is incomplete')
           with open(os.environ['GITHUB_ENV'], 'a') as output:
@@ -380,14 +466,14 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.arch }}
           VARIANT: ${{ matrix.variant }}
           PLEX_E2E_RESTART_CYCLES: '1'
-          PLEX_E2E_SOAK_SECONDS: '21000'
+          PLEX_E2E_SOAK_SECONDS: ${{ inputs.mode == 'probe' && '60' || '21000' }}
           EVIDENCE_DIR: evidence/soak
           PLEX_E2E_MEDIA_CACHE_DIR: ${{ github.workspace }}/media-fixture-cache
         run: bash scripts/plex-container-e2e.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: soak-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
+          name: ${{ inputs.profile_id && format('{0}-', inputs.profile_id) || '' }}soak-${{ matrix.variant }}-${{ matrix.arch }}-pg${{ matrix.postgres }}
           path: evidence
           if-no-files-found: error
 
@@ -396,7 +482,13 @@ jobs:
     if: always()
     needs: [resolve, media-fixtures, runtime-e2e, candidate, soak, native-bundle-install]
     runs-on: ubuntu-latest
+    outputs:
+      failure_category: ${{ steps.observation.outputs.failure_category }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
       - name: Verify every native matrix lane completed
         env:
           RESOLUTION: ${{ needs.resolve.result }}
@@ -413,10 +505,30 @@ jobs:
           test "$BUNDLES" = success
           test "$MEDIA" = success
           echo 'PASS all declared native workload lanes. Image promotion remains a separate action.'
+      - uses: actions/download-artifact@v4
+        if: always() && inputs.profile_id != ''
+        continue-on-error: true
+        with:
+          pattern: ${{ inputs.profile_id }}-candidate-*
+          path: observation-evidence
+      - id: observation
+        if: always() && inputs.upstream_profile_json != ''
+        env:
+          PROFILE_JSON: ${{ inputs.upstream_profile_json }}
+          SOURCE: ${{ needs.resolve.outputs.source_sha }}
+          MODE: ${{ inputs.mode || 'full' }}
+          JOBS_PASSED: ${{ needs.resolve.result == 'success' && needs.media-fixtures.result == 'success' && needs.runtime-e2e.result == 'success' && needs.candidate.result == 'success' && needs.soak.result == 'success' && needs.native-bundle-install.result == 'success' }}
+        run: python3 scripts/native_compatibility_observation.py --root observation-evidence --profile-json "$PROFILE_JSON" --source "$SOURCE" --mode "$MODE" --jobs-passed "$JOBS_PASSED" --output observation/observation.json
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.upstream_profile_json != ''
+        with:
+          name: ${{ inputs.profile_id }}-compatibility-observation
+          path: observation/observation.json
+          if-no-files-found: error
 
   native-bundle-install:
     name: Native ZIP / ${{ matrix.variant }} / ${{ matrix.arch }}
-    needs: resolve
+    needs: [resolve, linux-bundle]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -452,24 +564,10 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           persist-credentials: false
-      - uses: docker/setup-buildx-action@v3
-      - name: Build the matching native release payload
-        env:
-          BUILDER_IMAGE: ${{ needs.resolve.outputs.builder_image }}
-          BUNDLE_ARCH: ${{ matrix.bundle_arch }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -eu
-          docker buildx build --platform "linux/$ARCH" --target release-payload \
-            --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
-            --output type=local,dest=bundle-root .
-          mkdir -p "bundle/libs/$BUNDLE_ARCH" bundle/scripts bundle/schema
-          cp "bundle-root/libs/db_interpose_pg.so" "bundle/db_interpose_pg-linux-$BUNDLE_ARCH.so"
-          cp -L bundle-root/libs/*.so* "bundle/libs/$BUNDLE_ARCH/"
-          rm "bundle/libs/$BUNDLE_ARCH/db_interpose_pg.so"
-          cp scripts/install_wrappers_linux.sh scripts/migrate_lib.sh scripts/migrate_table.py scripts/seed_shadow_table_from_pg.py bundle/scripts/
-          cp schema/*.sql bundle/schema/
-          (cd bundle && zip -r ../native-bundle.zip .)
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.profile_id && format('{0}-linux-release-zip', inputs.profile_id) || 'linux-release-zip' }}
+          path: release-bundle
       - name: Verify the ZIP on the unmodified pinned Plex image
         env:
           BASE_PLEX_IMAGE: ${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
@@ -477,10 +575,97 @@ jobs:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           EVIDENCE_DIR: evidence/native-bundle
           POSTGRES_IMAGE: ${{ needs.resolve.outputs.postgres15_image }}
-        run: bash scripts/test-native-linux-bundle.sh native-bundle.zip
+        run: |
+          bundle=$(find release-bundle -maxdepth 1 -name '*.zip' -type f)
+          test "$(printf '%s\n' "$bundle" | wc -l)" -eq 1
+          mkdir -p evidence
+          sha256sum "$bundle" > evidence/bundle-sha256.txt
+          bash scripts/test-native-linux-bundle.sh "$bundle"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-bundle-${{ matrix.variant }}-${{ matrix.arch }}
-          path: evidence/native-bundle
+          name: ${{ inputs.profile_id && format('{0}-', inputs.profile_id) || '' }}native-bundle-${{ matrix.variant }}-${{ matrix.arch }}
+          path: evidence
           if-no-files-found: error
+
+  linux-payload:
+    if: inputs.payload_profile_id == '' || inputs.payload_profile_id == inputs.profile_id
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            bundle_arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            bundle_arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build one native payload
+        env:
+          BUILDER_IMAGE: ${{ needs.resolve.outputs.builder_image }}
+          ARCH: ${{ matrix.arch }}
+          BUNDLE_ARCH: ${{ matrix.bundle_arch }}
+        run: |
+          docker buildx build --file Dockerfile.standalone --platform "linux/$ARCH" --target export-payload --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" --output type=local,dest=bundle-root .
+          mkdir -p "payload/libs/$BUNDLE_ARCH"
+          cp bundle-root/libs/db_interpose_pg.so "payload/db_interpose_pg-linux-$BUNDLE_ARCH.so"
+          cp -L bundle-root/libs/*.so* "payload/libs/$BUNDLE_ARCH/"
+          rm "payload/libs/$BUNDLE_ARCH/db_interpose_pg.so"
+          mkdir -p runtime-payload/libs
+          cp -L bundle-root/libs/* runtime-payload/libs/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.profile_id && format('{0}-', inputs.profile_id) || '' }}runtime-payload-${{ matrix.arch }}
+          path: runtime-payload
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.profile_id && format('{0}-', inputs.profile_id) || '' }}linux-payload-${{ matrix.bundle_arch }}
+          path: payload
+          if-no-files-found: error
+
+  linux-bundle:
+    needs: [resolve, linux-payload]
+    if: always() && needs.resolve.result == 'success' && (needs.linux-payload.result == 'success' || needs.linux-payload.result == 'skipped')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: inputs.payload_profile_id == '' || inputs.payload_profile_id == inputs.profile_id
+        with:
+          pattern: ${{ inputs.profile_id && format('{0}-linux-payload-*', inputs.profile_id) || 'linux-payload-*' }}
+          merge-multiple: true
+          path: bundle
+      - uses: actions/download-artifact@v4
+        if: inputs.payload_profile_id != '' && inputs.payload_profile_id != inputs.profile_id
+        with:
+          name: ${{ inputs.payload_profile_id }}-linux-release-zip
+          path: release-bundle
+      - name: Assemble the final exact Linux ZIP before acceptance
+        if: inputs.payload_profile_id == '' || inputs.payload_profile_id == inputs.profile_id
+        run: |
+          mkdir -p bundle/scripts bundle/schema release-bundle
+          cp README.md CHANGELOG.md INSTALL.md LICENSE THIRD_PARTY_LICENSES bundle/
+          cp -R scripts/. bundle/scripts/
+          cp schema/*.sql bundle/schema/
+          version=$(cat VERSION)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          (cd bundle && zip -r "../release-bundle/plex-postgresql-v$version-linux.zip" .)
+          (cd release-bundle && sha256sum *.zip > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.profile_id && format('{0}-linux-release-zip', inputs.profile_id) || 'linux-release-zip' }}
+          path: release-bundle
+          if-no-files-found: error
+          retention-days: 90

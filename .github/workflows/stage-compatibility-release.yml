@@ -1,0 +1,68 @@
+name: Stage versioned compatibility release leaf
+on:
+  workflow_dispatch:
+    inputs:
+      merged_source_sha:
+        description: "Exact current default-branch SHA after reviewed fixes"
+        required: true
+        type: string
+      plex_version:
+        description: "Public Plex version being certified"
+        required: true
+        type: string
+      upstream_profile_json:
+        description: "Immutable latest profile verified by the green probe"
+        required: true
+        type: string
+      profile_id:
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: compatibility-release-staging
+  cancel-in-progress: false
+jobs:
+  stage:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Allocate regular version before testing
+        env:
+          SOURCE_SHA: ${{ inputs.merged_source_sha }}
+          PLEX_VERSION: ${{ inputs.plex_version }}
+          GH_TOKEN: ${{ github.token }}
+          PROFILE_JSON: ${{ inputs.upstream_profile_json }}
+          PROFILE_ID: ${{ inputs.profile_id }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/${{ github.event.repository.default_branch }}" --jq .sha)" = "$SOURCE_SHA"
+          git tag --list > "$RUNNER_TEMP/release-tags.txt"
+          python3 scripts/stage_compatibility_release.py --tags-file "$RUNNER_TEMP/release-tags.txt" --plex-version "$PLEX_VERSION"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          branch="automation/release-stage-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git switch -c "$branch"
+          git add VERSION CHANGELOG.md
+          if ! git diff --cached --quiet; then
+            git commit -m 'Freeze a versioned leaf before compatibility certification' -m 'Confidence: high' -m 'Tested: Version allocation and staging regression tests'
+          else
+            echo "Existing frozen candidate: $SOURCE_SHA; no duplicate staging PR required." >> "$GITHUB_STEP_SUMMARY"
+            gh workflow run release-certification.yml --ref '${{ github.event.repository.default_branch }}' -f "source_sha=$SOURCE_SHA" -f "upstream_profile_json=$PROFILE_JSON" -f "profile_id=$PROFILE_ID" -f mode=full
+            exit 0
+          fi
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/${{ github.event.repository.default_branch }}" --jq .sha)" = "$SOURCE_SHA"
+          git -c 'credential.helper=!gh auth git-credential' push origin "$branch"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base '${{ github.event.repository.default_branch }}' --head "$branch" --title "Stage compatibility release $(cat VERSION)" --body 'Version and factual changelog frozen before full native certification. Preserve this leaf with a merge; squash/rebase or concurrent main changes require fresh staging and certification.'
+          echo "Frozen candidate: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          gh workflow run release-certification.yml --ref '${{ github.event.repository.default_branch }}' -f "source_sha=$(git rev-parse HEAD)" -f "upstream_profile_json=$PROFILE_JSON" -f "profile_id=$PROFILE_ID" -f mode=full
