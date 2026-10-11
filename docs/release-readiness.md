@@ -2,6 +2,13 @@
 
 ## Scope and decision
 
+**11 October 2026 update:** v1.3.22 is a regular source release at the maintainer's
+request. PRs #32 and #33 are merged, and issues #10, #17, #24 and #26 are closed
+after regression review. Four native ZIP gates and eight 100-restart gates pass
+on `5dd3b51`; eight 350-minute soak gates remain in progress. New binary assets
+and production image promotion remain separately gated. Historical entries below
+record earlier validation states and are not the current summary.
+
 The target is a release that resolves or explicitly dispositions every known
 report for a declared support matrix. It is not proof that no bugs exist, that
 every historical Plex binary is supported, or that future Plex binaries will

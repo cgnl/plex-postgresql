@@ -8,16 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.22] - 2026-10-11
+
+### Added
+- Scheduled compatibility discovery for public Plex releases and up to two validated historical profiles, with separate draft codefix PRs and explicit CI dispatch.
+- Authenticated native certification and publication workflows that reuse exact tested Linux payloads, ZIPs and image digests.
+- Native ZIP installation gates for both image variants and CPU architectures, plus four concurrent real H264/audio clients during scans and metadata/watch updates.
+
 ### Fixed
+- Order Linuxserver PostgreSQL initialization after upstream temporary-directory cleanup, preventing migration SQL from disappearing during restart.
+- Export only release libraries instead of the complete compiler filesystem in native ZIP jobs.
 - Retain existing SQLite export files in durable backups before replacement, including exports confirmed with `--yes`.
 - Allow one hour by default for private migration snapshots, with a configurable upper bound of 24 hours for large libraries on slow storage.
 - Load Plex's libraries before shim dependencies consistently in Linux wrappers and container startup.
 - Test the native ZIP's packaged migration helpers against real SQLite library/blob files and an isolated PostgreSQL destination.
 - Obtain prepared-statement column descriptors through privately named PREPARE/DESCRIBE/DEALLOCATE rounds instead of executing statements for metadata, and refuse to publish row-producing statements without descriptors, preventing native Plex SIGSEGVs that read column metadata after PostgreSQL outage recovery.
 
-## [1.3.22]
-
-### Fixed
 - Replace connection-pool pthread liveness probes with lifecycle-owned logical tokens, preventing dereferences of expired thread descriptors during idle reclamation.
 - Preserve the SQLite MATCH boundary before following AND/OR filters and retain grouping for tag ranking by `count(*)`, fixing both observed native `/hubs/search` HTTP 500 errors.
 - Recognize exact repository bootstrap rows, including Administrator and preferences, before migration; reject modified defaults and preserve existing library data under destination locks.
@@ -31,9 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Include migration helpers and trusted schema/seed files in Docker images and release bundles.
 - Package Linux runtime dependencies per architecture and validate their Plex loader resolution before installation changes.
 
-### Added
-- Native ZIP installation gates for both image variants and CPU architectures, plus four concurrent real H264/audio clients during scans and metadata/watch updates.
-
+### Validation and distribution
+- Publish as a regular source release, not a prerelease. GitHub source archives contain the merged changes; new prebuilt binaries and Docker production promotion remain gated on their own certification.
+- All four native ZIP installation checks and all eight native 100-restart lanes passed on `5dd3b51`; the eight 350-minute soak lanes are still running at publication time.
+- Eighty Python regression tests and 34 PostgreSQL 15/18 migration checks pass. Automatic code generation still requires an API key; automatic publication requires genuine trust bootstrap.
 
 ## [1.3.21] - 2026-10-09
 

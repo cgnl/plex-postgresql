@@ -8,11 +8,10 @@ A small shim library that catches Plex SQLite calls and sends them to PostgreSQL
 
 ## Current validation status
 
-**v1.3.21 is a regular release.** [PR #31](https://github.com/cgnl/plex-postgresql/pull/31)
-is merged; follow-up fixes for v1.3.22 are in draft
-[PR #32](https://github.com/cgnl/plex-postgresql/pull/32).
-The complete native matrix and 5h50
-soak remain pending. Native PlexInc/arm64/PG18 now passes genuine SQLite import,
+**v1.3.22 is a regular source release.** PRs #31, #32 and #33 are merged.
+All four native ZIP checks and all eight 100-restart lanes passed on `5dd3b51`.
+The 5h50 soak remains pending. New prebuilt release assets and Docker production
+promotion require their own completed certification. Native PlexInc/arm64/PG18 passes genuine SQLite import,
 normal restart, both search routes, export and restoration into vanilla Plex,
 with watched state, server/media identity and source hashes preserved. The two
 observed search HTTP 500 causes have regressions and PostgreSQL 15/18 result
@@ -30,10 +29,11 @@ and a separate 5-hour-50-minute soak using the same immutable image digest.
 See [release gates and known gaps](docs/release-readiness.md) and
 [recorded validation evidence](docs/stability-validation-2026-10-09.md).
 
-## Latest published release: [v1.3.21](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.21)
+## Latest published release: [v1.3.22](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.22)
 
-Published on 9 October 2026. Includes transaction/reconnect, migration and FTS
-fixes, plus real movie/TV acceptance tooling. See [the changelog](CHANGELOG.md).
+Published on 11 October 2026. Includes runtime, migration, startup ordering and
+compatibility automation fixes. Download the source archives or build the
+container from the tag. See [the changelog](CHANGELOG.md).
 
 ### Runtime architecture introduced in v1.2.0
 
@@ -45,7 +45,7 @@ fixes, plus real movie/TV acceptance tooling. See [the changelog](CHANGELOG.md).
 - 🔧 **Stack safety:** heap-allocated thread-local buffers for Plex's 544K worker thread stacks
 - ✅ **712 tests passing** across unit, integration, and compatibility suites
 
-[📥 Download v1.3.21](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.21) | [📋 Full Changelog](CHANGELOG.md)
+[📥 Download v1.3.22 source](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.22) | [📋 Full Changelog](CHANGELOG.md)
 
 New automatic releases require a certificate for the exact tested source and
 Linux ZIP/image bytes. Tag pushes no longer independently publish assets.
