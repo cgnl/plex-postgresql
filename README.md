@@ -70,7 +70,7 @@ The candidate image repositories are:
 
 **macOS:**
 ```bash
-curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.21/plex-postgresql-v1.3.21-macos.zip \
+curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.22/plex-postgresql-v1.3.22-macos.zip \
   -o /tmp/plex-pg-macos.zip
 mkdir -p /tmp/plex-pg-macos && cd /tmp/plex-pg-macos
 unzip /tmp/plex-pg-macos.zip
@@ -79,10 +79,8 @@ pkill -f "Plex Media Server" 2>/dev/null || true
 ```
 
 **Linux:** use the architecture-aware installer from the corrected bundle.
-Keep its `libs/`, `scripts/` and `schema/` directories together. The published
-v1.3.21 ZIP lacks a complete matched dependency set; see the
-[Linux installation instructions](INSTALL.md#-linux-native) for the bundle format
-and validation status.
+Keep its `libs/`, `scripts/` and `schema/` directories together. See the
+[Linux installation instructions](INSTALL.md#-linux-native).
 
 **Docker:**
 ```bash
@@ -283,7 +281,7 @@ volumes:
 Use the latest macOS zip and run the wrapper installer. The installer copies the shim dylib into `Plex Media Server.app`, patches the binaries, and sets up the wrapper script. Everything lives inside the Plex app bundle.
 
 ```bash
-curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.21/plex-postgresql-v1.3.21-macos.zip -o /tmp/plex-pg-macos.zip
+curl -L https://github.com/cgnl/plex-postgresql/releases/download/v1.3.22/plex-postgresql-v1.3.22-macos.zip -o /tmp/plex-pg-macos.zip
 mkdir -p /tmp/plex-pg-macos && cd /tmp/plex-pg-macos
 unzip /tmp/plex-pg-macos.zip
 
@@ -304,8 +302,7 @@ pkill -f "Plex Media Server" 2>/dev/null || true
 ## Quick Start (Linux Native)
 
 The corrected bundle contains both named shims and `libs/x86_64/` plus
-`libs/aarch64/` runtime dependencies. This format is part of the follow-up work;
-the already published v1.3.21 ZIP does not contain it.
+`libs/aarch64/` runtime dependencies. Both are included in v1.3.22.
 
 Extract a corrected bundle without flattening its directories. The installer
 selects and validates the matching shim, dependencies and Plex loader before
