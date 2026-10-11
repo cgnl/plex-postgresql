@@ -460,7 +460,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -eu
-          docker buildx build --platform "linux/$ARCH" --target builder \
+          docker buildx build --platform "linux/$ARCH" --target release-payload \
             --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
             --output type=local,dest=bundle-root .
           mkdir -p "bundle/libs/$BUNDLE_ARCH" bundle/scripts bundle/schema

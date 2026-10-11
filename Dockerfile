@@ -53,6 +53,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 RUN nm -D --defined-only /libs/db_interpose_pg.so > /libs/default-exports.txt && \
     awk '$3 ~ /^(vfork|__cxa_throw)(@.*)?$/ || $3 ~ /create_simple_converter/ { print "Forbidden default export: " $3; rejected=1 } END { exit rejected }' /libs/default-exports.txt
 
+# Export only release libraries, excluding the compiler filesystem.
+FROM scratch AS release-payload
+COPY --from=builder /libs /libs
+
 # Runtime stage
 FROM ${PLEX_BASE_IMAGE}
 
