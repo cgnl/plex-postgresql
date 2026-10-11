@@ -318,7 +318,6 @@ pub(super) fn bind_text_impl(
 ) -> c_int {
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_TEXT, p_stmt) };
     let original_val = val;
-    let original_length = n_bytes;
     let replacement = unsafe {
         replacement_identifier(
             pg_stmt,
@@ -356,7 +355,7 @@ pub(super) fn bind_text_impl(
                     (*pg_stmt).param_values[pg_idx] = ptr::null_mut();
                 }
             }
-            if !original_val.is_null() && original_length >= 0 {
+            if !original_val.is_null() {
                 unsafe { invoke_destructor_if_custom(original_val.cast(), destructor) };
             }
             drop(guard);
@@ -451,11 +450,9 @@ pub(super) fn bind_text_impl(
         }
     }
     // A replacement never transfers the caller's original pointer to SQLite.
-    // Negative-length bind_text and NULL have no destructor obligation.
-    if !original_val.is_null()
-        && original_length >= 0
-        && (replacement.is_some() || is_pg_routed_noncached(pg_stmt))
-    {
+    // SQLite owns a custom-destructor value whatever its length (negative only
+    // means NUL-terminated), so it is disposed of here when SQLite never sees it.
+    if !original_val.is_null() && (replacement.is_some() || is_pg_routed_noncached(pg_stmt)) {
         unsafe { invoke_destructor_if_custom(original_val.cast(), destructor) };
     }
 
@@ -836,26 +833,26 @@ mod tests {
         assert_eq!(LAST.load(Ordering::SeqCst), invalid as usize);
         let negative = unsafe { libc::strdup(c"negative".as_ptr()) };
         assert_eq!(bind_text_impl(handle, 1, negative, -1, callback), SQLITE_OK);
-        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
-        unsafe { libc::free(negative.cast()) };
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        assert_eq!(LAST.load(Ordering::SeqCst), negative as usize);
         assert_eq!(
             bind_text_impl(handle, 1, ptr::null(), 0, callback),
             SQLITE_OK
         );
-        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
         assert!(stmt.param_values[0].is_null());
         let oversized = unsafe { libc::strdup(c"oversized".as_ptr()) };
         assert_eq!(
             bind_text64_impl(handle, 1, oversized, u64::MAX, callback, 1),
             18
         );
-        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 4);
         assert_eq!(LAST.load(Ordering::SeqCst), oversized as usize);
         assert_eq!(
             bind_text64_impl(handle, 1, ptr::null(), u64::MAX, callback, 1),
             SQLITE_OK
         );
-        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 4);
         crate::pg_statement::c_abi::pg_unregister_stmt(handle);
         assert_eq!(
             unsafe { rusqlite::ffi::sqlite3_finalize(sqlite_stmt) },
