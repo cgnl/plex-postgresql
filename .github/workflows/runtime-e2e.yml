@@ -157,7 +157,7 @@ jobs:
               apk add --no-cache bash build-base postgresql-dev postgresql14-client sqlite-dev sqlite-libs linux-headers curl
               export CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup RUSTUP_TOOLCHAIN=stable
               export PATH="/usr/local/cargo/bin:$PATH"
-              curl --proto=https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+              curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
               exec bash scripts/run-metadata-descriptor-e2e.sh
             '
       - name: Clean up the owned PostgreSQL fixture

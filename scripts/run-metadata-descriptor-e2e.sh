@@ -29,7 +29,7 @@ cleanup() {
     status=$?
     trap - EXIT
     if [[ $external_fixture_ready == 1 ]]; then
-        psql -X -h "$admin_host" -p "$admin_port" -U "$admin_user" -d "$admin_database" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $database WITH (FORCE)" -c "DROP ROLE IF EXISTS $role" >/dev/null 2>&1 || echo "WARNING: fixture cleanup failed: $database/$role" >&2
+        PGPASSWORD="${RUNTIME_E2E_ADMIN_PASSWORD:?}" psql -X -h "$admin_host" -p "$admin_port" -U "$admin_user" -d "$admin_database" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $database WITH (FORCE)" -c "DROP ROLE IF EXISTS $role" >/dev/null 2>&1 || echo "WARNING: fixture cleanup failed: $database/$role" >&2
     fi
     if [[ $status != 0 && -f "$fixture/shim.log" ]]; then tail -n 80 "$fixture/shim.log" >&2; fi
     rm -rf "$fixture"
