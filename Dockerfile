@@ -115,7 +115,11 @@ COPY scripts/docker-entrypoint.sh /usr/local/lib/plex-postgresql/docker-entrypoi
 RUN chmod +x /usr/local/lib/plex-postgresql/docker-entrypoint.sh
 
 # Create s6-overlay init script to run our initialization
-RUN mkdir -p /etc/s6-overlay/s6-rc.d/init-plex-postgresql && \
+# Linuxserver's chown initialization deletes TMPDIR. It must finish before
+# migration creates temporary SQL there, including on repeated container starts.
+RUN test -f /etc/s6-overlay/s6-rc.d/init-plex-chown/run && \
+    mkdir -p /etc/s6-overlay/s6-rc.d/init-plex-postgresql/dependencies.d && \
+    touch /etc/s6-overlay/s6-rc.d/init-plex-postgresql/dependencies.d/init-plex-chown && \
     echo "oneshot" > /etc/s6-overlay/s6-rc.d/init-plex-postgresql/type && \
     echo "/usr/local/lib/plex-postgresql/docker-entrypoint.sh" > /etc/s6-overlay/s6-rc.d/init-plex-postgresql/up && \
     chmod +x /etc/s6-overlay/s6-rc.d/init-plex-postgresql/up && \
