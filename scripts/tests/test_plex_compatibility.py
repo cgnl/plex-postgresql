@@ -1,4 +1,6 @@
 import copy
+import contextlib
+import io
 import importlib.util
 import json
 from pathlib import Path
@@ -26,6 +28,40 @@ def snapshot(version="1.43.4.10903-e5521bd8c"):
 
 
 class CompatibilityTests(unittest.TestCase):
+    def test_api_failures_are_visible_without_tokens(self):
+        failure = subprocess.CalledProcessError(1, ['gh', 'api'], stderr='HTTP 403: PR creation disabled; private-token')
+        output = io.StringIO()
+        with patch.dict(os.environ, GH_TOKEN='private-token'), \
+             patch.object(compatibility.subprocess, 'run', side_effect=failure), \
+             contextlib.redirect_stderr(output), self.assertRaises(subprocess.CalledProcessError):
+            compatibility.github_api('repos/owner/repo/pulls', 'POST', {})
+        self.assertIn('HTTP 403: PR creation disabled', output.getvalue())
+        self.assertNotIn('private-token', output.getvalue())
+
+    def report_retry_responses(self, tree='report-tree'):
+        source = self.plan['source_sha']
+        return [[], {'default_branch': 'main'}, {'object': {'sha': source}},
+                {'tree': {'sha': 'base-tree'}}, {'sha': 'report-tree'},
+                {'object': {'sha': 'existing-report-commit'}},
+                {'tree': {'sha': tree}, 'parents': [{'sha': source}]},
+                {'html_url': 'https://github.com/owner/repo/pull/35'}]
+
+    def test_report_retry_reuses_exact_existing_branch(self):
+        with patch.object(compatibility, 'github_api', side_effect=self.report_retry_responses()) as api:
+            url = compatibility.report_pr('owner/repo', self.plan, 'probe-passed',
+                                          'https://github.com/owner/repo/actions/runs/12')
+        self.assertTrue(url.endswith('/35'))
+        self.assertFalse(any(call.args[0].endswith('/git/refs') for call in api.call_args_list))
+        self.assertEqual(api.call_args_list[-1].args[0], 'repos/owner/repo/pulls')
+
+    def test_report_retry_rejects_changed_branch(self):
+        with patch.object(compatibility, 'github_api', side_effect=self.report_retry_responses('other-tree')) as api:
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                compatibility.report_pr('owner/repo', self.plan, 'probe-passed',
+                                        'https://github.com/owner/repo/actions/runs/12')
+        self.assertFalse(any(len(call.args) > 1 and call.args[1] == 'POST'
+                             and call.args[0].endswith('/pulls') for call in api.call_args_list))
+
     def setUp(self):
         self.policy = compatibility.read_json(SCRIPTS.parent / ".github/plex-compatibility-policy.json")
         self.history = {"schema_version": 1, "profiles": []}

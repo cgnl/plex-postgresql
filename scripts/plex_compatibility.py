@@ -12,6 +12,7 @@ import json
 import re
 import os
 import subprocess
+import sys
 from pathlib import Path
 from urllib.parse import quote
 
@@ -352,8 +353,17 @@ def github_api(path, method="GET", body=None):
     args = ["gh", "api", path, "--method", method]
     if body is not None:
         args += ["--input", "-"]
-    result = subprocess.run(args, input=json.dumps(body) if body is not None else None,
-                            text=True, capture_output=True, check=True)
+    try:
+        result = subprocess.run(args, input=json.dumps(body) if body is not None else None,
+                                text=True, capture_output=True, check=True)
+    except subprocess.CalledProcessError as error:
+        diagnostic = (error.stderr or '').strip()
+        for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
+            token = os.environ.get(name)
+            if token:
+                diagnostic = diagnostic.replace(token, '[redacted]')
+        print(f'GitHub API {method} {path}: {diagnostic[:8000]}', file=sys.stderr)
+        raise
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
@@ -559,11 +569,21 @@ def report_pr(repository, plan, category, run_url):
                  f"Root cause remains under investigation. [Evidence]({run_url}).\n\n")
         entries.append({"path": "CHANGELOG.md", "mode": "100644", "type": "blob", "content": entry + original})
     tree = github_api(f"repos/{repository}/git/trees", "POST", {"base_tree": tree_sha, "tree": entries})
-    commit = github_api(f"repos/{repository}/git/commits", "POST", {
-        "message": "Preserve measured Plex compatibility observations\n\nConfidence: high\nScope-risk: narrow\nTested: deterministic evidence classification",
-        "tree": tree["sha"], "parents": [base_commit]})
     branch = "automation/plex-report-" + plan["fingerprint"]
-    github_api(f"repos/{repository}/git/refs", "POST", {"ref": "refs/heads/" + branch, "sha": commit["sha"]})
+    try:
+        existing = github_api(f"repos/{repository}/git/ref/heads/{branch}")
+    except subprocess.CalledProcessError as error:
+        if not api_missing(error):
+            raise
+        commit = github_api(f"repos/{repository}/git/commits", "POST", {
+            "message": "Preserve measured Plex compatibility observations\n\nConfidence: high\nScope-risk: narrow\nTested: deterministic evidence classification",
+            "tree": tree["sha"], "parents": [base_commit]})
+        github_api(f"repos/{repository}/git/refs", "POST", {"ref": "refs/heads/" + branch, "sha": commit["sha"]})
+    else:
+        commit = github_api(f"repos/{repository}/git/commits/{existing['object']['sha']}")
+        if (commit['tree']['sha'] != tree['sha']
+                or [parent['sha'] for parent in commit['parents']] != [base_commit]):
+            raise ValueError('Existing report branch does not match this observation')
     pr = github_api(f"repos/{repository}/pulls", "POST", {
         "title": f"Record Plex compatibility: {category}", "head": branch, "base": base,
         "body": body + f"\n<!-- {marker} -->\n", "draft": False})
