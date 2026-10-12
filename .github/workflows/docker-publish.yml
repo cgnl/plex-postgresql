@@ -383,7 +383,7 @@ jobs:
 
   soak:
     name: Soak 5h50 / ${{ matrix.variant }} / ${{ matrix.arch }} / PG${{ matrix.postgres }}
-    if: ${{ always() && needs.resolve.result == 'success' && needs.runtime-e2e.result == 'success' }}
+    if: ${{ always() && inputs.mode != 'probe' && needs.resolve.result == 'success' && needs.runtime-e2e.result == 'success' }}
     needs: [resolve, runtime-e2e, candidate]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
@@ -497,11 +497,17 @@ jobs:
           SOAK: ${{ needs.soak.result }}
           BUNDLES: ${{ needs.native-bundle-install.result }}
           MEDIA: ${{ needs.media-fixtures.result }}
+          MODE: ${{ inputs.mode || 'full' }}
         run: |
           test "$RESOLUTION" = success
           test "$RUNTIME" = success
           test "$CANDIDATES" = success
-          test "$SOAK" = success
+          if [ "$MODE" = probe ]; then
+            test "$SOAK" = skipped
+          else
+            test "$MODE" = full
+            test "$SOAK" = success
+          fi
           test "$BUNDLES" = success
           test "$MEDIA" = success
           echo 'PASS all declared native workload lanes. Image promotion remains a separate action.'
@@ -517,7 +523,7 @@ jobs:
           PROFILE_JSON: ${{ inputs.upstream_profile_json }}
           SOURCE: ${{ needs.resolve.outputs.source_sha }}
           MODE: ${{ inputs.mode || 'full' }}
-          JOBS_PASSED: ${{ needs.resolve.result == 'success' && needs.media-fixtures.result == 'success' && needs.runtime-e2e.result == 'success' && needs.candidate.result == 'success' && needs.soak.result == 'success' && needs.native-bundle-install.result == 'success' }}
+          JOBS_PASSED: ${{ needs.resolve.result == 'success' && needs.media-fixtures.result == 'success' && needs.runtime-e2e.result == 'success' && needs.candidate.result == 'success' && ((inputs.mode == 'probe' && needs.soak.result == 'skipped') || (inputs.mode != 'probe' && needs.soak.result == 'success')) && needs.native-bundle-install.result == 'success' }}
         run: python3 scripts/native_compatibility_observation.py --root observation-evidence --profile-json "$PROFILE_JSON" --source "$SOURCE" --mode "$MODE" --jobs-passed "$JOBS_PASSED" --output observation/observation.json
       - uses: actions/upload-artifact@v4
         if: always() && inputs.upstream_profile_json != ''

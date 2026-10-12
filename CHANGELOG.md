@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Clear old PostgreSQL errors after a cached query recovers, including queries returning no rows.
+- Keep compatibility status outside GitHub issues.
+- Run the short compatibility check without starting the full duration test.
+
 ## [1.3.22] - 2026-10-11
 
 ### Added

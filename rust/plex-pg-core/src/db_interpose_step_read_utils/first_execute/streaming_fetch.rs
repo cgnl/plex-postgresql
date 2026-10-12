@@ -55,6 +55,7 @@ pub(super) unsafe fn streaming_fetch_result(
 
     let first_status = crate::libpq_helpers::rust_pq_result_status(first_res);
     if first_status == PGRES_SINGLE_TUPLE {
+        crate::db_interpose_exec::pg_path::clear_pg_last_error(s.conn);
         // Clear any pre-existing result (e.g. from metadata-only fetch) to prevent leak
         if !s.result.is_null() {
             crate::libpq_helpers::rust_pq_clear(s.result);
@@ -72,6 +73,7 @@ pub(super) unsafe fn streaming_fetch_result(
     }
 
     if first_status == PGRES_TUPLES_OK {
+        crate::db_interpose_exec::pg_path::clear_pg_last_error(s.conn);
         log_debug_lazy!(
             "STREAM: zero rows returned for sql={:.200}",
             cstr_to_str(s.pg_sql)

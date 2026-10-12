@@ -11,7 +11,7 @@ use libc::{c_char, c_int, c_void};
 use postgres::{Config, NoTls};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -41,6 +41,7 @@ struct Api {
     column_decltype: unsafe extern "C" fn(Handle, c_int) -> *const c_char,
     column_int64: unsafe extern "C" fn(Handle, c_int) -> i64,
     errmsg: unsafe extern "C" fn(Handle) -> *const c_char,
+    errcode: unsafe extern "C" fn(Handle) -> c_int,
 }
 
 unsafe fn symbol<T: Copy>(library: Handle, name: &str) -> T {
@@ -52,9 +53,8 @@ unsafe fn symbol<T: Copy>(library: Handle, name: &str) -> T {
 
 impl Api {
     unsafe fn load(sqlite_path: &str, shim_path: &str) -> Self {
-        // Load the shim before SQLite, as LD_PRELOAD does: its constructor
-        // resolves the real SQLite through RTLD_NEXT, which only finds
-        // libraries loaded after the shim.
+        // Obtain handles to the preloaded libraries. Their startup order puts
+        // SQLite after the shim so its constructor can resolve RTLD_NEXT.
         let shim_path_c = CString::new(shim_path).unwrap();
         let shim = libc::dlopen(shim_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
         assert!(!shim.is_null(), "shim dlopen failed: {}", dlerror());
@@ -74,6 +74,7 @@ impl Api {
             column_decltype: symbol(shim, "sqlite3_column_decltype"),
             column_int64: symbol(shim, "sqlite3_column_int64"),
             errmsg: symbol(shim, "sqlite3_errmsg"),
+            errcode: symbol(shim, "sqlite3_errcode"),
         };
         let mut info: libc::Dl_info = std::mem::zeroed();
         assert_ne!(libc::dladdr(api.prepare as *const c_void, &mut info), 0);
@@ -130,10 +131,26 @@ struct PgProxy {
     state: Arc<Mutex<ProxyState>>,
     running: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    control: Option<std::net::SocketAddr>,
 }
 
 impl PgProxy {
     fn start(upstream: String) -> Self {
+        if let Ok(control) = std::env::var("METADATA_DESCRIPTOR_PROXY_CONTROL") {
+            return Self {
+                address: format!("127.0.0.1:{}", std::env::var("PLEX_PG_PORT").unwrap())
+                    .parse()
+                    .unwrap(),
+                state: Arc::new(Mutex::new(ProxyState {
+                    online: true,
+                    streams: Vec::new(),
+                    refused: 0,
+                })),
+                running: Arc::new(AtomicBool::new(false)),
+                worker: None,
+                control: Some(control.parse().unwrap()),
+            };
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -176,15 +193,31 @@ impl PgProxy {
             state,
             running,
             worker: Some(worker),
+            control: None,
         }
+    }
+
+    fn command(&self, command: u8) -> usize {
+        let mut stream = TcpStream::connect(self.control.unwrap()).unwrap();
+        stream.write_all(&[command]).unwrap();
+        let mut value = [0; 8];
+        stream.read_exact(&mut value).unwrap();
+        u64::from_le_bytes(value) as usize
     }
 
     /// Connections the proxy dropped while offline.
     fn refused(&self) -> usize {
+        if self.control.is_some() {
+            return self.command(2);
+        }
         self.state.lock().unwrap().refused
     }
 
     fn set_online(&self, online: bool) {
+        if self.control.is_some() {
+            self.command(u8::from(online));
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         state.online = online;
         if !online {
@@ -197,6 +230,9 @@ impl PgProxy {
 
 impl Drop for PgProxy {
     fn drop(&mut self) {
+        if self.control.is_some() {
+            return;
+        }
         self.set_online(false);
         self.running.store(false, Ordering::Release);
         let _ = TcpStream::connect(self.address);
@@ -251,6 +287,62 @@ fn require_musl_runner() {
 #[ignore = "requires an explicit disposable PostgreSQL database and matching musl shim"]
 fn metadata_descriptor_is_atomic_across_empty_results_and_postgres_outage() {
     require_musl_runner();
+    // Both libraries must be present at process startup: the shim constructor
+    // resolves SQLite once through RTLD_NEXT before any test code runs.
+    if std::env::var_os("METADATA_DESCRIPTOR_PRELOADED").is_none() {
+        let proxy = PgProxy::start(format!(
+            "{}:{}",
+            std::env::var("METADATA_DESCRIPTOR_UPSTREAM_HOST").unwrap(),
+            std::env::var("METADATA_DESCRIPTOR_UPSTREAM_PORT").unwrap()
+        ));
+        let control = TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_address = control.local_addr().unwrap();
+        let proxy_port = proxy.address.port();
+        let server = thread::spawn(move || {
+            for stream in control.incoming() {
+                let mut stream = stream.unwrap();
+                let mut command = [0];
+                stream.read_exact(&mut command).unwrap();
+                if command[0] == 3 {
+                    break;
+                }
+                if command[0] < 2 {
+                    proxy.set_online(command[0] == 1);
+                }
+                stream
+                    .write_all(&(proxy.refused() as u64).to_le_bytes())
+                    .unwrap();
+            }
+        });
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(std::env::args_os().skip(1))
+            .env("METADATA_DESCRIPTOR_PRELOADED", "1")
+            .env(
+                "METADATA_DESCRIPTOR_PROXY_CONTROL",
+                control_address.to_string(),
+            )
+            .env("PLEX_PG_PORT", proxy_port.to_string())
+            .env(
+                "LD_PRELOAD",
+                format!(
+                    "{}:{}",
+                    std::env::var("METADATA_DESCRIPTOR_RUNTIME_SHIM").unwrap(),
+                    std::env::var("METADATA_DESCRIPTOR_RUNTIME_SQLITE").unwrap()
+                ),
+            )
+            .status()
+            .unwrap();
+        TcpStream::connect(control_address)
+            .unwrap()
+            .write_all(&[3])
+            .unwrap();
+        server.join().unwrap();
+        assert!(
+            status.success(),
+            "preloaded runtime regression failed: {status}"
+        );
+        return;
+    }
     let upstream_host = std::env::var("METADATA_DESCRIPTOR_UPSTREAM_HOST").unwrap();
     let upstream_port: u16 = std::env::var("METADATA_DESCRIPTOR_UPSTREAM_PORT")
         .unwrap()
@@ -323,7 +415,7 @@ fn metadata_descriptor_is_atomic_across_empty_results_and_postgres_outage() {
         assert_descriptor(api, stmt);
         assert!(fetch_groups(api, stmt).is_empty());
         assert_descriptor(api, stmt);
-        assert_eq!((api.finalize)(stmt), 0);
+        assert_eq!((api.reset)(stmt), 0);
 
         let latency_started = Instant::now();
         for _ in 0..20 {
@@ -339,6 +431,10 @@ fn metadata_descriptor_is_atomic_across_empty_results_and_postgres_outage() {
         );
 
         proxy.set_online(false);
+        assert_eq!((api.step)(stmt), 1, "cached read hid the PostgreSQL outage");
+        assert_ne!((api.errcode)(db), 0, "failed read lost its outage error");
+        assert_descriptor(api, stmt);
+        assert_eq!((api.reset)(stmt), 0);
         let refused_before = proxy.refused();
         for attempt in 0..8 {
             let (outage_rc, outage_stmt) = api.prepare_query(db);
@@ -365,6 +461,33 @@ fn metadata_descriptor_is_atomic_across_empty_results_and_postgres_outage() {
             .batch_execute("INSERT INTO metadata_items VALUES (10, 2), (11, 2), (12, 7)")
             .unwrap();
         proxy.set_online(true);
+        assert_eq!(fetch_groups(api, stmt), BTreeMap::from([(2, 2), (7, 1)]));
+        assert_eq!(
+            (api.errcode)(db),
+            0,
+            "successful cached read retained an outage error: {}",
+            api.error(db)
+        );
+        assert_eq!((api.reset)(stmt), 0);
+        proxy.set_online(false);
+        assert_eq!((api.step)(stmt), 1, "cached read hid the second outage");
+        assert_ne!((api.errcode)(db), 0, "failed read lost its outage error");
+        assert_eq!((api.reset)(stmt), 0);
+        observer
+            .batch_execute("DELETE FROM metadata_items")
+            .unwrap();
+        proxy.set_online(true);
+        assert!(fetch_groups(api, stmt).is_empty());
+        assert_eq!(
+            (api.errcode)(db),
+            0,
+            "successful empty cached read retained an outage error: {}",
+            api.error(db)
+        );
+        assert_eq!((api.finalize)(stmt), 0);
+        observer
+            .batch_execute("INSERT INTO metadata_items VALUES (10, 2), (11, 2), (12, 7)")
+            .unwrap();
         let (recovery_rc, recovered) = api.prepare_query(db);
         assert_eq!(recovery_rc, 0, "recovery prepare: {}", api.error(db));
         assert!(!recovered.is_null());

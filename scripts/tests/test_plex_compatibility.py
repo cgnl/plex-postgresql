@@ -152,18 +152,83 @@ class CompatibilityTests(unittest.TestCase):
             self.assertIn("plex_version=" + snapshot()["plex_version"], output)
             self.assertIn("postgres18_image=", output)
 
-    def test_ledger_roundtrip_and_no_silent_dedup_expiry(self):
+    def missing(self):
+        return subprocess.CalledProcessError(1, ["gh"], stderr="gh: Not Found (HTTP 404)")
+
+    def test_ledger_migrates_existing_issue_readonly(self):
         ledger, _ = compatibility.enqueue(compatibility.empty_ledger(), self.plan)
-        body = compatibility.ledger_body(ledger)
-        issue = {"title": "Plex compatibility automation ledger", "number": 123, "body": body}
-        with patch.object(compatibility, "github_api", return_value=[issue]):
-            number, restored = compatibility.ledger_issue("cgnl/plex-postgresql")
-        self.assertEqual(number, 123)
+        issue = {"title": "Plex compatibility automation ledger", "number": 34,
+                 "body": compatibility.ledger_body(ledger)}
+        with patch.object(compatibility, "github_api", side_effect=[self.missing(), self.missing(), issue]) as api:
+            sha, restored = compatibility.ledger_state("cgnl/plex-postgresql")
+        self.assertIsNone(sha)
         self.assertEqual(restored, ledger)
+        self.assertIn("ref=automation%2Fcompatibility-state", api.call_args_list[0].args[0])
+        self.assertEqual(api.call_args_list[2].args, ("repos/cgnl/plex-postgresql/issues/34",))
+
+    def test_state_roundtrip_preserves_terminal_dedup_and_sha(self):
+        import base64
+        ledger = compatibility.empty_ledger()
         ledger["attempts"]["c" * 64] = {"state": "regression", "plan": self.plan}
-        with patch.object(compatibility, "github_api") as api:
-            compatibility.persist_ledger("cgnl/plex-postgresql", 123, ledger)
-        self.assertIn("c" * 64, json.loads(api.call_args.args[2]["body"].split('```json\n')[1][:-5])["attempts"])
+        with patch.object(compatibility, "github_api", side_effect=[{"default_branch": "main"}, {}, None]) as api:
+            compatibility.persist_ledger("cgnl/plex-postgresql", "d" * 40, ledger)
+        path, method, payload = api.call_args.args
+        self.assertEqual(method, "PUT")
+        self.assertEqual(payload["branch"], compatibility.LEDGER_BRANCH)
+        self.assertEqual(payload["sha"], "d" * 40)
+        envelope = json.loads(base64.b64decode(payload["content"]))
+        self.assertEqual(envelope["ledger"]["attempts"]["c" * 64], {"state": "regression"})
+        content = {"type": "file", "encoding": "base64", "sha": "e" * 40,
+                   "content": payload["content"]}
+        with patch.object(compatibility, "github_api", return_value=content) as api:
+            sha, restored = compatibility.ledger_state("cgnl/plex-postgresql")
+        self.assertEqual(sha, "e" * 40)
+        self.assertEqual(restored, envelope["ledger"])
+        self.assertEqual(api.call_count, 1)
+
+    def test_first_write_creates_only_dedicated_branch(self):
+        with patch.object(compatibility, "github_api", side_effect=[{"default_branch": "main"}, self.missing(), {"object": {"sha": "a" * 40}}, None, None]) as api:
+            compatibility.persist_ledger("cgnl/plex-postgresql", None, compatibility.empty_ledger())
+        ref = api.call_args_list[3].args[2]
+        self.assertEqual(ref, {"ref": "refs/heads/automation/compatibility-state", "sha": "a" * 40})
+        self.assertNotIn("sha", api.call_args.args[2])
+        self.assertTrue(all("/issues" not in call.args[0] for call in api.call_args_list))
+
+    def test_foreign_or_malformed_state_never_falls_back_to_issue(self):
+        import base64
+        for envelope in ({"marker": "foreign", "ledger": compatibility.empty_ledger()},
+                         {"marker": compatibility.LEDGER_MARKER, "ledger": {}},
+                         {"marker": compatibility.LEDGER_MARKER, "ledger": {**compatibility.empty_ledger(), "active": "a" * 64}}):
+            content = {"type": "file", "encoding": "base64", "sha": "e" * 40,
+                       "content": base64.b64encode(json.dumps(envelope).encode()).decode()}
+            with patch.object(compatibility, "github_api", return_value=content) as api, self.assertRaises(ValueError):
+                compatibility.ledger_state("cgnl/plex-postgresql")
+            self.assertEqual(api.call_count, 1)
+
+    def test_initialization_race_reads_existing_ref_without_forcing_update(self):
+        collision = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 422")
+        with patch.object(compatibility, "github_api", side_effect=[{"default_branch": "main"},
+                self.missing(), {"object": {"sha": "a" * 40}}, collision, {}, None]) as api:
+            compatibility.persist_ledger("cgnl/plex-postgresql", None, compatibility.empty_ledger())
+        self.assertEqual(api.call_args_list[4].args, ("repos/cgnl/plex-postgresql/git/ref/heads/automation/compatibility-state",))
+        self.assertNotIn("sha", api.call_args.args[2])
+        self.assertTrue(all(call.args[1] != "PATCH" for call in api.call_args_list if len(call.args) > 1))
+
+    def test_existing_state_branch_missing_file_is_not_reinitialized(self):
+        with patch.object(compatibility, "github_api", side_effect=[self.missing(), {}]) as api, self.assertRaisesRegex(ValueError, "no ledger"):
+            compatibility.ledger_state("cgnl/plex-postgresql")
+        self.assertEqual(api.call_count, 2)
+
+    def test_state_branch_cannot_be_default_branch(self):
+        with patch.object(compatibility, "github_api", return_value={"default_branch": compatibility.LEDGER_BRANCH}) as api, self.assertRaisesRegex(ValueError, "default branch"):
+            compatibility.persist_ledger("cgnl/plex-postgresql", None, compatibility.empty_ledger())
+        self.assertEqual(api.call_count, 1)
+
+    def test_state_conflict_is_not_retried_or_overwritten(self):
+        conflict = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 409")
+        with patch.object(compatibility, "github_api", side_effect=[{"default_branch": "main"}, {}, conflict]) as api, self.assertRaises(subprocess.CalledProcessError):
+            compatibility.persist_ledger("cgnl/plex-postgresql", "d" * 40, compatibility.empty_ledger())
+        self.assertEqual(api.call_count, 3)
 
     def observation(self, category="probe-passed"):
         return {"schema_version": 1, "candidate_source_sha": self.plan["source_sha"],

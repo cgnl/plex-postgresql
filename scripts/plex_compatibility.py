@@ -6,12 +6,14 @@ description, not proof that those inputs passed native acceptance.
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import re
 import os
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -355,42 +357,132 @@ def github_api(path, method="GET", body=None):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def ledger_issue(repository):
-    issues = github_api(f"repos/{repository}/issues?state=open&per_page=100")
-    matching = [issue for issue in issues if issue.get("title") == "Plex compatibility automation ledger"
-                and not issue.get("pull_request")]
-    if len(matching) > 1:
-        raise ValueError("Ambiguous compatibility ledger issues")
-    if matching:
-        issue = matching[0]
-        body = issue.get("body", "")
-        prefix = "<!-- plex-compatibility-ledger-v1 -->\n```json\n"
-        if not body.startswith(prefix) or not body.endswith("\n```\n"):
-            raise ValueError("Compatibility ledger issue has been edited or is malformed")
-        return issue["number"], json.loads(body[len(prefix):-5])
-    issue = github_api(f"repos/{repository}/issues", "POST", {
-        "title": "Plex compatibility automation ledger", "body": ledger_body(empty_ledger())})
-    return issue["number"], empty_ledger()
+LEDGER_BRANCH = "automation/compatibility-state"
+LEDGER_PATH = "compatibility-state.json"
+LEDGER_MARKER = "plex-compatibility-ledger-v1"
+
+
+def validate_ledger(ledger):
+    if (not isinstance(ledger, dict) or ledger.get("schema_version") != 1
+            or not isinstance(ledger.get("attempts"), dict)
+            or not isinstance(ledger.get("superseded"), list)):
+        raise ValueError("Invalid compatibility ledger schema")
+    keys = set(ledger["attempts"])
+    if any(not re.fullmatch(r"[0-9a-f]{64}", key) for key in keys):
+        raise ValueError("Invalid compatibility ledger fingerprint")
+    for slot in ("active", "pending"):
+        key = ledger.get(slot)
+        if slot not in ledger or (key is not None and key not in keys):
+            raise ValueError("Invalid compatibility ledger slot")
+        if key is not None and ledger["attempts"][key].get("state") != slot:
+            raise ValueError("Invalid compatibility ledger slot state")
+    if ledger["active"] is not None and ledger["active"] == ledger["pending"]:
+        raise ValueError("Duplicate compatibility ledger slots")
+    if any(key not in keys for key in ledger["superseded"]):
+        raise ValueError("Invalid superseded fingerprint")
+    for attempt in ledger["attempts"].values():
+        if (not isinstance(attempt, dict)
+                or attempt.get("state") not in TERMINAL | {"active", "pending", "superseded"}
+                or type(attempt.get("automatic_retries", 0)) is not int
+                or not 0 <= attempt.get("automatic_retries", 0) <= 1):
+            raise ValueError("Invalid compatibility attempt")
+    return ledger
+
+
+def api_missing(error):
+    return "HTTP 404" in (error.stderr or "")
+
+
+def ledger_state(repository):
+    # Only absence permits migration. Authentication and malformed content fail
+    # closed, and a Contents SHA binds each subsequent update to this read.
+    path = f"repos/{repository}/contents/{LEDGER_PATH}?ref={quote(LEDGER_BRANCH, safe='')}"
+    try:
+        content = github_api(path)
+    except subprocess.CalledProcessError as error:
+        if not api_missing(error):
+            raise
+    else:
+        if (content.get("type") != "file" or content.get("encoding") != "base64"
+                or not SHA.fullmatch(content.get("sha", ""))):
+            raise ValueError("Malformed compatibility state file")
+        try:
+            envelope = json.loads(base64.b64decode(content["content"].replace("\n", ""), validate=True))
+        except (ValueError, KeyError) as error:
+            raise ValueError("Malformed compatibility state content") from error
+        if not isinstance(envelope, dict) or envelope.get("marker") != LEDGER_MARKER:
+            raise ValueError("Compatibility state marker mismatch")
+        return content["sha"], validate_ledger(envelope.get("ledger"))
+
+    try:
+        github_api(f"repos/{repository}/git/ref/heads/{LEDGER_BRANCH}")
+    except subprocess.CalledProcessError as error:
+        if not api_missing(error):
+            raise
+    else:
+        raise ValueError("Existing compatibility state branch has no ledger file")
+
+    # Read the existing administrative issue once during migration, including
+    # closed issues. This path never creates or changes an issue.
+    try:
+        issue = github_api(f"repos/{repository}/issues/34")
+    except subprocess.CalledProcessError as error:
+        if not api_missing(error):
+            raise
+        return None, empty_ledger()
+    if issue.get("title") != "Plex compatibility automation ledger" or issue.get("pull_request"):
+        raise ValueError("Legacy compatibility ledger identity mismatch")
+    body = issue.get("body") or ""
+    prefix = "<!-- plex-compatibility-ledger-v1 -->\n```json\n"
+    if not body.startswith(prefix) or not body.endswith("\n```\n"):
+        raise ValueError("Legacy compatibility ledger has been edited or is malformed")
+    return None, validate_ledger(json.loads(body[len(prefix):-5]))
 
 
 def ledger_body(ledger):
+    # Kept for validating the legacy issue migration format.
     return "<!-- plex-compatibility-ledger-v1 -->\n```json\n" + json.dumps(ledger, sort_keys=True) + "\n```\n"
 
 
-def persist_ledger(repository, issue_number, ledger):
-    # Detailed plans are needed only while queued/active. Never forget a
-    # terminal fingerprint: doing so would allow a failed-input retry storm.
+def persist_ledger(repository, content_sha, ledger):
+    validate_ledger(ledger)
+    ledger = json.loads(json.dumps(ledger))
     for key, attempt in ledger["attempts"].items():
         if key not in (ledger.get("active"), ledger.get("pending")):
             attempt.pop("plan", None)
-    body = ledger_body(ledger)
+    body = json.dumps({"marker": LEDGER_MARKER, "ledger": ledger}, sort_keys=True) + "\n"
     if len(body.encode()) > 60000:
         raise ValueError("Attempt ledger requires archival before further work; no fingerprint was forgotten")
-    github_api(f"repos/{repository}/issues/{issue_number}", "PATCH", {"body": body})
+    default = github_api(f"repos/{repository}")["default_branch"]
+    if default == LEDGER_BRANCH:
+        raise ValueError("Compatibility state cannot use the default branch")
+    ref_path = f"repos/{repository}/git/ref/heads/{LEDGER_BRANCH}"
+    try:
+        github_api(ref_path)
+    except subprocess.CalledProcessError as error:
+        if not api_missing(error):
+            raise
+        source = github_api(f"repos/{repository}/git/ref/heads/{default}")["object"]["sha"]
+        try:
+            github_api(f"repos/{repository}/git/refs", "POST", {
+                "ref": "refs/heads/" + LEDGER_BRANCH, "sha": source})
+        except subprocess.CalledProcessError:
+            # Another initializer may have created the ref. Verify it exists;
+            # the Contents create/update still rejects stale or missing SHAs.
+            github_api(ref_path)
+    payload = {"message": "Preserve compatibility attempt history", "branch": LEDGER_BRANCH,
+               "content": base64.b64encode(body.encode()).decode()}
+    if content_sha is not None:
+        if not SHA.fullmatch(content_sha):
+            raise ValueError("Invalid compatibility content SHA")
+        payload["sha"] = content_sha
+    # No retry on 409/422: reread and recompute the transition instead of
+    # overwriting another coordinator's state.
+    github_api(f"repos/{repository}/contents/{LEDGER_PATH}", "PUT", payload)
 
 
 def claim(repository, plan, run_id, retry=False):
-    number, ledger = ledger_issue(repository)
+    content_sha, ledger = ledger_state(repository)
     active = ledger.get("active")
     if active:
         active_run = ledger["attempts"][active].get("run_id")
@@ -403,12 +495,12 @@ def claim(repository, plan, run_id, retry=False):
     ledger, action = enqueue(ledger, plan, retry)
     if action == "start-probe":
         ledger["attempts"][plan["fingerprint"]]["run_id"] = str(run_id)
-    persist_ledger(repository, number, ledger)
+    persist_ledger(repository, content_sha, ledger)
     return action
 
 
 def complete(repository, plan, run_id, result, run_url, category="insufficient-evidence"):
-    number, ledger = ledger_issue(repository)
+    content_sha, ledger = ledger_state(repository)
     key = plan["fingerprint"]
     attempt = ledger["attempts"].get(key, {})
     if attempt.get("run_id") != str(run_id):
@@ -420,7 +512,7 @@ def complete(repository, plan, run_id, result, run_url, category="insufficient-e
     if category == "probe-passed" and result != "success":
         raise ValueError("Failed workflow cannot supply a passing observation")
     ledger = finish(ledger, key, category, run_url)
-    persist_ledger(repository, number, ledger)
+    persist_ledger(repository, content_sha, ledger)
     return category
 
 

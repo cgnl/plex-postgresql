@@ -24,6 +24,7 @@ pub(super) unsafe fn eager_fetch_result(
     if !s.result.is_null()
         && crate::libpq_helpers::rust_pq_result_status(s.result) == PGRES_TUPLES_OK
     {
+        crate::db_interpose_exec::pg_path::clear_pg_last_error(s.conn);
         s.num_rows = crate::libpq_helpers::rust_pq_ntuples(s.result);
         s.num_cols = crate::libpq_helpers::rust_pq_nfields(s.result);
         s.ensure_column_capacity(s.num_cols as usize);
