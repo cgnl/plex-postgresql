@@ -163,7 +163,7 @@ jobs:
           RUNTIME_E2E_ADMIN_DATABASE: runtime_e2e_admin
           # Pinned alpine 3.15 (musl 1.2.2, the release builder base) via the
           # ECR mirror to stay independent of Docker Hub auth outages.
-          ALPINE_BUILDER_IMAGE: public.ecr.aws/docker/library/alpine@sha256:19b4bcc4f60e99dd5ebdca0cbce22c503bbcff197549d7e19dab4f22254dc864
+          ALPINE_BUILDER_IMAGE: docker.io/library/alpine@sha256:19b4bcc4f60e99dd5ebdca0cbce22c503bbcff197549d7e19dab4f22254dc864
         run: |
           set -eu
           docker run --rm --network host \

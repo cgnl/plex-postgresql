@@ -215,7 +215,7 @@ jobs:
           docker buildx build \
             --platform linux/amd64 \
             --target builder \
-            --build-arg BUILDER_IMAGE=public.ecr.aws/docker/library/alpine@sha256:19b4bcc4f60e99dd5ebdca0cbce22c503bbcff197549d7e19dab4f22254dc864 \
+            --build-arg BUILDER_IMAGE=docker.io/library/alpine@sha256:19b4bcc4f60e99dd5ebdca0cbce22c503bbcff197549d7e19dab4f22254dc864 \
             --output type=local,dest=out \
             .
 
