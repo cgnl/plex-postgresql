@@ -427,10 +427,14 @@ cleanup() {
     fi
     python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" "$real_media_verified" "$real_media_full_decode_verified" "$native_roundtrip_verified" "$concurrent_real_media_verified" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded, real_media, full_decode, roundtrip, concurrent = sys.argv[1:]
 Path(path).write_text(json.dumps({
+    "source_sha": os.environ.get("SOURCE_SHA", ""),
+    "postgres_image": os.environ.get("POSTGRES_IMAGE", ""),
+    "bundle_sha256": os.environ.get("PLEX_E2E_BUNDLE_SHA256", ""),
     "phase": phase, "exit_code": int(status), "candidate": image,
     "plex_version": version, "variant": variant, "arch": arch,
     "restart_cycles_requested": int(cycles), "restart_cycles_completed": int(completed),

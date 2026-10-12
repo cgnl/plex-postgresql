@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from publish_certified_release import GitHub
@@ -74,10 +76,18 @@ def issue(root, profile, candidate_sha, client, run_id, attempt, workflow_revisi
                 require(json.loads((lane / 'payload-binding.json').read_text())['bundle_sha256'] == bundle_hash,
                         'Container is not bound to exact ZIP')
                 smoke = json.loads((lane / 'container/result.json').read_text())
+                for key, expected in (('source_sha', candidate_sha),
+                                      ('postgres_image', profile['images'][f'postgres{postgres}']['ref']),
+                                      ('bundle_sha256', bundle_hash)):
+                    require(smoke.get(key) == expected, 'Smoke provenance mismatch: ' + key)
                 validate_workload(smoke, source=candidate_sha, version=profile['plex_version'], variant=variant, arch=arch, image=image)
                 require((lane / 'container/installed-version.txt').read_text().strip() == profile['plex_version'], 'Unmeasured Plex version')
                 soak = json.loads((root / f'{prefix}soak-{variant}-{arch}-pg{postgres}/soak/result.json').read_text())
-                validate_workload(soak, source=candidate_sha, version=profile['plex_version'], variant=variant, arch=arch, image=image, soak=True)
+                for key, expected in (('source_sha', candidate_sha),
+                                      ('postgres_image', profile['images'][f'postgres{postgres}']['ref']),
+                                      ('bundle_sha256', bundle_hash)):
+                    require(soak.get(key) == expected, 'Soak provenance mismatch: ' + key)
+                validate_workload(soak, source=candidate_sha, version=profile['plex_version'], variant=variant, arch=arch, image=image, soak=True, smoke_result=smoke)
                 cells.extend([f'{profile["id"]}/smoke/{variant}/{arch}/pg{postgres}', f'{profile["id"]}/soak/{variant}/{arch}/pg{postgres}'])
                 images.append(image)
                 if postgres == 15:
@@ -111,15 +121,49 @@ def issue(root, profile, candidate_sha, client, run_id, attempt, workflow_revisi
                               'run_attempt': attempt, 'head_sha': run['head_sha'], 'conclusion': 'success'}}
 
 
+def bind_publication_artifact(certificate, client, artifact_id, expected_digest, asset_root):
+    """Bind freshly uploaded, byte-identical assets without accepting an older attempt."""
+    auth = certificate['authorization']
+    run = client.get(f"actions/runs/{auth['run_id']}/attempts/{auth['run_attempt']}")
+    remote = client.get(f'actions/artifacts/{artifact_id}')
+    require(remote.get('id') == artifact_id, 'Publication artifact ID mismatch')
+    require(run['head_sha'] == auth['workflow_revision'] and run['event'] == 'workflow_dispatch', 'Untrusted binding run')
+    require(remote.get('workflow_run', {}).get('id') == auth['run_id'] and
+            remote['workflow_run'].get('head_sha') == auth['workflow_revision'], 'Foreign publication artifact')
+    require(remote.get('name') == f"certified-linux-release-zip-{auth['run_attempt']}" and not remote.get('expired'), 'Wrong publication artifact')
+    require(remote.get('digest') == 'sha256:' + expected_digest.removeprefix('sha256:'), 'Publication digest mismatch')
+    created = datetime.fromisoformat(remote['created_at'].replace('Z', '+00:00'))
+    started = datetime.fromisoformat(run['run_started_at'].replace('Z', '+00:00'))
+    require(started <= created <= datetime.now(timezone.utc), 'Publication artifact belongs to old attempt')
+    files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in Path(asset_root).iterdir() if path.is_file()}
+    require(files and all(item['files'] == files for item in certificate['artifacts']), 'Publication bytes differ from tested bytes')
+    result = dict(certificate)
+    result['artifacts'] = [{'name': remote['name'], 'artifact_id': remote['id'],
+                            'sha256': expected_digest.removeprefix('sha256:'),
+                            'kind': 'linux-certified-bundle', 'files': files}]
+    return result
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--evidence', required=True)
-    parser.add_argument('--profile-json', required=True)
-    parser.add_argument('--source-sha', required=True)
-    parser.add_argument('--policy', required=True)
+    parser.add_argument('--evidence')
+    parser.add_argument('--profile-json')
+    parser.add_argument('--source-sha')
+    parser.add_argument('--policy')
+    parser.add_argument('--draft')
+    parser.add_argument('--artifact-id', type=int)
+    parser.add_argument('--artifact-digest')
+    parser.add_argument('--assets', required=True)
     parser.add_argument('--ledger', default='.github/plex-compatibility-profiles.json')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
+    if args.draft:
+        result = bind_publication_artifact(json.loads(Path(args.draft).read_text()),
+                                          GitHub(os.environ['GITHUB_REPOSITORY'], os.environ['GH_TOKEN']),
+                                          args.artifact_id, args.artifact_digest, args.assets)
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(json.dumps(result, indent=2) + '\n')
+        raise SystemExit(0)
     profiles = certification_profiles(json.loads(args.profile_json), json.loads(Path(args.ledger).read_text()),
                                       json.loads(Path(args.policy).read_text())['maxHistoricalProfiles'])
     result = aggregate([issue(args.evidence, profile, args.source_sha,
@@ -127,5 +171,9 @@ if __name__ == '__main__':
                              int(os.environ['GITHUB_RUN_ID']), int(os.environ['GITHUB_RUN_ATTEMPT']),
                              os.environ['GITHUB_SHA'], hashlib.sha256(Path(args.policy).read_bytes()).hexdigest())
                         for profile in profiles])
+    assets = Path(args.assets)
+    assets.mkdir(parents=True, exist_ok=False)
+    for name in result['artifacts'][0]['files']:
+        shutil.copyfile(Path(args.evidence) / (profiles[0]['id'] + '-linux-release-zip') / name, assets / name)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(result, indent=2) + '\n')

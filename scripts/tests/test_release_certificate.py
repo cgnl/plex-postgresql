@@ -15,7 +15,7 @@ from publish_certified_release import extract_assets, preserved_main
 from verify_candidate_payload import verify
 from release_certificate import trusted_file_paths
 from validate_certification_source import validate_candidate
-from issue_release_certificate import aggregate
+from issue_release_certificate import aggregate, bind_publication_artifact
 from promote_certified_images import promotion_commands, promote, latest_command
 
 
@@ -79,6 +79,28 @@ class CertificateTests(unittest.TestCase):
         self.artifacts['artifacts'][0]['created_at'] = '2026-10-10T08:00:00Z'
         with self.assertRaises(ValueError):
             self.check()
+
+    def test_fresh_publication_binding_checks_owner_digest_attempt_and_bytes(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            asset = Path(directory) / 'bundle.zip'
+            asset.write_bytes(b'tested bytes')
+            self.certificate['artifacts'][0]['files'] = {'bundle.zip': hashlib.sha256(asset.read_bytes()).hexdigest()}
+            remote = copy.deepcopy(self.artifacts['artifacts'][0])
+            remote['name'] = 'certified-linux-release-zip-2'
+            client = type('Client', (), {'get': lambda _, path: self.run if '/attempts/' in path else remote})()
+            bound = bind_publication_artifact(self.certificate, client, 456, '1' * 64, directory)
+            self.assertEqual(bound['artifacts'][0]['name'], remote['name'])
+            for key, value in [('digest', 'sha256:' + '2' * 64), ('created_at', '2026-10-10T08:00:00Z'),
+                               ('workflow_run', {'id': 999, 'head_sha': 'c' * 40})]:
+                saved = remote[key]
+                remote[key] = value
+                with self.assertRaises(ValueError):
+                    bind_publication_artifact(self.certificate, client, 456, '1' * 64, directory)
+                remote[key] = saved
+            asset.write_bytes(b'changed')
+            with self.assertRaises(ValueError):
+                bind_publication_artifact(self.certificate, client, 456, '1' * 64, directory)
 
     def test_workflow_revision_rotates_only_when_reviewed_code_is_unchanged(self):
         self.trust['reviewed_file_blobs'] = {path: '5' * 40 for path in trusted_file_paths}
@@ -236,6 +258,30 @@ class CertificateTests(unittest.TestCase):
         inputs = {'source': 'a' * 40, 'version': result['plex_version'], 'variant': 'plexinc',
                   'arch': 'amd64', 'image': result['candidate']}
         validate_workload(result, **inputs)
+        result.update(source_sha=inputs['source'], postgres_image='postgres@sha256:' + '3' * 64,
+                      bundle_sha256='4' * 64)
+        smoke = copy.deepcopy(result)
+        paired_soak = dict(result, restart_cycles_requested=1, restart_cycles_completed=1,
+                           soak_seconds_requested=21000, soak_seconds_completed=21000,
+                           real_media_full_decode_verified=False, native_import_and_rollback_verified=False)
+        validate_workload(paired_soak, soak=True, smoke_result=smoke, **inputs)
+        with self.assertRaises(ValueError):
+            validate_workload(paired_soak, soak=True, **inputs)
+        for key, value in [('candidate', 'foreign'), ('source_sha', 'b' * 40),
+                           ('real_media_full_decode_verified', False), ('native_import_and_rollback_verified', False),
+                           ('postgres_image', 'postgres@sha256:' + '5' * 64), ('bundle_sha256', '6' * 64)]:
+            invalid = dict(smoke, **{key: value})
+            with self.assertRaises(ValueError):
+                validate_workload(paired_soak, soak=True, smoke_result=invalid, **inputs)
+        for key in ('source_sha', 'postgres_image', 'bundle_sha256'):
+            for which in ('smoke', 'soak'):
+                invalid = dict(smoke if which == 'smoke' else paired_soak)
+                del invalid[key]
+                with self.assertRaises(ValueError):
+                    validate_workload(invalid if which == 'soak' else paired_soak, soak=True,
+                                      smoke_result=invalid if which == 'smoke' else smoke, **inputs)
+        with self.assertRaises(ValueError):
+            validate_workload(dict(paired_soak, soak_seconds_completed=20999), soak=True, smoke_result=smoke, **inputs)
         result['restart_cycles_completed'] = 99
         with self.assertRaises(ValueError):
             validate_workload(result, **inputs)

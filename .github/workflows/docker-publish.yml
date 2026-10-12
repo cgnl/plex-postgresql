@@ -422,6 +422,13 @@ jobs:
           docker cp "$container:/usr/local/lib/plex-postgresql" container-payload
           bundle=$(find release-bundle -maxdepth 1 -name '*.zip' -type f)
           python3 scripts/verify_candidate_payload.py --bundle "$bundle" --directory container-payload --arch "$ARCH" --output evidence/payload-binding.json
+          python3 - <<'PY'
+          import json, os, re
+          checksum = json.load(open('evidence/payload-binding.json'))['bundle_sha256']
+          assert re.fullmatch('[0-9a-f]{64}', checksum)
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('PLEX_E2E_BUNDLE_SHA256=' + checksum + '\n')
+          PY
       - name: Prepare offline crash diagnostics
         run: |
           if ! command -v gdb >/dev/null; then
@@ -435,6 +442,7 @@ jobs:
           coredumpctl --version
       - name: Verify the exact candidate digest
         env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           BASE_PLEX_IMAGE: ${{ matrix.variant == 'linuxserver' && needs.resolve.outputs.linuxserver_image || needs.resolve.outputs.plexinc_image }}
           POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
           EXPECTED_PLEX_VERSION: ${{ needs.resolve.outputs.plex_version }}
@@ -519,8 +527,13 @@ jobs:
           expected['restart_cycles_completed'] = int(os.environ['REQUIRED_CYCLES'])
           if any(result.get(key) != value for key, value in expected.items()):
               raise SystemExit('Prior native smoke failed or is incomplete')
+          binding = json.loads((root / 'payload-binding.json').read_text())
+          checksum = binding['bundle_sha256']
+          if not re.fullmatch('[0-9a-f]{64}', checksum) or result.get('bundle_sha256') != checksum:
+              raise SystemExit('Prior native bundle binding mismatch')
           with open(os.environ['GITHUB_ENV'], 'a') as output:
               output.write('CANDIDATE_IMAGE=' + image + '\n')
+              output.write('PLEX_E2E_BUNDLE_SHA256=' + checksum + '\n')
           PY
       - uses: docker/login-action@v3
         with:
@@ -540,6 +553,7 @@ jobs:
           coredumpctl --version
       - name: Continuous native mixed fixture workload for 21000 seconds
         env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           POSTGRES_IMAGE: ${{ needs.resolve.outputs[format('postgres{0}_image', matrix.postgres)] }}
           EXPECTED_PLEX_VERSION: ${{ needs.resolve.outputs.plex_version }}
           EXPECTED_ARCH: ${{ matrix.arch }}

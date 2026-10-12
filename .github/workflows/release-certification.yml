@@ -112,7 +112,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PROFILE_JSON: ${{ inputs.upstream_profile_json }}
           SOURCE_SHA: ${{ inputs.source_sha }}
-        run: python3 scripts/issue_release_certificate.py --evidence certification-evidence --profile-json "$PROFILE_JSON" --source-sha "$SOURCE_SHA" --policy .github/plex-compatibility-policy.json --output certificate/certificate.json
+        run: python3 scripts/issue_release_certificate.py --evidence certification-evidence --profile-json "$PROFILE_JSON" --source-sha "$SOURCE_SHA" --policy .github/plex-compatibility-policy.json --assets certified-assets --output certificate/draft.json
+      - uses: actions/upload-artifact@v4
+        id: certified-assets
+        with:
+          name: certified-linux-release-zip-${{ github.run_attempt }}
+          path: certified-assets/*
+          if-no-files-found: error
+          retention-days: 90
+      - name: Bind fresh publication artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.certified-assets.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.certified-assets.outputs.artifact-digest }}
+        run: python3 scripts/issue_release_certificate.py --draft certificate/draft.json --artifact-id "$ARTIFACT_ID" --artifact-digest "$ARTIFACT_DIGEST" --assets certified-assets --output certificate/certificate.json
       - uses: actions/upload-artifact@v4
         with:
           name: release-certificate
