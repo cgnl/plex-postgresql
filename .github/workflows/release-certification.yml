@@ -104,6 +104,8 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
+          # Docker build records are gzip data, not ZIP evidence archives.
+          pattern: '!*.dockerbuild'
           path: certification-evidence
       - name: Validate every cell and bind final artifact bytes
         env:
