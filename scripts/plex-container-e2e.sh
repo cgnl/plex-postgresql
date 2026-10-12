@@ -7,6 +7,11 @@ set -euo pipefail
 : "${EXPECTED_ARCH:?native architecture required}"
 : "${VARIANT:?linuxserver or plexinc required}"
 EVIDENCE_DIR=${EVIDENCE_DIR:-container-evidence}
+# Verbose diagnostics are opt-in; full-duration runs retain bounded error context.
+shim_log_level=${PLEX_E2E_SHIM_LOG_LEVEL:-INFO}
+postgres_log_statement=${PLEX_E2E_POSTGRES_LOG_STATEMENT:-none}
+case "$shim_log_level" in INFO|DEBUG) ;; *) echo "Shim log level must be INFO or DEBUG" >&2; exit 2 ;; esac
+case "$postgres_log_statement" in none|all) ;; *) echo "PostgreSQL statement logging must be none or all" >&2; exit 2 ;; esac
 restart_cycles=${PLEX_E2E_RESTART_CYCLES:-1}
 [[ "$restart_cycles" =~ ^[0-9]{1,5}$ ]] || { echo "Invalid restart cycle count" >&2; exit 2; }
 restart_cycles=$((10#$restart_cycles))
@@ -422,10 +427,14 @@ cleanup() {
     fi
     python3 - "$EVIDENCE_DIR/result.json" "$phase" "$status" "$CANDIDATE_IMAGE" "$EXPECTED_PLEX_VERSION" "$VARIANT" "$EXPECTED_ARCH" "$restart_cycles" "$restart_cycles_completed" "$soak_seconds" "$soak_seconds_completed" "$soak_iterations" "$live_recovery_verified" "$decoded_fixture_verified" "$real_media_verified" "$real_media_full_decode_verified" "$native_roundtrip_verified" "$concurrent_real_media_verified" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 path, phase, status, image, version, variant, arch, cycles, completed, soak, elapsed, iterations, live_recovery, decoded, real_media, full_decode, roundtrip, concurrent = sys.argv[1:]
 Path(path).write_text(json.dumps({
+    "source_sha": os.environ.get("SOURCE_SHA", ""),
+    "postgres_image": os.environ.get("POSTGRES_IMAGE", ""),
+    "bundle_sha256": os.environ.get("PLEX_E2E_BUNDLE_SHA256", ""),
     "phase": phase, "exit_code": int(status), "candidate": image,
     "plex_version": version, "variant": variant, "arch": arch,
     "restart_cycles_requested": int(cycles), "restart_cycles_completed": int(completed),
@@ -479,8 +488,9 @@ docker network create --internal --label "plex-pg-canary=$fixture" "$network" >/
 docker volume create --label "plex-pg-canary=$fixture" "$config" >/dev/null
 docker volume create --label "plex-pg-canary=$fixture" "$negative_config" >/dev/null
 docker run -d --name "$postgres" --label "plex-pg-canary=$fixture" --network "$network" --network-alias postgres \
+    --log-driver json-file --log-opt max-size=20m --log-opt max-file=3 \
     -e POSTGRES_USER=plex -e "POSTGRES_PASSWORD=$password" -e POSTGRES_DB=plex \
-    "$POSTGRES_IMAGE" -c log_statement=all >/dev/null
+    "$POSTGRES_IMAGE" -c "log_statement=$postgres_log_statement" -c log_min_error_statement=error >/dev/null
 postgres_ready=false
 for ((attempt=1; attempt<=60; attempt++)); do
     if docker exec "$postgres" pg_isready -U plex -d plex >/dev/null 2>&1; then postgres_ready=true; break; fi
@@ -490,10 +500,11 @@ done
 
 start_plex() {
     docker run -d --name "$1" --label "plex-pg-canary=$fixture" --network "$network" \
+        --log-driver json-file --log-opt max-size=20m --log-opt max-file=3 \
         -v "$2:/config" \
         -e VERSION=docker -e PLEX_PG_HOST=postgres -e PLEX_PG_PORT=5432 \
         -e PLEX_PG_DATABASE=plex -e PLEX_PG_USER=plex -e "PLEX_PG_PASSWORD=$password" \
-        -e PLEX_PG_SCHEMA=plex -e PLEX_PG_LOG_LEVEL=DEBUG -e MIGRATION_INTERACTIVE=0 \
+        -e PLEX_PG_SCHEMA=plex -e "PLEX_PG_LOG_LEVEL=$shim_log_level" -e MIGRATION_INTERACTIVE=0 \
         -e PLEX_PG_REAPER_DIAGNOSTICS=1 \
         "$candidate_id" >/dev/null
 }

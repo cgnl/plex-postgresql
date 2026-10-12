@@ -15,7 +15,7 @@ trusted_file_paths = [
     'scripts/publish_certified_release.py', 'scripts/promote_certified_images.py',
     'scripts/stage_compatibility_release.py', 'scripts/validate_certification_source.py',
     'scripts/verify_candidate_payload.py', 'scripts/native_compatibility_observation.py',
-    'scripts/bootstrap_release_trust.py',
+    'scripts/bootstrap_release_trust.py', 'scripts/load_release_trust.py',
     'scripts/plex_compatibility.py', 'scripts/check-upstream-updates.py',
     'Dockerfile', 'Dockerfile.standalone',
     '.github/plex-compatibility-policy.json', '.github/plex-compatibility-profiles.json',
@@ -51,15 +51,33 @@ def profile_inputs(profile, profile_id):
     return profile
 
 
-def validate_workload(result, *, source, version, variant, arch, image, soak=False):
+def validate_workload(result, *, source, version, variant, arch, image, soak=False, smoke_result=None):
     expected = {'plex_version': version, 'variant': variant, 'arch': arch, 'candidate': image,
                 'phase': 'native-workload-complete', 'exit_code': 0, 'workload_passed': True,
                 'promotion_allowed': False, 'restart_cycles_requested': 1 if soak else 100,
                 'restart_cycles_completed': 1 if soak else 100}
+    full_checks = ('real_media_full_decode_verified', 'native_import_and_rollback_verified')
+    paired = soak and any(result.get(key) is not True for key in full_checks)
+    if paired:
+        require(smoke_result is not None, 'Skipped soak checks require matching smoke evidence')
+        require(all(result.get(key) is True or result.get(key) is False for key in full_checks),
+                'Soak must explicitly record skipped checks')
+        validate_workload(smoke_result, source=source, version=version, variant=variant, arch=arch, image=image)
+        require(result.get('source_sha') == smoke_result.get('source_sha') == source,
+                'Paired workloads require exact source evidence')
+        pg = result.get('postgres_image', '')
+        require(re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}', pg) is not None and
+                smoke_result.get('postgres_image') == pg, 'Paired PostgreSQL input mismatch')
+        bundle = result.get('bundle_sha256', '')
+        require(re.fullmatch(r'[0-9a-f]{64}', bundle) is not None and
+                smoke_result.get('bundle_sha256') == bundle, 'Paired release bundle mismatch')
+    for evidence in (result, smoke_result) if paired else (result,):
+        require(evidence.get('source_sha', source) == source, 'Workload source mismatch')
     for key in ('live_postgres_recovery_verified', 'decoded_fixture_verified',
                 'real_movie_and_tv_playback_verified', 'real_media_full_decode_verified',
                 'native_import_and_rollback_verified', 'four_concurrent_real_media_clients_verified'):
-        expected[key] = True
+        if not paired or key not in full_checks:
+            expected[key] = True
     require(all(result.get(key) == value for key, value in expected.items()), 'Incomplete native workload')
     require(re.fullmatch(r'[0-9a-f]{40}', source) is not None, 'Invalid source SHA')
     if soak:

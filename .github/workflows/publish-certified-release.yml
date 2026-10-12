@@ -20,20 +20,17 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       enabled: ${{ steps.trust.outputs.enabled }}
+      trust_hash: ${{ steps.trust.outputs.hash }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       - id: trust
-        run: |
-          if [[ ! -f .github/release-trust.json ]]; then
-            echo 'enabled=false' >> "$GITHUB_OUTPUT"
-            echo 'release-publication-unconfigured: genuine certificate bootstrap and reviewed release-trust.json are required.' >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          python3 -c 'import json; assert json.load(open(".github/release-trust.json")).get("enabled") is True'
-          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_TRUST_JSON: ${{ vars.RELEASE_TRUST_JSON }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 scripts/load_release_trust.py
   publish:
     needs: configuration
     if: needs.configuration.outputs.enabled == 'true'
@@ -56,6 +53,12 @@ jobs:
           [[ "$RUN_ID" =~ ^[0-9]+$ ]]
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name release-certificate --dir certificate
           echo "CERTIFICATE_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+      - name: Recheck operator-reviewed release configuration
+        env:
+          RELEASE_TRUST_JSON: ${{ vars.RELEASE_TRUST_JSON }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EXPECTED_TRUST_HASH: ${{ needs.configuration.outputs.trust_hash }}
+        run: python3 scripts/load_release_trust.py --expected-hash "$EXPECTED_TRUST_HASH"
       - name: Independently authenticate provenance and publish existing bytes
         env:
           GH_TOKEN: ${{ github.token }}
