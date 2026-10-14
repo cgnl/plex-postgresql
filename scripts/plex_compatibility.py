@@ -526,12 +526,126 @@ def complete(repository, plan, run_id, result, run_url, category="insufficient-e
     return category
 
 
+def release_tree(tree):
+    """Compare executable inputs exactly; only release prose may differ."""
+    if tree.get("truncated") is not False:
+        raise ValueError("Incomplete release source tree")
+    ignored = {"VERSION", "CHANGELOG.md", "README.md"}
+    return {item["path"]: (item["mode"], item["type"], item["sha"])
+            for item in tree["tree"]
+            if not (item["type"] == "blob" and item["mode"] == "100644"
+                    and (item["path"] in ignored or (item["path"].startswith("docs/")
+                                                    and item["path"].endswith(".md"))))
+            and item["type"] != "tree"}
+
+
+def certificate_from_run(client, run):
+    from bootstrap_release_trust import read_certificate
+    run_id = run["id"]
+    artifacts = client.get(f"actions/runs/{run_id}/artifacts?per_page=100")
+    certificates = [item for item in artifacts["artifacts"]
+                    if item["name"] == "release-certificate" and not item["expired"]]
+    if not certificates:
+        return None
+    if len(certificates) != 1:
+        raise ValueError("Published certificate missing or ambiguous")
+    artifact = certificates[0]
+    if artifact["size_in_bytes"] > 5 * 1024 * 1024:
+        raise ValueError("Certificate archive exceeds limit")
+    data = client.get(f'actions/artifacts/{artifact["id"]}/zip', raw=True)
+    if (artifact.get("digest") != "sha256:" + hashlib.sha256(data).hexdigest()
+            or artifact.get("workflow_run", {}).get("id") != run_id
+            or artifact["workflow_run"].get("head_sha") != run["head_sha"]):
+        raise ValueError("Published certificate provenance mismatch")
+    from datetime import datetime
+    created, started, completed = (datetime.fromisoformat(value.replace("Z", "+00:00"))
+                                  for value in (artifact["created_at"], run["run_started_at"], run["updated_at"]))
+    if not started <= created <= completed:
+        raise ValueError("Published certificate belongs to another attempt")
+    return read_certificate(data), artifacts
+
+
+def published_certificate(client, trust, source_sha, tag):
+    """Inspect at most ten recent successful runs plus genuine bootstrap."""
+    runs = client.get(f'actions/workflows/{trust["workflow_id"]}/runs?status=success&event=workflow_dispatch&per_page=10')["workflow_runs"]
+    seen = set()
+    for run in runs[:10]:
+        seen.add(run["id"])
+        proof = certificate_from_run(client, run)
+        if proof is None:
+            continue
+        certificate, artifacts = proof
+        if certificate["candidate_source_sha"] == source_sha and "v" + certificate["project_version"] == tag:
+            return certificate, run, artifacts
+    bootstrap_id = trust["bootstrap_run_id"]
+    if bootstrap_id not in seen:
+        run = client.get(f"actions/runs/{bootstrap_id}")
+        proof = certificate_from_run(client, run)
+        if proof is None:
+            return None
+        certificate, artifacts = proof
+        if certificate["candidate_source_sha"] == source_sha and "v" + certificate["project_version"] == tag:
+            return certificate, run, artifacts
+    return None
+
+
+def already_published(repository, plan):
+    """Suppress duplicate paperwork, without authorizing new release bytes."""
+    raw = os.environ.get("RELEASE_TRUST_JSON", "")
+    if not raw:
+        return False
+    from load_release_trust import load
+    from publish_certified_release import GitHub, expected_coverage
+    from release_certificate import authenticate
+    client = GitHub(repository, os.environ["GH_TOKEN"])
+    default = github_api(f"repos/{repository}")["default_branch"]
+    trust, _ = load(".github/release-trust.json", raw, repository, default)
+    release = client.get("releases/latest")
+    tag = release["tag_name"]
+    if (release.get("draft") is not False or release.get("prerelease") is not False
+            or re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag) is None):
+        raise ValueError("Latest release is not regular")
+    ref = client.get("git/ref/tags/" + tag)
+    if ref["object"].get("type") != "commit":
+        raise ValueError("Published release tag is not an immutable source commit")
+    selected = published_certificate(client, trust, ref["object"]["sha"], tag)
+    if selected is None:
+        return False
+    certificate, run, artifacts = selected
+    source = client.get("commits/" + certificate["candidate_source_sha"])
+    current = client.get("commits/" + plan["source_sha"])
+    if release_tree(client.get("git/trees/" + source["commit"]["tree"]["sha"] + "?recursive=1")) != release_tree(
+            client.get("git/trees/" + current["commit"]["tree"]["sha"] + "?recursive=1")):
+        return False
+    if certificate["profile_fingerprints"] != [p["fingerprint"] for p in plan["profiles"]]:
+        return False
+    policy = client.get("contents/.github/plex-compatibility-policy.json?ref=" + plan["source_sha"])
+    policy_hash = hashlib.sha256(base64.b64decode(policy["content"], validate=False)).hexdigest()
+    reviewed = {path: client.get(f'contents/{path}?ref={run["head_sha"]}')["sha"]
+                for path in trust["reviewed_file_blobs"]}
+    authenticate(certificate, trust, run, client.get(f'actions/workflows/{trust["workflow_id"]}'),
+                 artifacts, source, reviewed, expected_coverage(plan["profiles"], policy_hash))
+    tag = "v" + certificate["project_version"]
+    if (release.get("draft") is not False or release.get("prerelease") is not False
+            or ref["object"].get("type") != "commit"
+            or ref["object"].get("sha") != certificate["candidate_source_sha"]):
+        raise ValueError("Published regular release tag mismatch")
+    assets = {item["name"]: item.get("digest") for item in release["assets"]}
+    for bundle in certificate["artifacts"]:
+        for name, digest in bundle["files"].items():
+            if assets.get(name) != "sha256:" + digest:
+                raise ValueError("Published certified asset missing or changed")
+    return True
+
+
 def dispatch_followup(repository, plan, category, run_url):
     default = github_api(f"repos/{repository}")["default_branch"]
     current = github_api(f"repos/{repository}/git/ref/heads/{default}")["object"]["sha"]
     if current != plan["source_sha"]:
         raise ValueError("Default source changed; restage or reobserve instead of dispatching stale work")
     if category == "probe-passed":
+        if already_published(repository, plan):
+            return "already-published"
         latest = plan["profiles"][0]
         inputs = {"merged_source_sha": plan["source_sha"], "plex_version": latest["plex_version"],
                   "upstream_profile_json": json.dumps(latest, separators=(",", ":")), "profile_id": latest["id"]}
@@ -547,6 +661,8 @@ def dispatch_followup(repository, plan, category, run_url):
 
 
 def report_pr(repository, plan, category, run_url):
+    if category == "probe-passed" and already_published(repository, plan):
+        return "already-published"
     body = report(plan, category, run_url)
     marker = "plex-compatibility-report:" + plan["fingerprint"]
     prs = github_api(f"repos/{repository}/pulls?state=all&per_page=100")
