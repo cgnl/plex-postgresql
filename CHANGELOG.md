@@ -6,16 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [1.3.23]
-
-- Stage native compatibility verification for Plex 1.43.4.10903-e5521bd8c. Certification is pending.
-
 ## [Unreleased]
+
+## [1.3.23] - 2026-10-13
 
 ### Fixed
 - Clear old PostgreSQL errors after a cached query recovers, including queries returning no rows.
 - Keep compatibility status outside GitHub issues.
 - Run the short compatibility check without starting the full duration test.
+- Reuse four native image builds across PostgreSQL versions and limit CI log size.
+- Validate matching restart and duration results before publishing the exact tested files.
+
+### Tested
+- Plex 1.43.4.10903-e5521bd8c with PostgreSQL 15 and 18, LinuxServer and PlexInc, on native AMD64 and ARM64.
+- All eight configurations passed 100 restarts, 5 hours 50 minutes of playback load and live PostgreSQL recovery.
+- Four native ZIP installation and migration tests passed.
+- The macOS ARM64 build was checked separately for architecture, exported functions and download checksum.
 
 ## [1.3.22] - 2026-10-11
 
