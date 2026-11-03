@@ -44,7 +44,7 @@ pub(super) unsafe fn streaming_fetch_result(
     if first_res.is_null() {
         clear_streaming_state(s);
         s.result_conn = std::ptr::null_mut();
-        s.read_done = -1;
+        s.read_done = first_fetch_failure_state(ec.conn);
         crate::db_interpose_exec::pg_path::set_pg_last_error(
             s.conn,
             "PostgreSQL stream returned no initial result",
@@ -110,10 +110,23 @@ pub(super) unsafe fn streaming_fetch_result(
     }
     clear_streaming_state(s);
     s.result_conn = std::ptr::null_mut();
-    s.read_done = -1;
+    s.read_done = first_fetch_failure_state(ec.conn);
     crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
     *exec_conn_io = exec_conn;
     *stmt_guard = None; // unlock
     set_pg_conn_error(pg_conn_error_out);
     STEP_RESULT_ERROR
+}
+
+/// `read_done` after the first fetch failed. No row has reached the caller, so
+/// when the session was lost the statement stays retryable: the step retry
+/// re-runs it on the recovered session (a read prepared from the description
+/// cache meets a dead session only here, not at prepare). Any other failure is
+/// final.
+unsafe fn first_fetch_failure_state(pq: *mut crate::libpq_helpers::PGconn) -> c_int {
+    if crate::libpq_helpers::rust_pq_status(pq) != 0 {
+        0
+    } else {
+        -1
+    }
 }
