@@ -21,6 +21,112 @@ unsafe fn deallocate_descriptor(
     ok
 }
 
+/// Prepare, describe and deallocate the private descriptor statement with three
+/// separate round trips. Fallback for when pipeline mode is unavailable.
+unsafe fn describe_round_trips(
+    conn: *mut PgConnection,
+    exec_conn: *mut PgConnection,
+    name: &CStr,
+    sql: &CStr,
+    param_count: c_int,
+) -> (*mut PgResultLibpq, bool) {
+    let ec = &mut *exec_conn;
+    let prep = crate::libpq_helpers::rust_pq_prepare(
+        ec.conn,
+        name.as_ptr(),
+        sql.as_ptr(),
+        param_count,
+        ptr::null(),
+    );
+    let mut round_ok = crate::libpq_helpers::rust_pq_result_status(prep) == PGRES_COMMAND_OK;
+    if !round_ok {
+        crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, prep);
+    }
+    crate::libpq_helpers::rust_pq_clear(prep);
+    let mut desc = ptr::null_mut();
+    if round_ok {
+        desc = crate::libpq_helpers::rust_pq_describe_prepared(ec.conn, name.as_ptr());
+        round_ok = crate::libpq_helpers::rust_pq_result_status(desc) == PGRES_COMMAND_OK;
+        if !round_ok {
+            crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, desc);
+        }
+        let deallocated = deallocate_descriptor(conn, exec_conn, name);
+        round_ok = round_ok && deallocated;
+    }
+    (desc, round_ok)
+}
+
+/// The same prepare/describe/deallocate sequence in a single round trip using
+/// libpq pipeline mode. Every prepared statement used to pay three network
+/// round trips here before it ever executed, which dominated latency against a
+/// PostgreSQL server on another host (issue #59).
+///
+/// Returns None when pipeline mode cannot be entered (nothing was sent), so the
+/// caller can fall back to separate round trips.
+unsafe fn describe_pipelined(
+    conn: *mut PgConnection,
+    exec_conn: *mut PgConnection,
+    name: &CStr,
+    sql: &CStr,
+    param_count: c_int,
+) -> Option<(*mut PgResultLibpq, bool)> {
+    let pq = (*exec_conn).conn;
+    if !crate::libpq_helpers::pq_enter_pipeline_mode(pq) {
+        return None;
+    }
+    let deallocate = CString::new(format!("DEALLOCATE {}", name.to_string_lossy()))
+        .expect("generated DEALLOCATE cannot contain NUL");
+    let queued = crate::libpq_helpers::pq_send_prepare(pq, name.as_ptr(), sql.as_ptr(), param_count)
+        && crate::libpq_helpers::pq_send_describe_prepared(pq, name.as_ptr())
+        && crate::libpq_helpers::pq_send_command(pq, deallocate.as_ptr());
+    let synced = crate::libpq_helpers::pq_pipeline_sync(pq);
+
+    // Collect exactly one result per queued command (each followed by NULL),
+    // then the sync marker. After an error PostgreSQL skips to the sync point
+    // and libpq reports the remaining commands as PIPELINE_ABORTED.
+    let mut round_ok = queued && synced;
+    let mut error_recorded = false;
+    let mut desc = ptr::null_mut();
+    for command in 0..3 {
+        let res = crate::libpq_helpers::rust_pq_get_result(pq);
+        if res.is_null() {
+            round_ok = false;
+            break;
+        }
+        let status = crate::libpq_helpers::rust_pq_result_status(res);
+        if status != PGRES_COMMAND_OK {
+            round_ok = false;
+            if !error_recorded {
+                crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, res);
+                error_recorded = true;
+            }
+        }
+        if command == 1 && status == PGRES_COMMAND_OK {
+            desc = res;
+        } else {
+            crate::libpq_helpers::rust_pq_clear(res);
+        }
+        let mut trailing = crate::libpq_helpers::rust_pq_get_result(pq);
+        while !trailing.is_null() {
+            crate::libpq_helpers::rust_pq_clear(trailing);
+            trailing = crate::libpq_helpers::rust_pq_get_result(pq);
+        }
+    }
+    let sync = crate::libpq_helpers::rust_pq_get_result(pq);
+    if crate::libpq_helpers::rust_pq_result_status(sync) != crate::libpq_helpers::PGRES_PIPELINE_SYNC {
+        round_ok = false;
+    }
+    crate::libpq_helpers::rust_pq_clear(sync);
+    if !crate::libpq_helpers::pq_exit_pipeline_mode(pq) {
+        round_ok = false;
+    }
+    if !round_ok && !desc.is_null() {
+        crate::libpq_helpers::rust_pq_clear(desc);
+        desc = ptr::null_mut();
+    }
+    Some((desc, round_ok))
+}
+
 pub(crate) fn mask_collection_metadata_type(
     pg_stmt: &PgStmt,
     col_name: *const c_char,
@@ -66,6 +172,31 @@ pub(crate) unsafe fn set_metadata_result_state(
 
 /// Obtain result descriptors without executing the statement or consuming its stream.
 /// Connection and statement locks are deliberately never held together.
+/// Hand `desc` to the statement unless another thread described it first.
+unsafe fn install_descriptor(pg_stmt: *mut PgStmt, desc: *mut PgResultLibpq) {
+    let _guard = PgStmt::lock_mutex(pg_stmt);
+    let s = &mut *pg_stmt;
+    if s.descriptor.is_null() {
+        s.descriptor = desc;
+        s.num_cols = crate::libpq_helpers::rust_pq_nfields(desc);
+        s.ensure_column_capacity(s.num_cols as usize);
+    } else {
+        crate::libpq_helpers::rust_pq_clear(desc);
+    }
+}
+
+/// Drop a cached description that an execution result contradicts (the
+/// schema changed underneath, e.g. a migration in another Plex process).
+pub(crate) fn forget_descriptor_if_stale(stmt: &PgStmt, result_columns: c_int) {
+    if stmt.descriptor.is_null() || stmt.pg_sql.is_null() {
+        return;
+    }
+    if crate::libpq_helpers::rust_pq_nfields(stmt.descriptor) != result_columns {
+        let sql = unsafe { CStr::from_ptr(stmt.pg_sql) };
+        crate::descriptor_cache::forget(sql, stmt.param_count);
+    }
+}
+
 pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
     if pg_stmt.is_null() {
         return false;
@@ -81,6 +212,12 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         }
         (s.conn, CStr::from_ptr(s.pg_sql).to_owned(), s.param_count)
     };
+    // Repeated statements reuse a cached description: no round trip.
+    let cached = crate::descriptor_cache::lookup(&sql, param_count);
+    if !cached.is_null() {
+        unsafe { install_descriptor(pg_stmt, cached) };
+        return true;
+    }
     let conn_ref = unsafe { &*conn };
     let thread_conn = unsafe {
         if conn_ref.streaming_active.load(Ordering::SeqCst) != 0 {
@@ -114,50 +251,16 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         ))
         .expect("generated descriptor name cannot contain NUL");
         crate::libpq_helpers::rust_pq_set_nonblocking(ec.conn, 0);
-        let prep = crate::libpq_helpers::rust_pq_prepare(
-            ec.conn,
-            descriptor_name.as_ptr(),
-            sql.as_ptr(),
-            param_count,
-            ptr::null(),
-        );
-        let mut round_ok = crate::libpq_helpers::rust_pq_result_status(prep) == PGRES_COMMAND_OK;
-        if !round_ok {
-            unsafe {
-                crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, prep);
+        let (desc, round_ok) = unsafe {
+            match describe_pipelined(conn, exec_conn, &descriptor_name, &sql, param_count) {
+                Some(outcome) => outcome,
+                None => describe_round_trips(conn, exec_conn, &descriptor_name, &sql, param_count),
             }
-        }
-        crate::libpq_helpers::rust_pq_clear(prep);
-        let mut desc = ptr::null_mut();
-        if round_ok {
-            desc =
-                crate::libpq_helpers::rust_pq_describe_prepared(ec.conn, descriptor_name.as_ptr());
-            round_ok = crate::libpq_helpers::rust_pq_result_status(desc) == PGRES_COMMAND_OK;
-            if !round_ok {
-                unsafe {
-                    crate::db_interpose_exec::pg_path::record_pg_result_error(
-                        conn, exec_conn, desc,
-                    );
-                }
-            }
-            let deallocated = unsafe {
-                deallocate_descriptor(conn, exec_conn, CStr::from_ptr(descriptor_name.as_ptr()))
-            };
-            round_ok = round_ok && deallocated;
-        }
+        };
         if round_ok {
             drop(conn_guard);
-            unsafe {
-                let _guard = PgStmt::lock_mutex(pg_stmt);
-                let s = &mut *pg_stmt;
-                if s.descriptor.is_null() {
-                    s.descriptor = desc;
-                    s.num_cols = crate::libpq_helpers::rust_pq_nfields(desc);
-                    s.ensure_column_capacity(s.num_cols as usize);
-                } else {
-                    crate::libpq_helpers::rust_pq_clear(desc);
-                }
-            }
+            crate::descriptor_cache::store(&sql, param_count, desc);
+            unsafe { install_descriptor(pg_stmt, desc) };
             return true;
         }
         crate::libpq_helpers::rust_pq_clear(desc);

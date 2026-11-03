@@ -50,7 +50,7 @@ use decltype_accessor::column_decltype_impl;
 use decltype_cache::{lookup_decltype_direct, lookup_sqlite_decltype};
 use fake_value_slot::allocate_fake_sqlite_value;
 use metadata_accessors::{column_count_impl, column_name_impl, data_count_impl};
-pub(crate) use metadata_support::ensure_pg_result_for_metadata;
+pub(crate) use metadata_support::{ensure_pg_result_for_metadata, forget_descriptor_if_stale};
 use metadata_support::mask_collection_metadata_type;
 #[cfg(test)]
 use metadata_support::set_metadata_result_state;

@@ -184,6 +184,9 @@ pub extern "C" fn rust_my_sqlite3_step(p_stmt: *mut sqlite3_stmt) -> c_int {
 
 unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
     shim_alloc_maybe_log();
+    // No locks are held here, so statements pinned by a stream read-ahead can
+    // safely be released (and freed) now.
+    crate::pg_statement::release_deferred_spill_refs();
 
     if *tls_in_resolve_tables_ptr() != 0 {
         return orig_step(p_stmt);

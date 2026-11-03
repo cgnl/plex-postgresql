@@ -19,8 +19,24 @@ pub struct PGcancel {
 pub type Oid = u32;
 
 pub const PGRES_TUPLES_OK: c_int = 2;
+pub const PGRES_PIPELINE_SYNC: c_int = 10;
 
 extern "C" {
+    // Pipeline mode (libpq >= 14): queue several commands per round trip.
+    fn PQenterPipelineMode(conn: *mut PGconn) -> c_int;
+    fn PQexitPipelineMode(conn: *mut PGconn) -> c_int;
+    fn PQpipelineSync(conn: *mut PGconn) -> c_int;
+    fn PQsendPrepare(
+        conn: *mut PGconn,
+        stmt_name: *const c_char,
+        query: *const c_char,
+        n_params: c_int,
+        param_types: *const Oid,
+    ) -> c_int;
+    fn PQsendDescribePrepared(conn: *mut PGconn, stmt_name: *const c_char) -> c_int;
+    // Building one compact multi-row result from single-row results.
+    fn PQcopyResult(src: *const PGresult, flags: c_int) -> *mut PGresult;
+    fn PQsetvalue(res: *mut PGresult, tup_num: c_int, field_num: c_int, value: *mut c_char, len: c_int) -> c_int;
     fn PQsetnonblocking(conn: *mut PGconn, arg: c_int) -> c_int;
     fn PQisBusy(conn: *mut PGconn) -> c_int;
     fn PQconsumeInput(conn: *mut PGconn) -> c_int;
@@ -663,4 +679,89 @@ pub extern "C" fn rust_pg_align_idle_timeout_with_server(
         return target;
     }
     idle_timeout
+}
+
+// Crate-internal pipeline helpers (not exported, so the C FFI header is unchanged).
+// Callers must pass a live connection they hold exclusively.
+
+pub(crate) unsafe fn pq_enter_pipeline_mode(conn: *mut PGconn) -> bool {
+    !conn.is_null() && PQenterPipelineMode(conn) == 1
+}
+
+pub(crate) unsafe fn pq_exit_pipeline_mode(conn: *mut PGconn) -> bool {
+    !conn.is_null() && PQexitPipelineMode(conn) == 1
+}
+
+pub(crate) unsafe fn pq_pipeline_sync(conn: *mut PGconn) -> bool {
+    !conn.is_null() && PQpipelineSync(conn) == 1
+}
+
+pub(crate) unsafe fn pq_send_prepare(
+    conn: *mut PGconn,
+    stmt_name: *const c_char,
+    query: *const c_char,
+    n_params: c_int,
+) -> bool {
+    !conn.is_null()
+        && !stmt_name.is_null()
+        && !query.is_null()
+        && PQsendPrepare(conn, stmt_name, query, n_params, std::ptr::null()) == 1
+}
+
+pub(crate) unsafe fn pq_send_describe_prepared(conn: *mut PGconn, stmt_name: *const c_char) -> bool {
+    !conn.is_null() && !stmt_name.is_null() && PQsendDescribePrepared(conn, stmt_name) == 1
+}
+
+pub(crate) unsafe fn pq_send_command(conn: *mut PGconn, command: *const c_char) -> bool {
+    !conn.is_null()
+        && !command.is_null()
+        && PQsendQueryParams(
+            conn,
+            command,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        ) == 1
+}
+
+/// PQcopyResult flag: copy the column descriptors only.
+pub(crate) const PG_COPYRES_ATTRS: c_int = 0x01;
+
+pub(crate) unsafe fn pq_copy_result(src: *const PGresult, flags: c_int) -> *mut PGresult {
+    if src.is_null() {
+        return std::ptr::null_mut();
+    }
+    PQcopyResult(src, flags)
+}
+
+/// Append/overwrite one field; a null `value` stores SQL NULL.
+pub(crate) unsafe fn pq_set_value(
+    res: *mut PGresult,
+    tup_num: c_int,
+    field_num: c_int,
+    value: *const c_char,
+    len: c_int,
+) -> bool {
+    !res.is_null() && PQsetvalue(res, tup_num, field_num, value as *mut c_char, len) == 1
+}
+
+pub(crate) unsafe fn pq_get_is_null(res: *const PGresult, row: c_int, col: c_int) -> bool {
+    !res.is_null() && PQgetisnull(res, row, col) != 0
+}
+
+pub(crate) unsafe fn pq_get_value(res: *const PGresult, row: c_int, col: c_int) -> *const c_char {
+    if res.is_null() {
+        return std::ptr::null();
+    }
+    PQgetvalue(res, row, col)
+}
+
+pub(crate) unsafe fn pq_get_length(res: *const PGresult, row: c_int, col: c_int) -> c_int {
+    if res.is_null() {
+        return 0;
+    }
+    PQgetlength(res, row, col)
 }

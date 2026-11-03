@@ -51,7 +51,9 @@ pub extern "C" fn rust_step_write_prepare_connection(
             if !crate::pg_client::transaction::session_ready_locked(exec_conn) {
                 return STEP_RESULT_ERROR;
             }
-            if crate::pg_client::transaction::result_stream_live_locked(exec_conn) {
+            if crate::pg_client::transaction::result_stream_live_locked(exec_conn)
+                && !crate::pg_statement::spill_live_stream_locked(exec_conn, pg_stmt)
+            {
                 crate::pg_client::transaction::set_error(
                     exec_conn,
                     "Write cannot switch an active handle session while a result is streaming",

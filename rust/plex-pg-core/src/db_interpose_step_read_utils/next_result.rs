@@ -24,6 +24,65 @@ pub(super) fn advance_cached_result_impl(stmt: *mut PgStmt) -> c_int {
     STEP_RESULT_ROW
 }
 
+/// Serve the next row of a stream that was read ahead into one compact result
+/// (see pg_statement::spill_live_stream_locked). Caller holds the statement
+/// mutex.
+fn spilled_next(stmt: &mut PgStmt) -> c_int {
+    step_read_clear_row_caches(stmt as *mut PgStmt);
+    if !stmt.spill_installed {
+        // The single-row result still held is the row served before the
+        // read-ahead; the remaining rows now come from the compact result.
+        if !stmt.result.is_null() {
+            crate::libpq_helpers::rust_pq_clear(stmt.result);
+        }
+        stmt.result = stmt.spilled_result;
+        stmt.spilled_result = std::ptr::null_mut();
+        stmt.spill_installed = true;
+        stmt.current_row = 0;
+        stmt.num_rows = if stmt.result.is_null() {
+            0
+        } else {
+            crate::libpq_helpers::rust_pq_ntuples(stmt.result)
+        };
+        if stmt.num_rows > 0 {
+            stmt.num_cols = crate::libpq_helpers::rust_pq_nfields(stmt.result);
+            stmt.ensure_column_capacity(stmt.num_cols as usize);
+        }
+    } else {
+        stmt.current_row += 1;
+    }
+    if stmt.current_row < stmt.num_rows {
+        return STEP_RESULT_ROW;
+    }
+
+    let failed = stmt.spill_state < 0;
+    let error = stmt.spill_error.take();
+    if !stmt.result.is_null() {
+        crate::libpq_helpers::rust_pq_clear(stmt.result);
+        stmt.result = std::ptr::null_mut();
+    }
+    stmt.release_spill();
+    stmt.streaming_mode = 0;
+    stmt.streaming_conn = std::ptr::null_mut();
+    stmt.result_conn = std::ptr::null_mut();
+    stmt.current_row = stmt.num_rows;
+    if failed {
+        stmt.read_done = -1;
+        let message = error.unwrap_or_else(|| {
+            std::ffi::CString::new("PostgreSQL stream failed while reading ahead").unwrap()
+        });
+        unsafe {
+            crate::db_interpose_exec::pg_path::set_pg_last_error(
+                stmt.conn,
+                &message.to_string_lossy(),
+            );
+        }
+        return STEP_RESULT_ERROR;
+    }
+    stmt.read_done = 1;
+    STEP_RESULT_DONE
+}
+
 pub(super) fn streaming_next_impl(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) -> c_int {
     if stmt.is_null() {
         return STEP_RESULT_ERROR;
@@ -31,6 +90,10 @@ pub(super) fn streaming_next_impl(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) 
     let stmt_ptr = stmt;
     let stmt = unsafe { &mut *stmt };
     let stmt_guard = unsafe { PgStmt::lock_mutex(stmt_ptr) };
+
+    if stmt.spill_state != 0 {
+        return spilled_next(stmt);
+    }
 
     if stmt.streaming_mode == 0 || stmt.streaming_conn.is_null() {
         return STEP_RESULT_ERROR;

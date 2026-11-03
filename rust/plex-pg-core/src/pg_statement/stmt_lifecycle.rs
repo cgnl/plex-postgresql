@@ -10,6 +10,14 @@ use crate::log_info_lazy;
 const PMT_STMT_SWEEP_EXTRA_FREE: i32 = 6;
 
 unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_name: &str) {
+    // A spilled stream was already read to its end and no longer holds the
+    // connection; only its buffered rows need releasing.
+    if stmt.spill_state != 0 {
+        stmt.release_spill();
+        stmt.streaming_mode = 0;
+        stmt.streaming_conn = std::ptr::null_mut();
+        return;
+    }
     if stmt.streaming_mode == 0 || stmt.streaming_conn.is_null() {
         return;
     }
@@ -29,7 +37,29 @@ unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_nam
     let sconn = &mut *stmt.streaming_conn;
     let _conn_guard = PthreadMutexGuard::lock(&mut sconn.mutex as *mut _);
     if !sconn.conn.is_null() {
-        let cancel = crate::libpq_helpers::rust_pq_get_cancel(sconn.conn);
+        // Plex often resets a statement after reading only its first row. Rows
+        // that have already arrived are discarded locally; PQcancel opens a
+        // separate connection to the server and waits for it, costing extra
+        // round trips per statement (issue #59). Cancel only when the result is
+        // still incomplete after everything buffered has been consumed.
+        let mut drain_count = 0;
+        let mut complete = false;
+        crate::libpq_helpers::rust_pq_consume_input(sconn.conn);
+        while crate::libpq_helpers::rust_pq_is_busy(sconn.conn) == 0 {
+            let buffered = crate::libpq_helpers::rust_pq_get_result(sconn.conn);
+            if buffered.is_null() {
+                complete = true;
+                break;
+            }
+            drain_count += 1;
+            crate::libpq_helpers::rust_pq_clear(buffered);
+            crate::libpq_helpers::rust_pq_consume_input(sconn.conn);
+        }
+        let cancel = if complete {
+            std::ptr::null_mut()
+        } else {
+            crate::libpq_helpers::rust_pq_get_cancel(sconn.conn)
+        };
         if !cancel.is_null() {
             let mut errbuf = [0 as c_char; 256];
             if crate::libpq_helpers::rust_pq_cancel(
@@ -43,8 +73,10 @@ unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_nam
             }
             crate::libpq_helpers::rust_pq_free_cancel(cancel);
         }
-        let mut drain_count = 0;
         loop {
+            if complete {
+                break;
+            }
             let drain = crate::libpq_helpers::rust_pq_get_result(sconn.conn);
             if drain.is_null() {
                 break;
@@ -122,6 +154,14 @@ pub fn rust_stmt_free(stmt_ptr: *mut PgStmt) {
     }
     unsafe {
         let stmt = &mut *stmt_ptr;
+
+        // A finished CREATE/ALTER/DROP may have changed result shapes; drop
+        // cached descriptions (also cleared when such a statement is prepared).
+        if !stmt.sql.is_null()
+            && crate::descriptor_cache::starts_with_ddl(std::ffi::CStr::from_ptr(stmt.sql).to_bytes())
+        {
+            crate::descriptor_cache::clear();
+        }
 
         let ref_count = stmt.ref_count.load(Ordering::Acquire);
         if ref_count != 0 {

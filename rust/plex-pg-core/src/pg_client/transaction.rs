@@ -385,7 +385,13 @@ unsafe fn execute(conn: *mut PgConnection, sql: &str) -> Result<c_int, c_int> {
             "PostgreSQL transaction session unavailable; outcome may be unknown",
         ));
     }
-    if result_stream_live_locked(conn) {
+    // BEGIN/SAVEPOINT/RELEASE/COMMIT leave open SQLite cursors usable, so the
+    // stream is read ahead. A rollback aborts pending statements in SQLite
+    // too; keep refusing rather than serving rows the rollback discarded.
+    let rolls_back = matches!(control, Control::Rollback | Control::RollbackTo(_));
+    if result_stream_live_locked(conn)
+        && (rolls_back || !crate::pg_statement::spill_live_stream_locked(conn, std::ptr::null_mut()))
+    {
         return Err(set_error(
             conn,
             "Transaction control cannot interrupt an active PostgreSQL result",

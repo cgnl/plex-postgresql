@@ -161,13 +161,41 @@ unsafe fn worker_init_admitted() -> c_int {
         worker_running = 1;
         worker_request = EMPTY_WORKER_REQUEST;
 
-        if libc::pthread_create(
+        // The worker can start from the shim constructor, before Plex installs
+        // its process-wide signal mask. Plex handles asynchronous signals on
+        // its own sigwait thread and aborts ("unexpected async signal") when
+        // one lands elsewhere, so the worker must never be eligible to receive
+        // them. Threads inherit the creator's mask; block everything around
+        // pthread_create and restore the caller's mask afterwards.
+        let mut all_signals: libc::sigset_t = std::mem::zeroed();
+        let mut caller_mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all_signals);
+        // Faults raised by the worker itself must still reach the crash
+        // handlers; a blocked synchronous signal is delivered with its
+        // default action instead, losing all diagnostics.
+        for synchronous in [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGTRAP,
+            libc::SIGSYS,
+            libc::SIGABRT,
+        ] {
+            libc::sigdelset(&mut all_signals, synchronous);
+        }
+        let masked =
+            libc::pthread_sigmask(libc::SIG_SETMASK, &all_signals, &mut caller_mask) == 0;
+        let created = libc::pthread_create(
             ptr::addr_of_mut!(worker_thread),
             &attr as *const _,
             worker_thread_func,
             ptr::null_mut(),
-        ) != 0
-        {
+        );
+        if masked {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &caller_mask, ptr::null_mut());
+        }
+        if created != 0 {
             log_error("WORKER: Failed to create thread");
             worker_running = 0;
             libc::pthread_attr_destroy(&mut attr as *mut _);

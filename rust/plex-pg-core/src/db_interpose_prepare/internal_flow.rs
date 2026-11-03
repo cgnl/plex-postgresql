@@ -341,6 +341,10 @@ pub(super) fn prepare_v2_internal_impl(
     // Defense-in-depth: if pg_conn is null (low-stack skip_complex_processing),
     // look up the connection directly so DDL still routes to PG.
     let is_ddl = crate::pg_config::is_ddl_str(sql_str);
+    if is_ddl {
+        // Schema changes invalidate every cached result description.
+        crate::descriptor_cache::clear();
+    }
     let effective_pg_conn = if is_ddl && pg_conn.is_null() {
         crate::pg_client::rust_pg_find_connection(db)
     } else {

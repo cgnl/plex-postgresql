@@ -43,7 +43,7 @@ pub(super) fn first_execute_impl(
         };
 
         let mut conn_guard =
-            match lock_exec_connection(&mut exec_conn, &mut stmt_guard, pg_conn_error_out) {
+            match lock_exec_connection(pg_stmt, &mut exec_conn, &mut stmt_guard, pg_conn_error_out) {
                 Ok(conn_guard) => conn_guard,
                 Err(rc) => return rc,
             };
