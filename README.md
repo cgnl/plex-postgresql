@@ -8,15 +8,15 @@ A small shim library that catches Plex SQLite calls and sends them to PostgreSQL
 
 ## Current validation status
 
-**v1.3.23 is a regular release.** Linux AMD64/ARM64 and macOS ARM64 downloads are available, along with LinuxServer and PlexInc Docker images.
+**v1.3.24 is a regular release published without the certification matrix**, at the maintainer's request. It contains Linux AMD64/ARM64 and macOS ARM64 downloads. The Docker images were not rebuilt; the latest images remain v1.3.23.
 
-All eight Linux configurations passed 100 restart cycles, 5 hours 50 minutes of movie and TV playback load with four simultaneous clients, and recovery after a live PostgreSQL restart. All four native ZIP installation and migration checks passed. The macOS ARM64 build was checked separately; the full playback matrix ran on Linux.
+v1.3.24 was tested on Plex 1.43.5.11079 (official Debian package, ARM64) against PostgreSQL 15 on another host: native installation and migration, library deletion, emptying the trash, filter lists, metadata matching and media analysis, and request latency at network round-trip times up to 17 ms. Unit tests, CI and the native ZIP installation check pass. The 100-restart and 5 hour 50 minute load matrix was not run for this release.
 
-The tested matrix is **LinuxServer and PlexInc × native AMD64 and ARM64 × PostgreSQL 15 and 18**, using Plex **1.43.4.10903-e5521bd8c**. The published Linux ZIP and Docker images are the exact tested files and images. See the [completed test run](https://github.com/cgnl/plex-postgresql/actions/runs/38313571637).
+The last fully certified release is [v1.3.23](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.23): **LinuxServer and PlexInc × native AMD64 and ARM64 × PostgreSQL 15 and 18** with Plex **1.43.4.10903-e5521bd8c**, 100 restart cycles, 5 hours 50 minutes of playback load and recovery after a live PostgreSQL restart. See the [completed test run](https://github.com/cgnl/plex-postgresql/actions/runs/38313571637).
 
-## Latest published release: [v1.3.23](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.23)
+## Latest published release: [v1.3.24](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.24)
 
-Published on 13 October 2026. Fixes stale database errors after PostgreSQL recovery and improves compatibility CI. See [the changelog](CHANGELOG.md).
+Published on 3 November 2026. Fixes native Linux installation and configuration, far fewer PostgreSQL round trips, library deletion, emptying the trash, filter lists, and metadata matching and media analysis jobs. See [the changelog](CHANGELOG.md).
 
 ### Runtime architecture introduced in v1.2.0
 
@@ -28,7 +28,7 @@ Published on 13 October 2026. Fixes stale database errors after PostgreSQL recov
 - 🔧 **Stack safety:** heap-allocated thread-local buffers for Plex's 544K worker thread stacks
 - ✅ **712 tests passing** across unit, integration, and compatibility suites
 
-[📥 Download v1.3.23](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.23) | [📋 Full Changelog](CHANGELOG.md)
+[📥 Download v1.3.24](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.24) | [📋 Full Changelog](CHANGELOG.md)
 
 New automatic releases require a certificate for the exact tested source and
 Linux ZIP/image bytes. Tag pushes no longer independently publish assets.

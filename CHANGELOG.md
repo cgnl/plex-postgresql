@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.24] - 2026-11-03
+
 ### Fixed
 - Native Linux installs connect to the configured PostgreSQL server. The packaged systemd unit never reads `/etc/default/plexmediaserver`, so the wrappers fell back to `localhost` and Plex crashed. The wrappers and the installer now read `/etc/plex-postgresql.conf` (and `PLEX_PG_*` lines in `/etc/default/plexmediaserver`); environment variables still take precedence.
 - The installer no longer loses its settings under `sudo`: it reads the config file, and writes the settings it migrated with to `/etc/plex-postgresql.conf` (mode 0640, Plex group) when that file does not exist yet.
