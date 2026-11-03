@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Native Linux installs connect to the configured PostgreSQL server. The packaged systemd unit never reads `/etc/default/plexmediaserver`, so the wrappers fell back to `localhost` and Plex crashed. The wrappers and the installer now read `/etc/plex-postgresql.conf` (and `PLEX_PG_*` lines in `/etc/default/plexmediaserver`); environment variables still take precedence.
+- The installer no longer loses its settings under `sudo`: it reads the config file, and writes the settings it migrated with to `/etc/plex-postgresql.conf` (mode 0640, Plex group) when that file does not exist yet.
+- Native installs (Linux and macOS) load the PostgreSQL schema before migrating; importing an existing library into an empty database always failed. The macOS installer also set no PostgreSQL defaults before migrating.
+- The installer checks its tools, the PostgreSQL login and the destination before snapshotting the library, so a missing tool or wrong password fails in seconds instead of after hours. `sqlite3` is optional: the Plex SQLite binary is used when it is missing.
+- Snapshotting a large library reads the source once instead of several times, reports progress, uses reflinks where the filesystem supports them, scales its timeout with the library size and explains how to raise it. The import reuses the verified snapshot instead of taking a second one.
+- A migration prompt without an interactive terminal now explains itself instead of exiting silently.
+- Plex no longer logs `Resources: Unexpected result when reading /proc/<pid>/stat` for finished jobs. The shim's worker thread now blocks all signals, so `SIGCHLD` no longer needs to be ignored and Plex sees its child processes exit again.
+- Far fewer PostgreSQL round trips, which made every query slow against a server on another host: `statement_timeout` is set once per connection instead of before every read; result descriptions are cached per statement text (cleared on schema changes) and otherwise fetched in one pipelined round trip instead of three; a statement reset after reading part of a fully received result no longer sends a separate cancel request. A single-item request went from 34 to about 9 round trips, one per query Plex issues.
+- Deleting a library no longer fails: subqueries in `FROM` without an alias get one (PostgreSQL 15 requires it), and `ANALYZE` is a no-op instead of failing on the SQLite shadow.
+- Emptying the trash no longer fails with `MediaItem::Find` errors. A statement (or `BEGIN`/`SAVEPOINT`/`RELEASE`/`COMMIT`) that needs the transaction's PostgreSQL session while another result is still streaming now reads the rest of that result ahead into one compact result instead of failing.
+- Library filter lists such as genres no longer fail with HTTP 500 (`std::bad_cast`): aliased aggregate columns like `count(...) AS tags_count` report no declared type, as in SQLite.
+
+### Added
+- `MIGRATION_INTEGRITY_CHECK` (`full`, `quick`, `skip`) and `MIGRATION_LIVE_SOURCE=1` (migrate a snapshot of a running library) for large installs.
+- `PLEX_PG_FORCE_SIGCHLD_IGNORE=1` restores the previous `SIGCHLD` handling.
+
+### Tested
+- Plex 1.43.5.11079 (official Debian package, unpacked as on a Proxmox LXC) on ARM64 with a password-protected PostgreSQL 15 on another host: installation via `sudo` without `sqlite3`, start with only the systemd unit's environment, migration while Plex keeps running.
+- Reproduced each reported failure before the fix and confirmed it after: library deletion, emptying the trash of a movie with two versions, `/proc` errors after 48 child jobs, the genre list, and request latency at 0–8 ms network round-trip time (34 → 9 round trips per item request).
+- Cargo tests, `make ci-test`, `make ffi-header-check`, Clippy with warnings as errors, and `scripts/test-native-linux-bundle.sh` on ARM64.
+
 ## [1.3.23] - 2026-10-13
 
 ### Fixed

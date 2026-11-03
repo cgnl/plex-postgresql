@@ -43,7 +43,25 @@ fi
 # Source shared migration library (if it exists)
 if [[ -f "$SCRIPT_DIR/migrate_lib.sh" ]]; then
     source "$SCRIPT_DIR/migrate_lib.sh"
-    check_and_migrate
+    plex_pg_load_config
+    # Same defaults as the server wrapper below, so migration and runtime use
+    # one database; migrate_lib requires these to be set.
+    PG_HOST="${PLEX_PG_HOST:-/tmp}"
+    PG_PORT="${PLEX_PG_PORT:-5432}"
+    PG_DATABASE="${PLEX_PG_DATABASE:-plex}"
+    PG_USER="${PLEX_PG_USER:-plex}"
+    PG_SCHEMA="${PLEX_PG_SCHEMA:-plex}"
+    export PLEX_PG_PASSWORD="${PLEX_PG_PASSWORD:-plex}"
+    migration_preflight
+    init_pg_schema "$(resolve_schema_dir)"
+    if [[ ! -f "$SQLITE_DB" ]]; then
+        seed_fresh_pg_defaults
+    fi
+    if [[ -f "$SQLITE_DB" ]] && is_shadow_database "$SQLITE_DB"; then
+        echo "The Plex database is already a PostgreSQL shadow; skipping migration."
+    else
+        check_and_migrate
+    fi
 fi
 
 # ============================================================================
