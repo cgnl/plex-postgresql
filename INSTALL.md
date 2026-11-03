@@ -437,7 +437,7 @@ sudo command line):
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `MIGRATION_SNAPSHOT_TIMEOUT` | 15 min per GiB, at least 1 h | Seconds allowed for the snapshot |
+| `MIGRATION_SNAPSHOT_TIMEOUT` | 15 min per GiB, at least 1 h | Seconds allowed for the snapshot (explicit values up to 86400) |
 | `MIGRATION_INTEGRITY_CHECK` | `full` | `full` (per-table `integrity_check`), `quick` (`PRAGMA quick_check`, skips index verification) or `skip` (roughly halves the snapshot time) |
 | `MIGRATION_LIVE_SOURCE` | `0` | `1` snapshots the library while Plex keeps running (SQLite online backup); changes made after the snapshot are not migrated. Restart Plex when the installer finishes. |
 

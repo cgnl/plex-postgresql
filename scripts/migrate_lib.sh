@@ -826,18 +826,23 @@ source, destination, timeout, integrity, live = sys.argv[1:]
 if integrity not in ('full', 'quick', 'skip'):
     sys.exit('ERROR: MIGRATION_INTEGRITY_CHECK must be full, quick or skip')
 live = live in ('1', 'true', 'yes')
-root = pathlib.Path(destination)
-root.mkdir(parents=True, exist_ok=True)
 originals = [(pathlib.Path(source), 'library.db'), (pathlib.Path(source[:-3] + '.blobs.db'), 'library.blobs.db')]
 paths = [pathlib.Path(str(path) + suffix) for path, _ in originals for suffix in ('', '-wal', '-shm', '-journal')]
 GIB = 1024 ** 3
 total = sum(path.stat().st_size for path in paths if path.is_file())
+# Validated before anything is created. Without an explicit limit, allow
+# 15 minutes per GiB (at least an hour, at most a week).
 if timeout:
-    seconds = float(timeout)
+    try:
+        seconds = float(timeout)
+    except ValueError:
+        seconds = 0.0
+    if not 0 < seconds <= 86400:
+        sys.exit('ERROR: MIGRATION_SNAPSHOT_TIMEOUT must be greater than 0 and at most 86400 seconds')
 else:
-    seconds = max(3600.0, 900.0 * total / GIB)
-if not 0 < seconds <= 7 * 86400:
-    sys.exit('ERROR: MIGRATION_SNAPSHOT_TIMEOUT must be greater than 0 and at most 604800 seconds')
+    seconds = min(max(3600.0, 900.0 * total / GIB), 7 * 86400.0)
+root = pathlib.Path(destination)
+root.mkdir(parents=True, exist_ok=True)
 started = time.monotonic()
 deadline = started + seconds
 last_report = 0.0
@@ -1007,7 +1012,7 @@ except BaseException as error:
         for suffix in ('', '-wal', '-shm', '-journal'):
             (root / (name + suffix)).unlink(missing_ok=True)
     if isinstance(error, (SnapshotTimeout, subprocess.TimeoutExpired)):
-        sys.exit(f'ERROR: The SQLite snapshot did not finish within {int(seconds)}s ({size(total)} source). '
+        sys.exit(f'ERROR: SQLite snapshot timed out: not finished within {int(seconds)}s ({size(total)} source). '
                  f'Set a larger MIGRATION_SNAPSHOT_TIMEOUT (seconds) in /etc/plex-postgresql.conf, or pass it '
                  f'explicitly: sudo MIGRATION_SNAPSHOT_TIMEOUT=... <installer>. A plain `export` is dropped by sudo. '
                  f'MIGRATION_INTEGRITY_CHECK=quick (skips index checks) or skip reduces the verification step.')
