@@ -8,7 +8,7 @@ A small shim library that catches Plex SQLite calls and sends them to PostgreSQL
 
 ## Current validation status
 
-**v1.3.24 is a regular release published without the certification matrix**, at the maintainer's request. It contains Linux AMD64/ARM64 and macOS ARM64 downloads. The Docker images were not rebuilt; the latest images remain v1.3.23.
+**v1.3.24 is a regular release published without the certification matrix**, at the maintainer's request. It contains Linux AMD64/ARM64 and macOS ARM64 downloads, and LinuxServer and PlexInc Docker images for AMD64 and ARM64. The images are the ones built and smoke-tested by the native probe run (LinuxServer and PlexInc × AMD64 and ARM64 × PostgreSQL 15 and 18, one restart each).
 
 v1.3.24 was tested on Plex 1.43.5.11079 (official Debian package, ARM64) against PostgreSQL 15 on another host: native installation and migration, library deletion, emptying the trash, filter lists, metadata matching and media analysis, and request latency at network round-trip times up to 17 ms. Unit tests, CI and the native ZIP installation check pass. The 100-restart and 5 hour 50 minute load matrix was not run for this release.
 

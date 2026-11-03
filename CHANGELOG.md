@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pipeline mode is looked up at run time, so the shim still loads against libpq older than 14 (using separate round trips there); a failed pipeline never leaves the connection in pipeline mode.
 
 ### Added
+- Manual workflow `publish-manual-docker.yml`: publishes a release's Docker images from the images a green native probe run built for the tag's exact source.
 - `MIGRATION_INTEGRITY_CHECK` (`full`, `quick`, `skip`) and `MIGRATION_LIVE_SOURCE=1` (migrate a snapshot of a running library) for large installs.
 - `PLEX_PG_FORCE_SIGCHLD_IGNORE=1` restores the previous `SIGCHLD` handling.
 
