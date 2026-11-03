@@ -19,7 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Far fewer PostgreSQL round trips, which made every query slow against a server on another host: `statement_timeout` is set once per connection instead of before every read; result descriptions are cached per statement text (cleared on schema changes) and otherwise fetched in one pipelined round trip instead of three; a statement reset after reading part of a fully received result no longer sends a separate cancel request. A single-item request went from 34 to about 9 round trips, one per query Plex issues.
 - Deleting a library no longer fails: subqueries in `FROM` without an alias get one (PostgreSQL 15 requires it), and `ANALYZE` is a no-op instead of failing on the SQLite shadow.
 - Emptying the trash no longer fails with `MediaItem::Find` errors. A statement (or `BEGIN`/`SAVEPOINT`/`RELEASE`/`COMMIT`) that needs the transaction's PostgreSQL session while another result is still streaming now reads the rest of that result ahead into one compact result instead of failing.
-- Library filter lists such as genres no longer fail with HTTP 500 (`std::bad_cast`): aliased aggregate columns like `count(...) AS tags_count` report no declared type, as in SQLite.
+- Library filter lists such as genres no longer fail with HTTP 500 (`std::bad_cast`): columns aliased from an expression that calls an aggregate (`count(...) AS tags_count`, `coalesce(sum(x), 0) AS total`) report no declared type, as in SQLite.
+- Metadata matching and media analysis work on native Linux installs. The shim was preloaded into the bash wrapper of `Plex Media Scanner`, and the system bash cannot load it (it is linked against Plex's musl libc), so every scanner job crashed before it started (`Scanner: error reading match results`). A scanner that is a script now starts without the shim and preloads it itself.
+- Scanner jobs use PostgreSQL. The shim took the text after the last `/` of the whole command line as the program name, so the matcher (`... --content-type=application/json`) was taken for an unrelated program called `json` and read the stale SQLite file instead.
+- A short wait when PostgreSQL has no free connection slots instead of failing at once: each scanner job opens its own connections, and bursts of jobs could exceed `max_connections`. The `docker-compose` files set `max_connections=200`; INSTALL.md documents the requirement for native installs.
+- `ROLLBACK` while a result is still streaming aborts that statement and rolls back, as in SQLite, instead of failing and leaving the PostgreSQL transaction open. `ROLLBACK TO` reads the result ahead like other transaction control.
+- Cached result descriptions stay correct when the schema changes: they are not stored while DDL may be uncommitted and are cleared when that transaction ends, DDL sent through `sqlite3_exec` also clears them, statements on temporary tables are not cached, and a statement whose result no longer matches its description takes the new one. The cache is bounded in size.
+- Resetting a statement whose result was cancelled now always reads the connection back to idle; it could leave the connection busy while marking it free, which failed the next statement on it.
+- Pipeline mode is looked up at run time, so the shim still loads against libpq older than 14 (using separate round trips there); a failed pipeline never leaves the connection in pipeline mode.
 
 ### Added
 - `MIGRATION_INTEGRITY_CHECK` (`full`, `quick`, `skip`) and `MIGRATION_LIVE_SOURCE=1` (migrate a snapshot of a running library) for large installs.
@@ -27,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tested
 - Plex 1.43.5.11079 (official Debian package, unpacked as on a Proxmox LXC) on ARM64 with a password-protected PostgreSQL 15 on another host: installation via `sudo` without `sqlite3`, start with only the systemd unit's environment, migration while Plex keeps running.
-- Reproduced each reported failure before the fix and confirmed it after: library deletion, emptying the trash of a movie with two versions, `/proc` errors after 48 child jobs, the genre list, and request latency at 0–8 ms network round-trip time (34 → 9 round trips per item request).
+- Reproduced each reported failure before the fix and confirmed it after: library deletion, emptying the trash of a movie with two versions, `/proc` errors after 48 child jobs, the genre list, and request latency at 0–17 ms network round-trip time (34 → 9 round trips per item request).
+- Metadata refresh and media analysis on a native install: scanner jobs that all failed before now exit successfully, also under a burst of jobs against `max_connections=100`.
 - Cargo tests, `make ci-test`, `make ffi-header-check`, Clippy with warnings as errors, and `scripts/test-native-linux-bundle.sh` on ARM64.
 
 ## [1.3.23] - 2026-10-13

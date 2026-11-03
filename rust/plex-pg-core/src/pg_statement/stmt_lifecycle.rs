@@ -42,16 +42,20 @@ unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_nam
         // separate connection to the server and waits for it, costing extra
         // round trips per statement (issue #59). Cancel only when the result is
         // still incomplete after everything buffered has been consumed.
+        // Bounded so a fast server cannot stream a large result into this
+        // loop; past the bound, cancelling is cheaper than reading.
+        const MAX_BUFFERED: usize = 256;
+        let mut buffered_count = 0;
         let mut drain_count = 0;
         let mut complete = false;
         crate::libpq_helpers::rust_pq_consume_input(sconn.conn);
-        while crate::libpq_helpers::rust_pq_is_busy(sconn.conn) == 0 {
+        while buffered_count < MAX_BUFFERED && crate::libpq_helpers::rust_pq_is_busy(sconn.conn) == 0 {
             let buffered = crate::libpq_helpers::rust_pq_get_result(sconn.conn);
             if buffered.is_null() {
                 complete = true;
                 break;
             }
-            drain_count += 1;
+            buffered_count += 1;
             crate::libpq_helpers::rust_pq_clear(buffered);
             crate::libpq_helpers::rust_pq_consume_input(sconn.conn);
         }
@@ -81,15 +85,16 @@ unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_nam
             if drain.is_null() {
                 break;
             }
+            // Read to the end: the connection is marked idle below, so no
+            // result (including the cancellation error) may be left behind.
             drain_count += 1;
             crate::libpq_helpers::rust_pq_clear(drain);
-            if drain_count > 1000 {
+            if drain_count == 1000 {
                 log_info_lazy!(
                     "{}: drain after cancel exceeded 1000 on {:p}",
                     op_name,
                     stmt.streaming_conn
                 );
-                break;
             }
         }
         if drain_count > 0 {

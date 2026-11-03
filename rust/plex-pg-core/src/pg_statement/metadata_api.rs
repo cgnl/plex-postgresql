@@ -23,62 +23,85 @@ fn is_aggregate_expression_name(col: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
-/// True when `col` is the alias of an aggregate call in `sql`, e.g.
-/// `count(tags.id) AS tags_count`. SQLite reports no declared type for any
-/// expression column; only plain table columns have one. Without this, an
-/// aliased count got `dt_integer(8)` from its int8 OID and Plex's SOCI layer
-/// raised std::bad_cast (e.g. the library genre list returned HTTP 500).
+/// True when `col` is the alias of a select item that calls an aggregate,
+/// e.g. `count(tags.id) AS tags_count` or `coalesce(sum(x), 0) AS total`.
+/// SQLite reports no declared type for any expression column; only plain
+/// table columns have one. Without this, an aliased count got `dt_integer(8)`
+/// from its int8 OID and Plex's SOCI layer raised std::bad_cast (e.g. the
+/// library genre list returned HTTP 500). Works on bytes: SQL may hold
+/// non-ASCII literals.
 fn alias_is_aggregate(sql: &str, col: &str) -> bool {
-    const AGGREGATES: [&str; 8] = [
-        "count", "sum", "max", "min", "avg", "total", "group_concat", "string_agg",
-    ];
-    if col.is_empty() || sql.is_empty() {
+    let (sql, col) = (sql.as_bytes(), col.as_bytes());
+    if col.is_empty() {
         return false;
     }
-    let lower = sql.to_ascii_lowercase();
-    let col = col.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    for alias in [format!(" as {col}"), format!(" as \"{col}\""), format!(" as '{col}'")] {
-        let mut from = 0;
-        while let Some(found) = lower[from..].find(&alias) {
-            let at = from + found;
-            from = at + alias.len();
-            if bytes
-                .get(from)
-                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
-            {
-                continue;
-            }
-            let before = lower[..at].trim_end().as_bytes();
-            if before.last() != Some(&b')') {
-                continue;
-            }
-            let mut depth = 0usize;
-            let mut open = None;
-            for index in (0..before.len()).rev() {
-                match before[index] {
-                    b')' => depth += 1,
-                    b'(' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            open = Some(index);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let Some(open) = open else { continue };
-            let head = lower[..open].trim_end();
-            let name_start = head
-                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .map_or(0, |i| i + 1);
-            if AGGREGATES.contains(&&head[name_start..]) {
-                return true;
-            }
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for at in 1..sql.len().saturating_sub(1) {
+        let prev = sql[at - 1];
+        if !sql[at..at + 2].eq_ignore_ascii_case(b"as") || !(prev.is_ascii_whitespace() || prev == b')') {
+            continue;
+        }
+        let mut name = at + 2;
+        while sql.get(name).is_some_and(|b| b.is_ascii_whitespace()) {
+            name += 1;
+        }
+        if name == at + 2 && !matches!(sql.get(name), Some(b'"' | b'\'' | b'`')) {
+            continue; // `as` inside a longer word
+        }
+        let quote = sql.get(name).copied().filter(|b| matches!(b, b'"' | b'\'' | b'`'));
+        if quote.is_some() {
+            name += 1;
+        }
+        let Some(candidate) = sql.get(name..name + col.len()) else {
+            continue;
+        };
+        let after = sql.get(name + col.len()).copied();
+        let ends = match quote {
+            Some(q) => after == Some(q),
+            None => after.is_none_or(|b| !word(b)),
+        };
+        if candidate.eq_ignore_ascii_case(col) && ends && select_item_calls_aggregate(&sql[..at]) {
+            return true;
         }
     }
     false
+}
+
+/// Whether the select item ending at the end of `before` calls an aggregate.
+fn select_item_calls_aggregate(before: &[u8]) -> bool {
+    const AGGREGATES: [&[u8]; 8] = [
+        b"count", b"sum", b"max", b"min", b"avg", b"total", b"group_concat", b"string_agg",
+    ];
+    let mut depth = 0usize;
+    let mut start = 0;
+    for index in (0..before.len()).rev() {
+        match before[index] {
+            b')' => depth += 1,
+            b'(' if depth == 0 => {
+                start = index + 1;
+                break;
+            }
+            b'(' => depth -= 1,
+            b',' if depth == 0 => {
+                start = index + 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let item = &before[start..];
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    AGGREGATES.iter().any(|name| {
+        (0..item.len().saturating_sub(name.len() - 1)).any(|at| {
+            item[at..].len() >= name.len()
+                && item[at..at + name.len()].eq_ignore_ascii_case(name)
+                && (at == 0 || !word(item[at - 1]))
+                && item[at + name.len()..]
+                    .iter()
+                    .find(|b| !b.is_ascii_whitespace())
+                    == Some(&b'(')
+        })
+    })
 }
 
 pub fn rust_oid_to_sqlite_type(oid: u32) -> i32 {
@@ -152,6 +175,15 @@ mod alias_aggregate_tests {
         assert!(!alias_is_aggregate("select coalesce(a, b) as c from t", "c"));
         assert!(!alias_is_aggregate("select count(*) as n_total from t", "n"));
         assert!(!alias_is_aggregate("select x as tags_count from t", "tags_count"));
+        assert!(alias_is_aggregate("select coalesce(sum(x), 0) as total from t", "total"));
+        assert!(alias_is_aggregate("select count(*) filter (where a) as c from t", "c"));
+        assert!(alias_is_aggregate("select a, max(b)AS m from t", "m"));
+        assert!(alias_is_aggregate("select a,\n\tcount(b)\n\tAS n from t", "n"));
+        assert!(!alias_is_aggregate("select count(a) as n, b as c from t", "c"));
+        // Literals are not parsed; non-ASCII text must simply not panic.
+        let _ = alias_is_aggregate("select 'émax(a) as c', b as c from t", "c");
+        let _ = alias_is_aggregate("select é as é from t", "é");
+        assert!(!alias_is_aggregate("select counter(a) as c from t", "c"));
     }
 }
 

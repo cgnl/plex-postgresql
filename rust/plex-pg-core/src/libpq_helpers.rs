@@ -22,10 +22,6 @@ pub const PGRES_TUPLES_OK: c_int = 2;
 pub const PGRES_PIPELINE_SYNC: c_int = 10;
 
 extern "C" {
-    // Pipeline mode (libpq >= 14): queue several commands per round trip.
-    fn PQenterPipelineMode(conn: *mut PGconn) -> c_int;
-    fn PQexitPipelineMode(conn: *mut PGconn) -> c_int;
-    fn PQpipelineSync(conn: *mut PGconn) -> c_int;
     fn PQsendPrepare(
         conn: *mut PGconn,
         stmt_name: *const c_char,
@@ -34,6 +30,9 @@ extern "C" {
         param_types: *const Oid,
     ) -> c_int;
     fn PQsendDescribePrepared(conn: *mut PGconn, stmt_name: *const c_char) -> c_int;
+    fn PQftype(res: *const PGresult, col: c_int) -> Oid;
+    fn PQftable(res: *const PGresult, col: c_int) -> Oid;
+    fn PQfname(res: *const PGresult, col: c_int) -> *const c_char;
     // Building one compact multi-row result from single-row results.
     fn PQcopyResult(src: *const PGresult, flags: c_int) -> *mut PGresult;
     fn PQsetvalue(res: *mut PGresult, tup_num: c_int, field_num: c_int, value: *mut c_char, len: c_int) -> c_int;
@@ -217,12 +216,49 @@ pub extern "C" fn rust_pq_reset(conn: *mut PGconn) {
     unsafe { PQreset(conn) }
 }
 
+/// Waits between attempts when the server has no free connection slots
+/// (about 3 s in total).
+const CONNECTION_SLOT_RETRY_MS: [u64; 6] = [50, 100, 200, 400, 800, 1500];
+
+/// True when PostgreSQL refused the connection for lack of slots
+/// (SQLSTATE 53300: "too many clients" / "remaining connection slots").
+fn refused_for_lack_of_slots(conn: *mut PGconn) -> bool {
+    if conn.is_null() {
+        return false;
+    }
+    let message = unsafe { PQerrorMessage(conn) };
+    if message.is_null() {
+        return false;
+    }
+    let message = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy();
+    message.contains("too many clients") || message.contains("remaining connection slots")
+}
+
+/// Connect, waiting briefly while the server is out of connection slots.
+/// Every Plex process (the server and each scanner, matcher and analysis job)
+/// opens its own connections, so bursts of jobs can momentarily exceed
+/// `max_connections`; a short wait lets finished jobs release theirs instead
+/// of failing the job.
 #[no_mangle]
 pub extern "C" fn rust_pq_connectdb(conninfo: *const c_char) -> *mut PGconn {
     if conninfo.is_null() {
         return std::ptr::null_mut();
     }
-    unsafe { PQconnectdb(conninfo) }
+    let mut conn = unsafe { PQconnectdb(conninfo) };
+    for wait in CONNECTION_SLOT_RETRY_MS {
+        if unsafe { PQstatus(conn) } == 0 || !refused_for_lack_of_slots(conn) {
+            break;
+        }
+        unsafe { PQfinish(conn) };
+        std::thread::sleep(std::time::Duration::from_millis(wait));
+        conn = unsafe { PQconnectdb(conninfo) };
+    }
+    if !conn.is_null() && unsafe { PQstatus(conn) } != 0 && refused_for_lack_of_slots(conn) {
+        log_info_lazy!(
+            "PostgreSQL has no free connection slots (max_connections reached); raise max_connections or lower PLEX_PG_POOL_SIZE"
+        );
+    }
+    conn
 }
 
 #[no_mangle]
@@ -684,16 +720,52 @@ pub extern "C" fn rust_pg_align_idle_timeout_with_server(
 // Crate-internal pipeline helpers (not exported, so the C FFI header is unchanged).
 // Callers must pass a live connection they hold exclusively.
 
+/// Pipeline mode arrived in libpq 14. It is looked up at run time so the shim
+/// still links and loads against an older libpq, which then just takes the
+/// separate-round-trip paths.
+struct PipelineApi {
+    enter: unsafe extern "C" fn(*mut PGconn) -> c_int,
+    exit: unsafe extern "C" fn(*mut PGconn) -> c_int,
+    sync: unsafe extern "C" fn(*mut PGconn) -> c_int,
+}
+
+fn pipeline_api() -> Option<&'static PipelineApi> {
+    static API: std::sync::OnceLock<Option<PipelineApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let symbol = |name: &[u8]| libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const c_char);
+        let (enter, exit, sync) = (
+            symbol(b"PQenterPipelineMode\0"),
+            symbol(b"PQexitPipelineMode\0"),
+            symbol(b"PQpipelineSync\0"),
+        );
+        if enter.is_null() || exit.is_null() || sync.is_null() {
+            return None;
+        }
+        Some(PipelineApi {
+            enter: std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(*mut PGconn) -> c_int>(enter),
+            exit: std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(*mut PGconn) -> c_int>(exit),
+            sync: std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(*mut PGconn) -> c_int>(sync),
+        })
+    })
+    .as_ref()
+}
+
 pub(crate) unsafe fn pq_enter_pipeline_mode(conn: *mut PGconn) -> bool {
-    !conn.is_null() && PQenterPipelineMode(conn) == 1
+    !conn.is_null() && pipeline_api().is_some_and(|api| (api.enter)(conn) == 1)
 }
 
 pub(crate) unsafe fn pq_exit_pipeline_mode(conn: *mut PGconn) -> bool {
-    !conn.is_null() && PQexitPipelineMode(conn) == 1
+    !conn.is_null() && pipeline_api().is_some_and(|api| (api.exit)(conn) == 1)
 }
 
 pub(crate) unsafe fn pq_pipeline_sync(conn: *mut PGconn) -> bool {
-    !conn.is_null() && PQpipelineSync(conn) == 1
+    !conn.is_null() && pipeline_api().is_some_and(|api| (api.sync)(conn) == 1)
+}
+
+pub(crate) unsafe fn pq_field_matches(a: *const PGresult, b: *const PGresult, col: c_int) -> bool {
+    PQftype(a, col) == PQftype(b, col)
+        && PQftable(a, col) == PQftable(b, col)
+        && std::ffi::CStr::from_ptr(PQfname(a, col)) == std::ffi::CStr::from_ptr(PQfname(b, col))
 }
 
 pub(crate) unsafe fn pq_send_prepare(

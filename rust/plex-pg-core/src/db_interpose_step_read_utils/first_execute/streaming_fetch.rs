@@ -65,7 +65,7 @@ pub(super) unsafe fn streaming_fetch_result(
         s.current_row = 0;
         s.num_rows = 1;
         s.num_cols = crate::libpq_helpers::rust_pq_nfields(first_res);
-        crate::db_interpose_column::forget_descriptor_if_stale(s, s.num_cols);
+        crate::db_interpose_column::refresh_descriptor_if_stale(s, first_res);
         s.ensure_column_capacity(s.num_cols as usize);
         resolve_column_tables(pg_stmt, exec_conn);
         trace_play_queue_result(pg_stmt, first_res, "STREAM FIRST");

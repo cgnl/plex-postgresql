@@ -368,6 +368,61 @@ unsafe fn build_scrubbed_env(envp: *const *const c_char) -> Option<FilteredEnv> 
     })
 }
 
+/// True when `path` starts with `#!`. The shim is linked against Plex's musl
+/// libc, so it must never be preloaded into a script interpreter (the system
+/// bash/sh use glibc and crash in the dynamic linker). Native Linux installs
+/// replace "Plex Media Scanner" with a bash wrapper that preloads the shim
+/// itself; injecting the shim into that exec made every scanner job (metadata
+/// matching, media analysis) die before it started.
+/// Uses only open/read/close, so it is safe between fork and exec.
+unsafe fn is_script(path: *const c_char) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let fd = libc::open(path, libc::O_RDONLY | libc::O_CLOEXEC);
+    if fd < 0 {
+        return false;
+    }
+    let mut magic = [0u8; 2];
+    let read = libc::read(fd, magic.as_mut_ptr().cast(), magic.len());
+    libc::close(fd);
+    read == 2 && magic == *b"#!"
+}
+
+/// The environment unchanged except that the shim is removed from LD_PRELOAD.
+unsafe fn build_script_env(envp: *const *const c_char) -> Option<FilteredEnv> {
+    let entries = collect_env_entries(envp);
+    let mut rewritten = Vec::with_capacity(entries.len());
+    let mut removed = 0usize;
+    let mut modified = 0usize;
+    for entry in &entries {
+        if !is_ld_preload_entry(entry) {
+            rewritten.push(entry.clone());
+            continue;
+        }
+        match rewrite_env_entry(entry) {
+            Some(value) => {
+                if value.as_ref() != entry {
+                    modified += 1;
+                }
+                rewritten.push(value.into_owned());
+            }
+            None => removed += 1,
+        }
+    }
+    if removed == 0 && modified == 0 {
+        return None;
+    }
+    let (storage, ptrs) = build_cstring_env(&rewritten)?;
+    Some(FilteredEnv {
+        _storage: storage,
+        ptrs,
+        removed,
+        modified,
+        injected: 0,
+    })
+}
+
 unsafe fn build_kept_env(envp: *const *const c_char) -> Option<FilteredEnv> {
     let preload = capture_self_ld_preload()?;
     let entries = collect_env_entries(envp);
@@ -423,10 +478,12 @@ unsafe fn adjusted_env_for_process(
     }
 
     let label = process_label(path, argv);
-    let filtered = if should_keep_env_for_process(&label) {
-        build_kept_env(envp)
-    } else {
+    let filtered = if !should_keep_env_for_process(&label) {
         build_scrubbed_env(envp)
+    } else if is_script(path) {
+        build_script_env(envp)
+    } else {
+        build_kept_env(envp)
     }?;
 
     if filtered.changed() {
@@ -474,6 +531,8 @@ impl ExecEnvironment {
         let scanner = label
             .windows(b"Plex Media Scanner".len())
             .any(|window| window == b"Plex Media Scanner");
+        // A scanner wrapper script preloads the shim itself (see `is_script`).
+        let preload_shim = scanner && !is_script(executable);
         let mut source = source_envp(envp);
         let mut count = 0;
         let mut has_preload = false;
@@ -493,44 +552,43 @@ impl ExecEnvironment {
                 seen_preload = true;
             }
             let mut selected = entry;
-            if !scanner {
-                if key == b"LD_LIBRARY_PATH"
+            if !scanner
+                && (key == b"LD_LIBRARY_PATH"
                     || key.starts_with(b"PLEX_PG_")
                     || key == b"LANG"
                     || key == b"LANGUAGE"
                     || key == b"CHARSET"
-                    || key.starts_with(b"LC_")
-                {
-                    continue;
-                }
-                if key == b"LD_PRELOAD" {
-                    let mut length = b"LD_PRELOAD=".len();
-                    self.preload[..length].copy_from_slice(b"LD_PRELOAD=");
-                    for token in bytes[separator + 1..].split(|byte| *byte == b':') {
-                        if token.is_empty()
-                            || token
-                                .windows(SHIM_SO_TOKEN.len())
-                                .any(|window| window == SHIM_SO_TOKEN.as_bytes())
-                        {
-                            continue;
-                        }
-                        let extra = usize::from(length > b"LD_PRELOAD=".len());
-                        if length + extra + token.len() >= self.preload.len() {
-                            return Err(libc::E2BIG);
-                        }
-                        if extra != 0 {
-                            self.preload[length] = b':';
-                            length += 1;
-                        }
-                        self.preload[length..length + token.len()].copy_from_slice(token);
-                        length += token.len();
-                    }
-                    if length == b"LD_PRELOAD=".len() {
+                    || key.starts_with(b"LC_"))
+            {
+                continue;
+            }
+            if !preload_shim && key == b"LD_PRELOAD" {
+                let mut length = b"LD_PRELOAD=".len();
+                self.preload[..length].copy_from_slice(b"LD_PRELOAD=");
+                for token in bytes[separator + 1..].split(|byte| *byte == b':') {
+                    if token.is_empty()
+                        || token
+                            .windows(SHIM_SO_TOKEN.len())
+                            .any(|window| window == SHIM_SO_TOKEN.as_bytes())
+                    {
                         continue;
                     }
-                    self.preload[length] = 0;
-                    selected = self.preload.as_ptr().cast();
+                    let extra = usize::from(length > b"LD_PRELOAD=".len());
+                    if length + extra + token.len() >= self.preload.len() {
+                        return Err(libc::E2BIG);
+                    }
+                    if extra != 0 {
+                        self.preload[length] = b':';
+                        length += 1;
+                    }
+                    self.preload[length..length + token.len()].copy_from_slice(token);
+                    length += token.len();
                 }
+                if length == b"LD_PRELOAD=".len() {
+                    continue;
+                }
+                self.preload[length] = 0;
+                selected = self.preload.as_ptr().cast();
             }
             has_preload |= key == b"LD_PRELOAD";
             if count + 1 >= self.entries.len() {
@@ -539,7 +597,7 @@ impl ExecEnvironment {
             self.entries[count] = selected;
             count += 1;
         }
-        if scanner && !has_preload {
+        if preload_shim && !has_preload {
             if let Some(Some(entry)) = SCANNER_LD_PRELOAD_ENTRY.get() {
                 if count + 1 >= self.entries.len() {
                     return Err(libc::E2BIG);
@@ -751,6 +809,24 @@ mod tests {
         inject_ld_preload_entry, process_label_from_parts, rewrite_env_entry,
         should_keep_env_for_process,
     };
+
+    #[test]
+    fn scripts_are_recognised_by_shebang() {
+        let dir = std::env::temp_dir();
+        let script = dir.join(format!("plex-pg-script-{}", std::process::id()));
+        let binary = dir.join(format!("plex-pg-binary-{}", std::process::id()));
+        std::fs::write(&script, b"#!/bin/bash\nexec true\n").unwrap();
+        std::fs::write(&binary, b"\x7fELF\x02\x01").unwrap();
+        let path = |p: &std::path::Path| std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        unsafe {
+            assert!(super::is_script(path(&script).as_ptr()));
+            assert!(!super::is_script(path(&binary).as_ptr()));
+            assert!(!super::is_script(c"/nonexistent/plex-pg".as_ptr()));
+            assert!(!super::is_script(std::ptr::null()));
+        }
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_file(binary);
+    }
 
     #[test]
     fn keep_process_whitelist_is_narrow() {

@@ -343,7 +343,7 @@ pub(super) fn prepare_v2_internal_impl(
     let is_ddl = crate::pg_config::is_ddl_str(sql_str);
     if is_ddl {
         // Schema changes invalidate every cached result description.
-        crate::descriptor_cache::clear();
+        crate::descriptor_cache::note_ddl(sql_str.as_bytes());
     }
     let effective_pg_conn = if is_ddl && pg_conn.is_null() {
         crate::pg_client::rust_pg_find_connection(db)

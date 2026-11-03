@@ -55,6 +55,24 @@ pub(crate) unsafe fn spill_live_stream_locked(
     conn: *mut PgConnection,
     requester: *mut PgStmt,
 ) -> bool {
+    take_live_stream_locked(conn, requester, false)
+}
+
+/// ROLLBACK while a result streams: as in SQLite, the pending statement is
+/// aborted (its next step fails) and the rollback proceeds. The stream is
+/// cancelled rather than read, since its rows are discarded anyway.
+///
+/// # Safety
+/// As for `spill_live_stream_locked`.
+pub(crate) unsafe fn abort_live_stream_locked(conn: *mut PgConnection) -> bool {
+    take_live_stream_locked(conn, std::ptr::null_mut(), true)
+}
+
+unsafe fn take_live_stream_locked(
+    conn: *mut PgConnection,
+    requester: *mut PgStmt,
+    abort: bool,
+) -> bool {
     if conn.is_null() || (*conn).conn.is_null() {
         return false;
     }
@@ -99,8 +117,30 @@ pub(crate) unsafe fn spill_live_stream_locked(
     if !is_live_owner(s, conn, generation) {
         return false;
     }
-    read_ahead(s, conn);
+    if abort {
+        abort_stream(s, conn);
+    } else {
+        read_ahead(s, conn);
+    }
     true
+}
+
+unsafe fn abort_stream(s: &mut PgStmt, conn: *mut PgConnection) {
+    let pq = (*conn).conn;
+    let cancel = libpq_helpers::rust_pq_get_cancel(pq);
+    if !cancel.is_null() {
+        let mut errbuf = [0 as std::os::raw::c_char; 256];
+        libpq_helpers::rust_pq_cancel(cancel, errbuf.as_mut_ptr(), errbuf.len() as c_int);
+        libpq_helpers::rust_pq_free_cancel(cancel);
+    }
+    discard_stream(pq);
+    s.spilled_result = std::ptr::null_mut();
+    s.spill_installed = false;
+    s.spill_state = -1;
+    s.spill_error = Some(CString::new("abort due to ROLLBACK").unwrap_or_default());
+    s.streaming_conn = std::ptr::null_mut();
+    (*conn).streaming_active.store(0, Ordering::SeqCst);
+    log_info("STREAM: aborted a streaming statement for ROLLBACK");
 }
 
 fn is_live_owner(s: &PgStmt, conn: *mut PgConnection, generation: u64) -> bool {

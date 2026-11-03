@@ -326,7 +326,7 @@ curl -s http://localhost:32400/library/sections | head -10
 ### Prerequisites
 - Linux x86_64 or ARM64 (aarch64)
 - Plex Media Server 1.40+ installed
-- PostgreSQL 15.x
+- PostgreSQL 15.x with `max_connections` of at least 200 (see [Performance Tuning](#performance-tuning))
 - Root access (sudo)
 
 ### Option 1: Pre-compiled ZIP (Recommended)
@@ -514,6 +514,15 @@ sudo systemctl start plexmediaserver
 export PLEX_PG_POOL_SIZE=100   # Default: 50
 export PLEX_PG_IDLE_TIMEOUT=300  # Seconds before idle connections are reaped (default: 300)
 ```
+
+Plex Media Server is not the only client: every metadata match and media
+analysis job runs a separate `Plex Media Scanner` process with its own
+connections (roughly 15–20 each, and Plex runs several at once). PostgreSQL's
+default `max_connections=100` is too low for that; use at least 200
+(`max_connections = 200` in `postgresql.conf`, then restart PostgreSQL). The
+bundled `docker-compose` files already set it. When the server runs out of
+slots the shim waits up to about 3 seconds for one to free up before failing
+the job.
 
 **Unix Socket (7% faster than TCP):**
 ```bash

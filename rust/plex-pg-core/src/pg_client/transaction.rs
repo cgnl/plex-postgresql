@@ -385,12 +385,18 @@ unsafe fn execute(conn: *mut PgConnection, sql: &str) -> Result<c_int, c_int> {
             "PostgreSQL transaction session unavailable; outcome may be unknown",
         ));
     }
-    // BEGIN/SAVEPOINT/RELEASE/COMMIT leave open SQLite cursors usable, so the
-    // stream is read ahead. A rollback aborts pending statements in SQLite
-    // too; keep refusing rather than serving rows the rollback discarded.
-    let rolls_back = matches!(control, Control::Rollback | Control::RollbackTo(_));
+    // Other transaction control leaves open SQLite cursors usable, so the
+    // stream is read ahead. ROLLBACK aborts pending statements in SQLite, so
+    // the streaming statement is aborted instead of serving rows the rollback
+    // discarded.
+    let rolls_back = matches!(control, Control::Rollback);
+    let ends_transaction = !matches!(control, Control::Begin | Control::Savepoint(_));
     if result_stream_live_locked(conn)
-        && (rolls_back || !crate::pg_statement::spill_live_stream_locked(conn, std::ptr::null_mut()))
+        && !(if rolls_back {
+            crate::pg_statement::abort_live_stream_locked(conn)
+        } else {
+            crate::pg_statement::spill_live_stream_locked(conn, std::ptr::null_mut())
+        })
     {
         return Err(set_error(
             conn,
@@ -485,6 +491,9 @@ unsafe fn execute(conn: *mut PgConnection, sql: &str) -> Result<c_int, c_int> {
                 state.savepoints.truncate(position + 1);
             }
         }
+    }
+    if ends_transaction {
+        crate::descriptor_cache::transaction_ended();
     }
     (*conn).last_error_code = 0;
     (*conn).last_error.fill(0);

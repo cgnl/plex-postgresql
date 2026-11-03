@@ -87,10 +87,20 @@ unsafe fn describe_pipelined(
     let mut round_ok = queued && synced;
     let mut error_recorded = false;
     let mut desc = ptr::null_mut();
-    for command in 0..3 {
+    if !round_ok {
+        // A send failed: libpq holds the reason; the results that were
+        // queued cannot be matched to commands, so just drain to the sync.
+        crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, ptr::null_mut());
+        error_recorded = true;
+    }
+    for command in 0..if round_ok { 3 } else { 0 } {
         let res = crate::libpq_helpers::rust_pq_get_result(pq);
         if res.is_null() {
             round_ok = false;
+            if !error_recorded {
+                crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, res);
+                error_recorded = true;
+            }
             break;
         }
         let status = crate::libpq_helpers::rust_pq_result_status(res);
@@ -112,13 +122,28 @@ unsafe fn describe_pipelined(
             trailing = crate::libpq_helpers::rust_pq_get_result(pq);
         }
     }
-    let sync = crate::libpq_helpers::rust_pq_get_result(pq);
-    if crate::libpq_helpers::rust_pq_result_status(sync) != crate::libpq_helpers::PGRES_PIPELINE_SYNC {
+    // Up to the sync marker (directly after the three commands; after a
+    // failed send, whatever was queued before it).
+    for _ in 0..8 {
+        let res = crate::libpq_helpers::rust_pq_get_result(pq);
+        if res.is_null() {
+            continue;
+        }
+        let status = crate::libpq_helpers::rust_pq_result_status(res);
+        crate::libpq_helpers::rust_pq_clear(res);
+        if status == crate::libpq_helpers::PGRES_PIPELINE_SYNC {
+            break;
+        }
         round_ok = false;
     }
-    crate::libpq_helpers::rust_pq_clear(sync);
     if !crate::libpq_helpers::pq_exit_pipeline_mode(pq) {
+        // Results are still pending (lost connection or a protocol surprise).
+        // Never leave the session in pipeline mode: start a fresh one.
         round_ok = false;
+        if !error_recorded {
+            crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, ptr::null_mut());
+        }
+        crate::libpq_helpers::rust_pq_reset(pq);
     }
     if !round_ok && !desc.is_null() {
         crate::libpq_helpers::rust_pq_clear(desc);
@@ -185,16 +210,29 @@ unsafe fn install_descriptor(pg_stmt: *mut PgStmt, desc: *mut PgResultLibpq) {
     }
 }
 
-/// Drop a cached description that an execution result contradicts (the
-/// schema changed underneath, e.g. a migration in another Plex process).
-pub(crate) fn forget_descriptor_if_stale(stmt: &PgStmt, result_columns: c_int) {
-    if stmt.descriptor.is_null() || stmt.pg_sql.is_null() {
+/// Replace a description that an execution result contradicts (the schema
+/// changed underneath, e.g. a migration in another Plex process): the
+/// statement's own copy, which column metadata prefers, and the cached one.
+pub(crate) fn refresh_descriptor_if_stale(stmt: &mut PgStmt, result: *const PgResultLibpq) {
+    if stmt.descriptor.is_null() || result.is_null() {
         return;
     }
-    if crate::libpq_helpers::rust_pq_nfields(stmt.descriptor) != result_columns {
+    let columns = crate::libpq_helpers::rust_pq_nfields(result);
+    let same = crate::libpq_helpers::rust_pq_nfields(stmt.descriptor) == columns
+        && (0..columns)
+            .all(|col| unsafe { crate::libpq_helpers::pq_field_matches(stmt.descriptor, result, col) });
+    if same {
+        return;
+    }
+    if !stmt.pg_sql.is_null() {
         let sql = unsafe { CStr::from_ptr(stmt.pg_sql) };
         crate::descriptor_cache::forget(sql, stmt.param_count);
     }
+    let fresh = unsafe {
+        crate::libpq_helpers::pq_copy_result(result, crate::libpq_helpers::PG_COPYRES_ATTRS)
+    };
+    crate::libpq_helpers::rust_pq_clear(stmt.descriptor);
+    stmt.descriptor = fresh;
 }
 
 pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
@@ -213,6 +251,7 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         (s.conn, CStr::from_ptr(s.pg_sql).to_owned(), s.param_count)
     };
     // Repeated statements reuse a cached description: no round trip.
+    let described_at = crate::descriptor_cache::generation();
     let cached = crate::descriptor_cache::lookup(&sql, param_count);
     if !cached.is_null() {
         unsafe { install_descriptor(pg_stmt, cached) };
@@ -259,7 +298,7 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         };
         if round_ok {
             drop(conn_guard);
-            crate::descriptor_cache::store(&sql, param_count, desc);
+            crate::descriptor_cache::store(&sql, param_count, desc, described_at);
             unsafe { install_descriptor(pg_stmt, desc) };
             return true;
         }

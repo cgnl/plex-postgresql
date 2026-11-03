@@ -27,7 +27,7 @@ pub(super) unsafe fn eager_fetch_result(
         crate::db_interpose_exec::pg_path::clear_pg_last_error(s.conn);
         s.num_rows = crate::libpq_helpers::rust_pq_ntuples(s.result);
         s.num_cols = crate::libpq_helpers::rust_pq_nfields(s.result);
-        crate::db_interpose_column::forget_descriptor_if_stale(s, s.num_cols);
+        crate::db_interpose_column::refresh_descriptor_if_stale(s, s.result);
         s.ensure_column_capacity(s.num_cols as usize);
         s.current_row = 0;
         s.result_conn = exec_conn;

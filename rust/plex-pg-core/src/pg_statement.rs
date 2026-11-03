@@ -66,7 +66,9 @@ use stmt_constants::{
 };
 pub use stmt_factory::rust_stmt_create;
 pub use stmt_lifecycle::{rust_stmt_clear_result, rust_stmt_free};
-pub(crate) use stream_spill::{release_deferred_spill_refs, spill_live_stream_locked};
+pub(crate) use stream_spill::{
+    abort_live_stream_locked, release_deferred_spill_refs, spill_live_stream_locked,
+};
 use stmt_support::{
     leak_enabled, stmt_cache_disabled, stmt_ref_ptr, stmt_unref_ptr, MAX_CACHED_STMTS_PER_THREAD,
 };
