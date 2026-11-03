@@ -44,7 +44,11 @@ class CompatibilityTests(unittest.TestCase):
                 {'tree': {'sha': 'base-tree'}}, {'sha': 'report-tree'},
                 {'object': {'sha': 'existing-report-commit'}},
                 {'tree': {'sha': tree}, 'parents': [{'sha': source}]},
-                {'html_url': 'https://github.com/owner/repo/pull/35'}]
+                {'html_url': 'https://github.com/owner/repo/pull/35', 'number': 35},
+                [{'number': 35, 'head': {'ref': 'automation/plex-report-new'}},
+                 {'number': 30, 'head': {'ref': 'automation/plex-report-old'}},
+                 {'number': 31, 'head': {'ref': 'feature/unrelated'}}],
+                {}, {}]
 
     def test_report_retry_reuses_exact_existing_branch(self):
         with patch.object(compatibility, 'github_api', side_effect=self.report_retry_responses()) as api:
@@ -52,7 +56,18 @@ class CompatibilityTests(unittest.TestCase):
                                           'https://github.com/owner/repo/actions/runs/12')
         self.assertTrue(url.endswith('/35'))
         self.assertFalse(any(call.args[0].endswith('/git/refs') for call in api.call_args_list))
-        self.assertEqual(api.call_args_list[-1].args[0], 'repos/owner/repo/pulls')
+        self.assertIn(('repos/owner/repo/pulls', 'POST'), [call.args[:2] for call in api.call_args_list])
+        # Only the older report is closed; the new one and unrelated PRs stay open.
+        self.assertEqual(api.call_args_list[-1].args, ('repos/owner/repo/pulls/30', 'PATCH', {'state': 'closed'}))
+        self.assertFalse(any('/31' in call.args[0] or '/35' in call.args[0].split('pull')[-1]
+                             for call in api.call_args_list if len(call.args) > 1 and call.args[1] == 'PATCH'))
+
+    def test_non_actionable_results_open_no_pull_request(self):
+        for category in ('insufficient-evidence', 'waiting-for-image', 'infrastructure-failed'):
+            with patch.object(compatibility, 'github_api') as api:
+                self.assertEqual(compatibility.report_pr('owner/repo', self.plan, category, None),
+                                 'recorded-in-ledger')
+            api.assert_not_called()
 
     def test_report_retry_rejects_changed_branch(self):
         with patch.object(compatibility, 'github_api', side_effect=self.report_retry_responses('other-tree')) as api:
