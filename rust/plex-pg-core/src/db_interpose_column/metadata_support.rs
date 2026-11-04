@@ -235,6 +235,15 @@ pub(crate) fn refresh_descriptor_if_stale(stmt: &mut PgStmt, result: *const PgRe
     stmt.descriptor = fresh;
 }
 
+fn session_looks_healthy(ec: &mut PgConnection) -> bool {
+    let _guard = unsafe { PthreadMutexGuard::lock(&mut ec.mutex as *mut _) };
+    if ec.conn.is_null() || ec.streaming_active.load(Ordering::SeqCst) != 0 {
+        return !ec.conn.is_null() && crate::libpq_helpers::rust_pq_status(ec.conn) == 0;
+    }
+    crate::libpq_helpers::rust_pq_consume_input(ec.conn);
+    crate::libpq_helpers::rust_pq_status(ec.conn) == 0
+}
+
 pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
     if pg_stmt.is_null() {
         return false;
@@ -250,13 +259,6 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         }
         (s.conn, CStr::from_ptr(s.pg_sql).to_owned(), s.param_count)
     };
-    // Repeated statements reuse a cached description: no round trip.
-    let described_at = crate::descriptor_cache::generation();
-    let cached = crate::descriptor_cache::lookup(&sql, param_count);
-    if !cached.is_null() {
-        unsafe { install_descriptor(pg_stmt, cached) };
-        return true;
-    }
     let conn_ref = unsafe { &*conn };
     let thread_conn = unsafe {
         if conn_ref.streaming_active.load(Ordering::SeqCst) != 0 {
@@ -271,6 +273,19 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         thread_conn
     };
     let ec = unsafe { &mut *exec_conn };
+    // Repeated statements reuse a cached description: no round trip. Only
+    // while the session is healthy: during an outage prepare must fail as
+    // before instead of publishing a statement that cannot run. Reading
+    // whatever already arrived is local and notices a server that closed the
+    // connection (restart, outage) without a round trip.
+    let described_at = crate::descriptor_cache::generation();
+    if session_looks_healthy(ec) {
+        let cached = crate::descriptor_cache::lookup(&sql, param_count);
+        if !cached.is_null() {
+            unsafe { install_descriptor(pg_stmt, cached) };
+            return true;
+        }
+    }
     // A backend lost since the pool handed out this connection only surfaces
     // once the first round trips fail. Mirror the step retry contract: let the
     // pool reset the session and run the pure-metadata round once more, so a
