@@ -16,7 +16,7 @@ The last fully certified release is [v1.3.23](https://github.com/cgnl/plex-postg
 
 ## Latest published release: [v1.3.24](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.24)
 
-Published on 3 November 2026. Fixes native Linux installation and configuration, far fewer PostgreSQL round trips, library deletion, emptying the trash, filter lists, and metadata matching and media analysis jobs. See [the changelog](CHANGELOG.md).
+Published on 4 November 2026. Fixes native Linux installation and configuration, far fewer PostgreSQL round trips, library deletion, emptying the trash, filter lists, and metadata matching and media analysis jobs. See [the changelog](CHANGELOG.md).
 
 ### Runtime architecture introduced in v1.2.0
 
