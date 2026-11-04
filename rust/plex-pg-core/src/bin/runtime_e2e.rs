@@ -399,7 +399,7 @@ fn run() -> Result<()> {
         &'static str,
         fn(&Api, &Db<'_>, &Db<'_>, &mut Client) -> Result<()>,
     );
-    let cases: [Case; 20] = [
+    let cases: [Case; 21] = [
         (
             "native_uuid_binding_ownership",
             |api, first, _, observer| {
@@ -1151,6 +1151,26 @@ fn run() -> Result<()> {
                         == 1,
                     "sqlite3_exec write did not persist",
                 )
+            },
+        ),
+        (
+            // Plex 1.43.5 migration 202609141200 records a preference this way;
+            // a failure aborted the migration on a fresh database.
+            "preferences_upsert_returning",
+            |api, first, _, observer| {
+                observer.batch_execute("CREATE TABLE runtime_e2e.preferences (id BIGSERIAL PRIMARY KEY, name TEXT UNIQUE, value TEXT)").map_err(|e| e.to_string())?;
+                for value in ["first", "second"] {
+                    let stmt = first.prepare("INSERT INTO preferences (`name`,`value`) VALUES (:U1,:U2) ON CONFLICT(`name`) DO UPDATE SET `value`=excluded.`value` RETURNING `id`")?;
+                    let name = CString::new("migration_pref").unwrap();
+                    let text = CString::new(value).unwrap();
+                    api.check(first.handle, unsafe { (api.bind_text)(stmt.handle, 1, name.as_ptr(), -1, None) }, 0, "bind preference name")?;
+                    api.check(first.handle, unsafe { (api.bind_text)(stmt.handle, 2, text.as_ptr(), -1, None) }, 0, "bind preference value")?;
+                    require(unsafe { (api.column_count)(stmt.handle) } == 1, "RETURNING column missing before step")?;
+                    api.check(first.handle, unsafe { (api.step)(stmt.handle) }, ROW, "preference upsert")?;
+                    require(unsafe { (api.column_int)(stmt.handle, 0) } == 1, "RETURNING id")?;
+                    api.check(first.handle, unsafe { (api.step)(stmt.handle) }, DONE, "preference upsert end")?;
+                }
+                Ok(())
             },
         ),
     ];

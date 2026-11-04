@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.25] - 2026-11-04
+
+### Fixed
+- Plex 1.43.5 starts on a fresh PostgreSQL database again (and upgrades to it). Its migration `202609141200` records a preference with `INSERT ... ON CONFLICT ... RETURNING id`; the shim executed such writes but returned no row, so the migration aborted with `std::exception` and Plex exited. Writes that Plex itself wrote with `RETURNING` now return their rows, as in SQLite.
+
+### Tested
+- Fresh start of Plex 1.43.5.11079 on an empty PostgreSQL database: all migrations complete and the server answers. Regression on an existing library (endpoints, emptying the trash, metadata matching). New runtime E2E case for `INSERT ... ON CONFLICT ... RETURNING`.
+
 ## [1.3.24] - 2026-11-04
 
 ### Fixed

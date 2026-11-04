@@ -247,6 +247,24 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
         crate::db_interpose_exec::pg_path::copy_pg_outcome(handle_conn, exec_conn);
         stmt.write_executed = 1;
         if !res.is_null() {
+            // A statement Plex wrote with RETURNING produces rows, as in
+            // SQLite (the shim's own `RETURNING id` suffix is not in stmt.sql).
+            if crate::libpq_helpers::rust_pq_result_status(res) == PGRES_TUPLES_OK
+                && crate::libpq_helpers::rust_pq_ntuples(res) > 0
+                && contains_icase_bytes(cstr_bytes(stmt.sql), b"RETURNING")
+            {
+                if !stmt.result.is_null() {
+                    crate::libpq_helpers::rust_pq_clear(stmt.result);
+                }
+                stmt.result = res;
+                stmt.num_rows = crate::libpq_helpers::rust_pq_ntuples(res);
+                stmt.num_cols = crate::libpq_helpers::rust_pq_nfields(res);
+                stmt.ensure_column_capacity(stmt.num_cols as usize);
+                stmt.current_row = 0;
+                stmt.result_conn = exec_conn;
+                stmt.metadata_only_result = 0;
+                return SQLITE_ROW;
+            }
             crate::libpq_helpers::rust_pq_clear(res);
         }
         STEP_RESULT_DONE

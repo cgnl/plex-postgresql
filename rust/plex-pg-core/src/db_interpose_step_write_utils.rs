@@ -33,6 +33,7 @@ use support::{
 pub use write_exec::rust_step_write_execute_and_finalize;
 
 const SQLITE_DONE: c_int = 101;
+const SQLITE_ROW: c_int = 100;
 const SQLITE_ERROR: c_int = 1;
 const STEP_RESULT_DONE: c_int = SQLITE_DONE;
 const STEP_RESULT_ERROR: c_int = SQLITE_ERROR;

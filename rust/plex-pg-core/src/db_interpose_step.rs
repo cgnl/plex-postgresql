@@ -378,11 +378,14 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                 return first_rc;
             } else if stmt_is_pg == 1 {
                 if write_executed {
-                    return if (*pg_stmt).write_executed < 0 {
-                        SQLITE_ERROR
-                    } else {
-                        SQLITE_DONE
-                    };
+                    if (*pg_stmt).write_executed < 0 {
+                        return SQLITE_ERROR;
+                    }
+                    // Remaining RETURNING rows of an executed write.
+                    if !(*pg_stmt).result.is_null() {
+                        return crate::db_interpose_step_read_utils::rust_step_read_eager_next(pg_stmt);
+                    }
+                    return SQLITE_DONE;
                 }
 
                 crate::db_interpose_step_write_utils::rust_step_write_log_debug_context(
@@ -422,6 +425,9 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                         param_values.as_ptr(),
                         &mut write_conn_error,
                     );
+                if write_rc == STEP_RESULT_ROW {
+                    return SQLITE_ROW;
+                }
                 if write_rc == STEP_RESULT_ERROR {
                     if write_conn_error != 0 {
                         note_pg_conn_error();
