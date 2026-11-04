@@ -62,14 +62,15 @@ unsafe fn describe_round_trips(
 /// PostgreSQL server on another host (issue #59).
 ///
 /// Returns None when pipeline mode cannot be entered (nothing was sent), so the
-/// caller can fall back to separate round trips.
+/// caller can fall back to separate round trips. The flag reports that the
+/// session had to be reset (a lost connection), so the caller retries once.
 unsafe fn describe_pipelined(
     conn: *mut PgConnection,
     exec_conn: *mut PgConnection,
     name: &CStr,
     sql: &CStr,
     param_count: c_int,
-) -> Option<(*mut PgResultLibpq, bool)> {
+) -> Option<(*mut PgResultLibpq, bool, bool)> {
     let pq = (*exec_conn).conn;
     if !crate::libpq_helpers::pq_enter_pipeline_mode(pq) {
         return None;
@@ -136,6 +137,7 @@ unsafe fn describe_pipelined(
         }
         round_ok = false;
     }
+    let mut reset = false;
     if !crate::libpq_helpers::pq_exit_pipeline_mode(pq) {
         // Results are still pending (lost connection or a protocol surprise).
         // Never leave the session in pipeline mode: start a fresh one.
@@ -144,12 +146,13 @@ unsafe fn describe_pipelined(
             crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, ptr::null_mut());
         }
         crate::libpq_helpers::rust_pq_reset(pq);
+        reset = true;
     }
     if !round_ok && !desc.is_null() {
         crate::libpq_helpers::rust_pq_clear(desc);
         desc = ptr::null_mut();
     }
-    Some((desc, round_ok))
+    Some((desc, round_ok, reset))
 }
 
 pub(crate) fn mask_collection_metadata_type(
@@ -305,10 +308,14 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         ))
         .expect("generated descriptor name cannot contain NUL");
         crate::libpq_helpers::rust_pq_set_nonblocking(ec.conn, 0);
-        let (desc, round_ok) = unsafe {
+        let (desc, round_ok, reset) = unsafe {
             match describe_pipelined(conn, exec_conn, &descriptor_name, &sql, param_count) {
                 Some(outcome) => outcome,
-                None => describe_round_trips(conn, exec_conn, &descriptor_name, &sql, param_count),
+                None => {
+                    let (desc, ok) =
+                        describe_round_trips(conn, exec_conn, &descriptor_name, &sql, param_count);
+                    (desc, ok, false)
+                }
             }
         };
         if round_ok {
@@ -322,7 +329,7 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         // No-op while the session is healthy; resets a broken one and reports
         // whether recovery was attempted, gating the single retry.
         let recovered = crate::pg_client::rust_pool_check_health(exec_conn.cast());
-        if attempt == 0 && recovered != 0 {
+        if attempt == 0 && (recovered != 0 || reset) {
             continue;
         }
         return false;
