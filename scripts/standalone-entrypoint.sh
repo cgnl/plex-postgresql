@@ -79,66 +79,8 @@ wait_for_postgres() {
 
 # Initialize PG schema
 init_schema() {
-    local schema="$PG_SCHEMA"
-    local schema_file="$SHIM_DIR/plex_schema.sql"
-    local compat_file="$SHIM_DIR/pg_compat_functions.sql"
-
-    migration_psql -c "CREATE SCHEMA IF NOT EXISTS $schema;" || return 1
-    migration_psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" || return 1
-
-    local table_count
-    table_count=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ') || return 1
-
-    if [ "$table_count" -gt "0" ] 2>/dev/null; then
-        echo "PostgreSQL schema '$schema' ready with $table_count tables"
-        # Load sqlite_column_types if missing (upgrade path)
-        local types_file="$SHIM_DIR/sqlite_column_types.sql"
-        if [ -f "$types_file" ]; then
-            local types_exists
-            types_exists=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema' AND table_name = 'sqlite_column_types';" 2>/dev/null | tr -d ' ') || return 1
-            if [ "$types_exists" = "0" ] 2>/dev/null; then
-                echo "Loading sqlite_column_types metadata..."
-                load_pg_schema_file "$types_file" || return 1
-            fi
-        fi
-    else
-        echo "PostgreSQL schema '$schema' is empty, loading schema..."
-        if [ -f "$schema_file" ]; then
-            echo "Loading schema from $schema_file..."
-            if load_pg_schema_file "$schema_file" "$SHIM_DIR/sqlite_column_types.sql" 2>&1; then
-                local new_count
-                new_count=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ') || return 1
-                echo "Schema loaded successfully! $new_count tables created."
-
-                # Keep the dump's history for a fresh PostgreSQL bootstrap.
-                # A source import replaces it atomically with the native library's
-                # actual migration rows before synchronizing the SQLite shadows.
-                local migration_count
-                migration_count=$(migration_psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ') || return 1
-                echo "schema_migrations has $migration_count entries (bootstrap history; source import replaces it)"
-
-
-            else
-                echo "ERROR: Schema load failed" >&2
-                return 1
-            fi
-        else
-            echo "ERROR: Schema file $schema_file not found!" >&2
-            return 1
-        fi
-        # Load sqlite_column_types after fresh schema
-
-    fi
-
-    validate_pg_schema_file "$schema_file" || return 1
-    apply_sqlite_schema_parity_upgrades "$SHIM_DIR/sqlite_constraint_parity_upgrade.sql" \
-        "$SHIM_DIR/fts_view_parity_upgrade.sql" || return 1
-
-    # Ensure PostgreSQL compatibility helper functions exist.
-    if [ -f "$compat_file" ]; then
-        migration_psql -f "$compat_file" || return 1
-    fi
-    migration_psql -q -c "SELECT version FROM $schema.schema_migrations LIMIT 0; SELECT id FROM $schema.metadata_items LIMIT 0; SELECT id FROM $schema.accounts LIMIT 0; SELECT id FROM $schema.blobs LIMIT 0;" >/dev/null || return 1
+    # Shared with the native installers (scripts/migrate_lib.sh).
+    init_pg_schema "$SHIM_DIR"
 }
 
 # Sync schema_migrations from PostgreSQL to SQLite

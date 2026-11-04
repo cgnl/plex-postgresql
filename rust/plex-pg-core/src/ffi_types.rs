@@ -42,6 +42,9 @@ pub struct PgConnection {
     pub last_error: [c_char; LAST_ERROR_LEN],
     pub last_error_code: c_int,
     pub streaming_active: AtomicI32,
+    /// Incremented whenever a statement starts streaming on this connection;
+    /// identifies the one statement whose stream is live (zeroed by calloc).
+    pub stream_generation: std::sync::atomic::AtomicU64,
 }
 
 // PgStmt is no longer repr(C) — all access is from Rust.
@@ -79,6 +82,20 @@ pub struct PgStmt {
     pub num_col_names: c_int,
     pub streaming_mode: c_int,
     pub streaming_conn: *mut PgConnection,
+    /// Generation of the connection's stream this statement started.
+    pub stream_generation: u64,
+    /// Remaining rows of this statement's stream, read ahead into one compact
+    /// result because a nested statement needed the same PostgreSQL session
+    /// (SQLite allows several open cursors per connection; a libpq connection
+    /// streams only one). Null when the stream had no rows left.
+    pub spilled_result: *mut PGresult,
+    /// True once `spilled_result` has become `result` and rows are served by
+    /// advancing `current_row`.
+    pub spill_installed: bool,
+    /// 0 = not spilled, 1 = spilled through completion, -1 = stream failed.
+    pub spill_state: c_int,
+    /// Error reported once the spilled rows are exhausted (spill_state == -1).
+    pub spill_error: Option<std::ffi::CString>,
     // Parameter arrays — sized to param_count via ensure_param_capacity()
     pub param_values: Vec<*mut c_char>,
     pub param_lengths: Vec<c_int>,
@@ -96,6 +113,26 @@ pub struct PgStmt {
     pub cached_row: c_int,
     pub col_table_names: Vec<*mut c_char>,
     pub col_tables_resolved: c_int,
+}
+
+impl PgStmt {
+    /// Drop any read-ahead rows and spill state.
+    pub fn release_spill(&mut self) {
+        // Once installed, the spilled rows are `result` and freed with it.
+        if !self.spill_installed && !self.spilled_result.is_null() {
+            crate::libpq_helpers::rust_pq_clear(self.spilled_result);
+        }
+        self.spilled_result = std::ptr::null_mut();
+        self.spill_installed = false;
+        self.spill_state = 0;
+        self.spill_error = None;
+    }
+}
+
+impl Drop for PgStmt {
+    fn drop(&mut self) {
+        self.release_spill();
+    }
 }
 
 impl Default for PgStmt {
@@ -137,6 +174,11 @@ impl PgStmt {
             num_col_names: 0,
             streaming_mode: 0,
             streaming_conn: std::ptr::null_mut(),
+            stream_generation: 0,
+            spilled_result: std::ptr::null_mut(),
+            spill_installed: false,
+            spill_state: 0,
+            spill_error: None,
             param_values: Vec::new(),
             param_lengths: Vec::new(),
             param_formats: Vec::new(),

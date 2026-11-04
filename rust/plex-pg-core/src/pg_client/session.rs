@@ -126,7 +126,10 @@ pub(super) fn apply_session_settings(pg_conn: *mut PGconn, schema: &str, dealloc
         let _ = exec_command(pg_conn, "DEALLOCATE ALL");
     }
 
-    if !exec_command(pg_conn, "SET statement_timeout = '60s'") {
+    // One session-wide timeout, set once per connection. Reads used to re-send
+    // this before every query (an extra round trip each, issue #59), which in
+    // effect left every connection at this value after its first read anyway.
+    if !exec_command(pg_conn, crate::db_interpose_conn_utils::STATEMENT_TIMEOUT_SQL) {
         log_error("Failed to set statement_timeout");
     }
 }

@@ -326,7 +326,7 @@ curl -s http://localhost:32400/library/sections | head -10
 ### Prerequisites
 - Linux x86_64 or ARM64 (aarch64)
 - Plex Media Server 1.40+ installed
-- PostgreSQL 15.x
+- PostgreSQL 15.x with `max_connections` of at least 200 (see [Performance Tuning](#performance-tuning))
 - Root access (sudo)
 
 ### Option 1: Pre-compiled ZIP (Recommended)
@@ -358,7 +358,51 @@ sudo -u postgres createdb -O plex plex
 sudo -u postgres psql -c "ALTER USER plex PASSWORD 'yourpassword';"
 ```
 
-**2. Download and Install**
+The installer needs `psql` and `python3`; `sqlite3` is optional (the Plex
+SQLite binary that ships with Plex is used when it is missing):
+
+```bash
+sudo apt install postgresql-client python3
+```
+
+**2. Configure Connection**
+
+The installer migrates your library into PostgreSQL, so configure the
+connection *before* running it. Create `/etc/plex-postgresql.conf`, readable by
+the Plex service group only because it holds the password:
+
+```bash
+sudo install -m 640 -g plex /dev/null /etc/plex-postgresql.conf
+sudo nano /etc/plex-postgresql.conf
+```
+
+```bash
+# PostgreSQL connection (values are taken literally; quote with '...' if needed)
+PLEX_PG_HOST=localhost
+PLEX_PG_PORT=5432
+PLEX_PG_DATABASE=plex
+PLEX_PG_USER=plex
+PLEX_PG_PASSWORD='yourpassword'
+PLEX_PG_SCHEMA=plex
+```
+
+Both the installer and the Plex wrappers read this file. Environment variables
+still win (for example `Environment=` lines added with `systemctl edit
+plexmediaserver`). `PLEX_PG_*` lines in `/etc/default/plexmediaserver` are also
+honoured, but the packaged systemd unit never reads that file itself, so prefer
+the dedicated file.
+
+You can also skip the file and pass the settings on the installer's command
+line; the installer then writes them to `/etc/plex-postgresql.conf` for you:
+
+```bash
+sudo PLEX_PG_HOST=db.lan PLEX_PG_PASSWORD='yourpassword' ./scripts/install_wrappers_linux.sh
+```
+
+Note that `export VAR=...` followed by `sudo ...` does **not** work: sudo drops
+exported variables.
+
+**3. Download and Install**
 
 ```bash
 # Choose a newer release that includes libs/x86_64 and libs/aarch64.
@@ -377,33 +421,27 @@ sudo ./scripts/install_wrappers_linux.sh
 
 **What the installer does:**
 - ✅ Checks the Plex installation and library compatibility before replacing binaries
+- ✅ Checks the tools and the PostgreSQL connection before touching your library
+- ✅ Creates the PostgreSQL schema
 - ✅ Installs the shim and runtime libraries matching your CPU
 - ✅ Backs up original binaries
-- ✅ Migrates SQLite to PostgreSQL
+- ✅ Migrates SQLite to PostgreSQL (with progress output)
 - ✅ Installs wrapper scripts to `/usr/lib/plexmediaserver/`
 - ✅ Wraps both `Plex Media Server` and `Plex Media Scanner`
+- ✅ Writes `/etc/plex-postgresql.conf` if it does not exist yet
 - ✅ No Plex source changes needed
 
-**3. Configure Connection**
+**Large libraries.** Before importing, the installer takes a private,
+verified snapshot of the SQLite library. Tunables (in the config file or on the
+sudo command line):
 
-Edit `/etc/default/plexmediaserver`:
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MIGRATION_SNAPSHOT_TIMEOUT` | 15 min per GiB, at least 1 h | Seconds allowed for the snapshot (explicit values up to 86400) |
+| `MIGRATION_INTEGRITY_CHECK` | `full` | `full` (per-table `integrity_check`), `quick` (`PRAGMA quick_check`, skips index verification) or `skip` (roughly halves the snapshot time) |
+| `MIGRATION_LIVE_SOURCE` | `0` | `1` snapshots the library while Plex keeps running (SQLite online backup); changes made after the snapshot are not migrated. Restart Plex when the installer finishes. |
 
-```bash
-sudo nano /etc/default/plexmediaserver
-```
-
-Add these lines:
-```bash
-# PostgreSQL connection
-PLEX_PG_HOST=localhost
-PLEX_PG_PORT=5432
-PLEX_PG_DATABASE=plex
-PLEX_PG_USER=plex
-PLEX_PG_PASSWORD=yourpassword
-PLEX_PG_SCHEMA=plex
-PLEX_PG_POOL_SIZE=50
-PLEX_PG_IDLE_TIMEOUT=300
-```
+On filesystems with reflinks (ZFS ≥ 2.2, btrfs, XFS) the copy is instant.
 
 **4. Start Plex**
 
@@ -429,11 +467,11 @@ cd plex-postgresql
 make linux
 sudo make install
 
-# Install wrappers
+# Configure the connection first (see Option 1 step 2), then install wrappers
 sudo systemctl stop plexmediaserver
 sudo ./scripts/install_wrappers_linux.sh
 
-# Configure and start (see Option 1 steps 3-4)
+# Start Plex (see Option 1 step 4)
 ```
 
 ### Verify Installation
@@ -476,6 +514,15 @@ sudo systemctl start plexmediaserver
 export PLEX_PG_POOL_SIZE=100   # Default: 50
 export PLEX_PG_IDLE_TIMEOUT=300  # Seconds before idle connections are reaped (default: 300)
 ```
+
+Plex Media Server is not the only client: every metadata match and media
+analysis job runs a separate `Plex Media Scanner` process with its own
+connections (roughly 15–20 each, and Plex runs several at once). PostgreSQL's
+default `max_connections=100` is too low for that; use at least 200
+(`max_connections = 200` in `postgresql.conf`, then restart PostgreSQL). The
+bundled `docker-compose` files already set it. When the server runs out of
+slots the shim waits up to about 3 seconds for one to free up before failing
+the job.
 
 **Unix Socket (7% faster than TCP):**
 ```bash

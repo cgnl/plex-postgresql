@@ -105,8 +105,6 @@ pub(crate) fn is_sqlite_passthrough_str(sql: &str) -> bool {
         || lower.starts_with("select load_extension")
         || lower.starts_with("select fts3_tokenizer")
         || lower.starts_with("select icu_load_collation")
-        || lower == "analyze"
-        || lower.starts_with("analyze ")
         || lower.contains("sqlite_stat1")
         || lower.contains("sqlite_stat4")
         || lower.contains("sqlite_master")
@@ -174,6 +172,9 @@ pub(crate) fn should_skip_sql_str(sql: &str) -> bool {
             return true;
         }
     }
+    if is_analyze_str(&lower) {
+        return true;
+    }
 
     // B) ANYWHERE patterns (case-insensitive substring match)
     const ANYWHERE_PATTERNS: &[&str] = &[
@@ -219,13 +220,29 @@ pub(crate) fn is_write_operation_str(sql: &str) -> bool {
         return true;
     }
     let lower = strip_leading_ws_and_sql_comments(sql).to_lowercase();
-    lower.starts_with("insert")
+    // ANALYZE is routed like a write so it gets a dummy shadow and becomes a
+    // PostgreSQL-side no-op (see is_analyze_str): preparing it on the shadow
+    // fails because the shadow lacks Plex's ICU collations.
+    is_analyze_str(&lower)
+        || lower.starts_with("insert")
         || lower.starts_with("update")
         || lower.starts_with("delete")
         || lower.starts_with("replace")
         || lower.starts_with("alter")
         || lower.starts_with("create")
         || lower.starts_with("drop")
+}
+
+/// Plex runs ANALYZE after deleting libraries and during database optimization.
+/// The library data lives in PostgreSQL (kept analyzed by autovacuum); running it
+/// on the data-less shadow is meaningless and fails on the ICU collations Plex
+/// registers only on its own handle, which aborted the whole request (issue #60).
+fn is_analyze_str(lower: &str) -> bool {
+    lower == "analyze"
+        || lower.starts_with("analyze ")
+        || lower.starts_with("analyze;")
+        || lower.starts_with("analyze\n")
+        || lower.starts_with("analyze\t")
 }
 
 /// Returns true if the SQL is a DDL operation (ALTER, CREATE, DROP).
@@ -731,9 +748,16 @@ mod tests {
     }
 
     #[test]
-    fn skip_analyze_normal_table_not_skipped() {
-        // ANALYZE on a regular table should NOT be skipped
-        assert!(!should_skip_sql_str("ANALYZE my_table"));
+    fn analyze_is_a_routed_pg_noop() {
+        // Statistics live in PostgreSQL; the shadow has no data and lacks
+        // Plex's ICU collations, so ANALYZE must never reach SQLite.
+        for sql in ["ANALYZE", "analyze", "ANALYZE my_table", "  analyze;", "ANALYZE\nmetadata_items"] {
+            assert!(should_skip_sql_str(sql), "{sql}");
+            assert!(is_write_operation_str(sql), "{sql}");
+            assert!(!is_sqlite_passthrough_str(sql), "{sql}");
+        }
+        assert!(!is_write_operation_str("SELECT analyze FROM t"));
+        assert!(!should_skip_sql_str("analyzed_items"));
     }
 
     #[test]

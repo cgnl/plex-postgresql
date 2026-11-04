@@ -105,6 +105,9 @@ pub(crate) fn exec_via_postgres(
         }
 
         let mut exec_sql = sql;
+        if crate::descriptor_cache::batch_contains_ddl(CStr::from_ptr(sql).to_bytes()) {
+            crate::descriptor_cache::note_ddl(CStr::from_ptr(sql).to_bytes());
+        }
         let blobs_rewrite = rewrite_blobs_schema_migrations(sql, pg.db_path.as_ptr());
         if !blobs_rewrite.is_null() {
             exec_sql = blobs_rewrite;

@@ -32,7 +32,14 @@ pub static mut SHIM_CREATE_UTF8_CODECVT_PTR: usize = 0;
 #[no_mangle]
 pub static mut SHIM_CREATE_SIMPLE_CODECVT_PTR: usize = 0;
 
-static FORCE_IGNORE_SIGCHLD: AtomicI32 = AtomicI32::new(1);
+// Plex reaps its children (scanner, transcoder, CrashUploader, plug-ins) on
+// SIGCHLD and tracks their resource usage until then. Ignoring SIGCHLD makes
+// the kernel reap them silently, so Plex keeps polling /proc/<pid>/stat of
+// long-gone jobs. The historical "unexpected async signal 17" abort came from
+// the shim's own worker thread accepting signals (it is now created with all
+// signals blocked), so the default leaves SIGCHLD to Plex.
+// PLEX_PG_FORCE_SIGCHLD_IGNORE=1 restores the old behaviour.
+static FORCE_IGNORE_SIGCHLD: AtomicI32 = AtomicI32::new(0);
 static INTERCEPT_SIGACTION: AtomicI32 = AtomicI32::new(1);
 static SIGNAL_LOG_ENABLED_CACHED: AtomicI32 = AtomicI32::new(-1);
 static EXCEPTION_CATCHER_ENABLED_CACHED: AtomicI32 = AtomicI32::new(-1);
@@ -314,6 +321,15 @@ pub extern "C" fn ensure_real_sqlite_loaded() {
     }
 }
 
+/// Base name of argv[0] from /proc/self/cmdline. Only argv[0] counts: the
+/// metadata matcher runs as `Plex Media Scanner ... --content-type=application/json`,
+/// and taking the text after the last `/` of the whole command line named it
+/// "json", so the shim skipped it and the matcher read the stale SQLite file.
+fn program_name(cmdline: &[u8]) -> &[u8] {
+    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or_default();
+    argv0.rsplit(|&b| b == b'/').next().unwrap_or_default()
+}
+
 unsafe extern "C" fn shim_init() {
     // Eagerly resolve all interposition hooks before any other thread can
     // call the interposed wrappers.  This eliminates data races on the
@@ -327,14 +343,7 @@ unsafe extern "C" fn shim_init() {
         || {
             // Process name filtering: skip non-server/scanner processes.
             if let Ok(cmdline) = std::fs::read("/proc/self/cmdline") {
-                let mut base = cmdline.as_slice();
-                if let Some(pos) = cmdline.iter().rposition(|&b| b == b'/') {
-                    base = &cmdline[pos + 1..];
-                }
-                if let Some(pos) = base.iter().position(|&b| b == 0) {
-                    base = &base[..pos];
-                }
-                let base_str = std::str::from_utf8(base).unwrap_or_default();
+                let base_str = std::str::from_utf8(program_name(&cmdline)).unwrap_or_default();
                 if !base_str.contains("Plex Media Server")
                     && !base_str.contains("Plex Media Scanner")
                 {
@@ -444,7 +453,7 @@ unsafe extern "C" fn shim_init() {
             } else {
                 let _ = libc::fprintf(
                     stderr_ptr(),
-                    b"[SHIM_INIT] SIGCHLD force-ignore disabled via PLEX_PG_DISABLE_SIGCHLD_IGNORE (PID %d)\n\0"
+                    b"[SHIM_INIT] SIGCHLD left to Plex (PLEX_PG_FORCE_SIGCHLD_IGNORE=1 ignores it) (PID %d)\n\0"
                         .as_ptr() as *const c_char,
                     libc::getpid(),
                 );
@@ -934,3 +943,17 @@ mod ld_preload_wrappers {
     // (AArch64 only) to correctly preserve the x8 SRET pointer while
     // redirecting ASCII charset requests to create_utf8_codecvt.
 } // mod ld_preload_wrappers
+
+#[cfg(test)]
+mod program_name_tests {
+    use super::program_name;
+
+    #[test]
+    fn only_argv0_names_the_process() {
+        let matcher: &[u8] = &[b"/usr/lib/plexmediaserver/Plex Media Scanner.original\0--match\0".as_slice(), b"--content-type=application/json\0"].concat();
+        assert_eq!(program_name(matcher), b"Plex Media Scanner.original");
+        assert_eq!(program_name(b"/usr/lib/plexmediaserver/Plex Media Server\0"), b"Plex Media Server");
+        assert_eq!(program_name(b"Plex Tuner Service\0--x=/a/b\0"), b"Plex Tuner Service");
+        assert_eq!(program_name(b""), b"");
+    }
+}

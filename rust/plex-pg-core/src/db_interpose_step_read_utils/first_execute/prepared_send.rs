@@ -91,12 +91,9 @@ pub(super) unsafe fn send_query_for_read(
     let scope = CString::new("STEP READ").unwrap();
     crate::db_interpose_conn_utils::rust_step_conn_cancel_and_drain(exec_conn, scope.as_ptr());
 
-    let timeout = CString::new(STATEMENT_TIMEOUT_SQL).unwrap();
+    // statement_timeout is a session setting applied when the connection is
+    // opened (pg_client::session); no per-query round trip here.
     let ec_ref = &*exec_conn;
-    let to_res = crate::libpq_helpers::rust_pq_exec(ec_ref.conn, timeout.as_ptr());
-    if !to_res.is_null() {
-        crate::libpq_helpers::rust_pq_clear(to_res);
-    }
 
     if !s.pg_sql.is_null() {
         pg_exception_note_query(s.pg_sql);

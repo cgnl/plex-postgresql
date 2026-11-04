@@ -45,6 +45,8 @@ pub mod db_interpose_txn_utils;
 pub mod db_interpose_value;
 pub mod db_interpose_value_helpers;
 pub mod dedup;
+pub mod derived_aliases;
+pub(crate) mod descriptor_cache;
 pub mod emit;
 pub mod env_utils;
 pub mod exception_what;

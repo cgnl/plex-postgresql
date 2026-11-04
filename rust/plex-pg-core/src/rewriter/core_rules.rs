@@ -1,6 +1,6 @@
 use sqlparser::ast::Statement;
 
-use crate::{dedup, functions, keywords, placeholders, quotes, types, upsert};
+use crate::{dedup, derived_aliases, functions, keywords, placeholders, quotes, types, upsert};
 
 use super::rules::{RewriteContext, RewriteRule};
 
@@ -9,6 +9,7 @@ struct PlaceholdersRule;
 struct FunctionsRule;
 struct TypesRule;
 struct KeywordsRule;
+struct DerivedAliasesRule;
 struct UpsertRule;
 struct QuotesRule;
 
@@ -62,6 +63,16 @@ impl RewriteRule for KeywordsRule {
     }
 }
 
+impl RewriteRule for DerivedAliasesRule {
+    fn name(&self) -> &'static str {
+        "derived_aliases"
+    }
+
+    fn apply(&self, stmt: &mut Statement, _ctx: &mut RewriteContext<'_>) {
+        derived_aliases::transform(stmt);
+    }
+}
+
 impl RewriteRule for UpsertRule {
     fn name(&self) -> &'static str {
         "upsert"
@@ -89,6 +100,7 @@ pub fn core_rules() -> Vec<Box<dyn RewriteRule>> {
         Box::new(FunctionsRule),
         Box::new(TypesRule),
         Box::new(KeywordsRule),
+        Box::new(DerivedAliasesRule),
         Box::new(UpsertRule),
         Box::new(QuotesRule),
     ]

@@ -56,6 +56,7 @@ pub(super) unsafe fn acquire_exec_connection(
 }
 
 pub(super) unsafe fn lock_exec_connection(
+    pg_stmt: *mut PgStmt,
     exec_conn: &mut *mut PgConnection,
     stmt_guard: &mut Option<StmtGuard>,
     pg_conn_error_out: *mut c_int,
@@ -72,7 +73,9 @@ pub(super) unsafe fn lock_exec_connection(
             }
             return Err(STEP_RESULT_ERROR);
         }
-        if crate::pg_client::transaction::result_stream_live_locked(*exec_conn) {
+        if crate::pg_client::transaction::result_stream_live_locked(*exec_conn)
+            && !crate::pg_statement::spill_live_stream_locked(*exec_conn, pg_stmt)
+        {
             crate::pg_client::transaction::set_error(
                 *exec_conn,
                 "Read cannot switch an active handle session while a result is streaming",

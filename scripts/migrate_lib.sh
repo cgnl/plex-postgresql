@@ -18,10 +18,212 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-MIGRATION_INTERACTIVE="${MIGRATION_INTERACTIVE:-1}"
+# MIGRATION_INTERACTIVE defaults to 1 where it is used, so a value from the
+# config file (loaded after sourcing this library) still applies.
 
 migration_psql() {
     psql -X -v ON_ERROR_STOP=1 "$@"
+}
+
+# The sqlite3 CLI is optional: every Plex install ships the same shell as
+# "Plex SQLite", which also knows Plex's ICU collations.
+migration_sqlite3() {
+    local cli
+    if cli=$(command -v sqlite3 2>/dev/null); then
+        "$cli" "$@"
+        return
+    fi
+    for cli in "${MIGRATION_PLEX_SQLITE:-}" \
+        "/usr/lib/plexmediaserver/Plex SQLite" \
+        "/Applications/Plex Media Server.app/Contents/MacOS/Plex SQLite"; do
+        if [[ -n "$cli" && -x "$cli" ]]; then
+            env -u LD_PRELOAD -u DYLD_INSERT_LIBRARIES "$cli" "$@"
+            return
+        fi
+    done
+    echo "ERROR: Neither the sqlite3 CLI nor Plex SQLite is available" >&2
+    return 127
+}
+
+# Load PLEX_PG_* and MIGRATION_* settings from the configuration files without
+# overriding anything already in the environment. Files are parsed, never
+# sourced, so values (passwords with '$' or quotes) are taken literally.
+# Precedence: environment > $PLEX_PG_CONFIG (/etc/plex-postgresql.conf) >
+# /etc/default/plexmediaserver. systemd never reads the latter for Plex, so it
+# is only honoured here for configurations written before the dedicated file.
+plex_pg_load_config() {
+    local file line key value
+    for file in "${PLEX_PG_CONFIG:-/etc/plex-postgresql.conf}" /etc/default/plexmediaserver; do
+        [[ -r "$file" && -f "$file" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?((PLEX_PG|MIGRATION)_[A-Z0-9_]+)=(.*)$ ]] || continue
+            key=${BASH_REMATCH[2]}
+            value=${BASH_REMATCH[4]%$'\r'}
+            if [[ "$value" =~ ^\'([^\']*)\'([[:space:]]+#.*)?[[:space:]]*$ ]]; then
+                value=${BASH_REMATCH[1]}
+            elif [[ "$value" =~ ^\"((\\.|[^\"\\])*)\"([[:space:]]+#.*)?[[:space:]]*$ ]]; then
+                # Same escapes the shell honours inside double quotes.
+                local raw=${BASH_REMATCH[1]} index char
+                value=""
+                for ((index = 0; index < ${#raw}; index++)); do
+                    char=${raw:index:1}
+                    if [[ "$char" == "\\" && "${raw:index+1:1}" == [\\\"\$\`] ]]; then
+                        index=$((index + 1))
+                        char=${raw:index:1}
+                    fi
+                    value+=$char
+                done
+            else
+                value=${value%%[[:space:]]#*}
+                value=${value%"${value##*[![:space:]]}"}
+            fi
+            [[ -z "${!key+set}" ]] || continue
+            printf -v "$key" '%s' "$value"
+            export "${key?}"
+        done < "$file"
+    done
+}
+
+# Write the settings used for migration to the dedicated config file so the
+# Plex wrappers connect to the same database. Readable by the Plex service
+# group only, because it holds the password.
+write_plex_pg_config() {
+    local file="${PLEX_PG_CONFIG:-/etc/plex-postgresql.conf}" group="${1:-plex}" temporary key
+    [[ -e "$file" ]] && return 0
+    for key in PLEX_PG_HOST PLEX_PG_PORT PLEX_PG_DATABASE PLEX_PG_USER PLEX_PG_PASSWORD PLEX_PG_SCHEMA; do
+        if [[ "${!key-}" == *"'"* ]]; then
+            echo "ERROR: $key contains a single quote; write $file by hand (\"...\" quoting)" >&2
+            return 1
+        fi
+    done
+    temporary=$(mktemp "$file.XXXXXX") || return 1
+    {
+        echo "# plex-postgresql connection settings, read by the Plex wrappers."
+        echo "# Values are taken literally; quote them with single quotes if needed."
+        for key in PLEX_PG_HOST PLEX_PG_PORT PLEX_PG_DATABASE PLEX_PG_USER PLEX_PG_PASSWORD PLEX_PG_SCHEMA; do
+            [[ -n "${!key+set}" ]] || continue
+            printf "%s='%s'\n" "$key" "${!key}"
+        done
+    } > "$temporary" || { rm -f "$temporary"; return 1; }
+    chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+    if chgrp "$group" "$temporary" 2>/dev/null; then
+        chmod 640 "$temporary"
+    else
+        echo -e "${YELLOW}WARNING: group '$group' not found; $file is readable by root only.${NC}" >&2
+        echo "  Make it readable for the Plex service user: chgrp <plex group> $file && chmod 640 $file" >&2
+    fi
+    mv "$temporary" "$file" || { rm -f "$temporary"; return 1; }
+    echo "Wrote PostgreSQL settings to $file"
+}
+
+# Fail fast, before any long SQLite snapshot, on everything a migration needs.
+migration_preflight() {
+    local missing=()
+    command -v psql >/dev/null 2>&1 || missing+=("psql (PostgreSQL client)")
+    if ! command -v python3 >/dev/null 2>&1; then
+        missing+=("python3")
+    elif ! python3 -c 'import sqlite3' >/dev/null 2>&1; then
+        missing+=("python3 sqlite3 module")
+    fi
+    if [[ -f "${SQLITE_DB:-}" ]] && ! migration_sqlite3 -version >/dev/null 2>&1; then
+        missing+=("sqlite3 (or the Plex SQLite binary)")
+    fi
+    if ((${#missing[@]})); then
+        echo -e "${RED}ERROR: Missing required tools: ${missing[*]}${NC}" >&2
+        echo "  Debian/Ubuntu: sudo apt install postgresql-client python3 sqlite3" >&2
+        return 1
+    fi
+    # Make the effective password explicit: write_plex_pg_config persists it,
+    # so the wrappers authenticate exactly like the migration did.
+    export PLEX_PG_PASSWORD="${PLEX_PG_PASSWORD-plex}"
+    export PGHOST="$PG_HOST" PGPORT="$PG_PORT" PGDATABASE="$PG_DATABASE" PGUSER="$PG_USER"
+    export PGPASSWORD="$PLEX_PG_PASSWORD"
+    local connect_error
+    if ! connect_error=$(psql -X -tAc 'SELECT 1' 2>&1 >/dev/null); then
+        echo -e "${RED}ERROR: Cannot connect to PostgreSQL at $PG_HOST:$PG_PORT (database $PG_DATABASE, user $PG_USER)${NC}" >&2
+        echo "  $connect_error" >&2
+        echo "  Set PLEX_PG_HOST/PORT/DATABASE/USER/PASSWORD in ${PLEX_PG_CONFIG:-/etc/plex-postgresql.conf}," >&2
+        echo "  or pass them explicitly: sudo PLEX_PG_HOST=... PLEX_PG_PASSWORD=... $0" >&2
+        return 1
+    fi
+}
+
+# Locate plex_schema.sql and its companion files (bundle schema/ dir or the
+# flat Docker install dir).
+resolve_schema_dir() {
+    local candidate migration_dir
+    migration_dir=$(dirname "${BASH_SOURCE[0]}")
+    for candidate in "${PLEX_PG_SCHEMA_DIR:-}" "${SHIM_DIR:-}/schema" "${SHIM_DIR:-}" \
+        "$migration_dir/../schema" "$migration_dir/schema"; do
+        if [[ -n "$candidate" && -f "$candidate/plex_schema.sql" ]]; then
+            (cd "$candidate" && pwd)
+            return 0
+        fi
+    done
+    echo "ERROR: plex_schema.sql not found" >&2
+    return 1
+}
+
+# Create (or validate and upgrade) the PostgreSQL schema from the files in $1.
+init_pg_schema() {
+    local schema_dir="$1"
+    validate_migration_schema || return 1
+    local schema="$PG_SCHEMA"
+    local schema_file="$schema_dir/plex_schema.sql"
+    local types_file="$schema_dir/sqlite_column_types.sql"
+    local compat_file="$schema_dir/pg_compat_functions.sql"
+
+    migration_psql -c "CREATE SCHEMA IF NOT EXISTS $schema;" || return 1
+    migration_psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" || return 1
+
+    local table_count
+    table_count=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ') || return 1
+
+    if [ "$table_count" -gt "0" ] 2>/dev/null; then
+        echo "PostgreSQL schema '$schema' ready with $table_count tables"
+        # Load sqlite_column_types if missing (upgrade path)
+        if [ -f "$types_file" ]; then
+            local types_exists
+            types_exists=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema' AND table_name = 'sqlite_column_types';" 2>/dev/null | tr -d ' ') || return 1
+            if [ "$types_exists" = "0" ] 2>/dev/null; then
+                echo "Loading sqlite_column_types metadata..."
+                load_pg_schema_file "$types_file" || return 1
+            fi
+        fi
+    else
+        echo "PostgreSQL schema '$schema' is empty, loading schema..."
+        if [ -f "$schema_file" ]; then
+            echo "Loading schema from $schema_file..."
+            if load_pg_schema_file "$schema_file" "$types_file" 2>&1; then
+                local new_count
+                new_count=$(migration_psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ') || return 1
+                echo "Schema loaded successfully! $new_count tables created."
+
+                # Keep the dump's history for a fresh PostgreSQL bootstrap.
+                # A source import replaces it atomically with the native library's
+                # actual migration rows before synchronizing the SQLite shadows.
+                local migration_count
+                migration_count=$(migration_psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ') || return 1
+                echo "schema_migrations has $migration_count entries (bootstrap history; source import replaces it)"
+            else
+                echo "ERROR: Schema load failed" >&2
+                return 1
+            fi
+        else
+            echo "ERROR: Schema file $schema_file not found!" >&2
+            return 1
+        fi
+    fi
+
+    validate_pg_schema_file "$schema_file" || return 1
+    apply_sqlite_schema_parity_upgrades "$schema_dir/sqlite_constraint_parity_upgrade.sql" \
+        "$schema_dir/fts_view_parity_upgrade.sql" || return 1
+
+    # Ensure PostgreSQL compatibility helper functions exist.
+    if [ -f "$compat_file" ]; then
+        migration_psql -f "$compat_file" || return 1
+    fi
+    migration_psql -q -c "SELECT version FROM $schema.schema_migrations LIMIT 0; SELECT id FROM $schema.metadata_items LIMIT 0; SELECT id FROM $schema.accounts LIMIT 0; SELECT id FROM $schema.blobs LIMIT 0;" >/dev/null || return 1
 }
 
 validate_migration_schema() {
@@ -600,9 +802,18 @@ PY
 
 # Read file bytes only from the mounted source. WAL recovery and SQLite backup
 # happen in a private writable copy, never on the original read-only mount.
+#
+# Tunables (environment or the config file):
+#   MIGRATION_SNAPSHOT_TIMEOUT  seconds; default scales with the source size
+#                               (15 minutes per GiB, at least one hour)
+#   MIGRATION_INTEGRITY_CHECK   full (default, per-table integrity_check),
+#                               quick (one PRAGMA quick_check) or skip
+#   MIGRATION_LIVE_SOURCE=1     snapshot a library Plex is still using through
+#                               SQLite's online backup; changes made after the
+#                               snapshot are not migrated
 snapshot_sqlite_sources() {
-    python3 - "$1" "$2" "${MIGRATION_SNAPSHOT_TIMEOUT:-3600}" <<'PY_SNAPSHOT'
-import hashlib
+    python3 - "$1" "$2" "${MIGRATION_SNAPSHOT_TIMEOUT:-}" "${MIGRATION_INTEGRITY_CHECK:-full}" "${MIGRATION_LIVE_SOURCE:-0}" <<'PY_SNAPSHOT'
+import fcntl
 import os
 import pathlib
 import sqlite3
@@ -611,19 +822,47 @@ import sys
 import tempfile
 import time
 
-source, destination, timeout = sys.argv[1:]
-seconds = float(timeout)
-if not 0 < seconds <= 86400:
-    raise ValueError('MIGRATION_SNAPSHOT_TIMEOUT must be greater than 0 and at most 86400 seconds')
-deadline = time.monotonic() + seconds
-root = pathlib.Path(destination)
-root.mkdir(parents=True, exist_ok=True)
+source, destination, timeout, integrity, live = sys.argv[1:]
+if integrity not in ('full', 'quick', 'skip'):
+    sys.exit('ERROR: MIGRATION_INTEGRITY_CHECK must be full, quick or skip')
+live = live in ('1', 'true', 'yes')
 originals = [(pathlib.Path(source), 'library.db'), (pathlib.Path(source[:-3] + '.blobs.db'), 'library.blobs.db')]
 paths = [pathlib.Path(str(path) + suffix) for path, _ in originals for suffix in ('', '-wal', '-shm', '-journal')]
+GIB = 1024 ** 3
+total = sum(path.stat().st_size for path in paths if path.is_file())
+# Validated before anything is created. Without an explicit limit, allow
+# 15 minutes per GiB (at least an hour, at most a week).
+if timeout:
+    try:
+        seconds = float(timeout)
+    except ValueError:
+        seconds = 0.0
+    if not 0 < seconds <= 86400:
+        sys.exit('ERROR: MIGRATION_SNAPSHOT_TIMEOUT must be greater than 0 and at most 86400 seconds')
+else:
+    seconds = min(max(3600.0, 900.0 * total / GIB), 7 * 86400.0)
+root = pathlib.Path(destination)
+root.mkdir(parents=True, exist_ok=True)
+started = time.monotonic()
+deadline = started + seconds
+last_report = 0.0
+
+def report(message, force=False):
+    global last_report
+    now = time.monotonic()
+    if force or now - last_report >= 5:
+        last_report = now
+        print(f'[snapshot {int(now - started):>5}s] {message}', file=sys.stderr, flush=True)
+
+def size(value):
+    return f'{value / GIB:.2f} GiB' if value >= GIB else f'{value / 1024 ** 2:.0f} MiB'
+
+class SnapshotTimeout(Exception):
+    pass
 
 def bounded():
     if time.monotonic() > deadline:
-        raise TimeoutError('SQLite source snapshot timed out')
+        raise SnapshotTimeout()
 
 native_cli = os.environ.get('MIGRATION_PLEX_SQLITE')
 if native_cli:
@@ -637,93 +876,148 @@ else:
 
 def validate_private_snapshot(target, tables, original):
     bounded()
+    if integrity == 'skip':
+        report(f'{original.name}: integrity check skipped (MIGRATION_INTEGRITY_CHECK=skip)', True)
+        return
+    report(f'{original.name}: {integrity} integrity check of {len(tables)} tables...', True)
+    if integrity == 'quick':
+        statements = ['PRAGMA quick_check;']
+    else:
+        statements = ["PRAGMA integrity_check('" + table.replace("'", "''") + "');" for (table,) in tables]
     if native_cli:
-        script = '.bail on\n' + '\n'.join(
-            "PRAGMA integrity_check('" + table.replace("'", "''") + "');" for (table,) in tables
-        )
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith(('PLEX_PG_', 'DYLD_')) and key not in {
                            'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_LOADER_PATH', 'LD_AUDIT',
                            'SQLITE_AUTO_EXTENSION', 'SQLITE_EXTENSIONS',
                        }}
-        result = subprocess.run([native_cli, str(target)], input=script, text=True,
-                                capture_output=True, env=environment,
+        result = subprocess.run([native_cli, str(target)], input='.bail on\n' + '\n'.join(statements),
+                                text=True, capture_output=True, env=environment,
                                 timeout=max(.01, deadline - time.monotonic()))
-        if result.returncode or result.stdout.strip().splitlines() != ['ok'] * len(tables):
+        if result.returncode or result.stdout.strip().splitlines() != ['ok'] * len(statements):
             raise RuntimeError(f'Invalid native physical SQLite source: {original}: {result.stderr.strip()} {result.stdout.strip()}')
     else:
         with sqlite3.connect(target) as database:
-            for (table,) in tables:
+            for index, statement in enumerate(statements, 1):
                 bounded()
-                check = database.execute("PRAGMA integrity_check('" + table.replace("'", "''") + "')").fetchall()
+                report(f'{original.name}: integrity check {index}/{len(statements)}')
+                check = database.execute(statement).fetchall()
                 if check != [('ok',)]:
-                    raise RuntimeError(f'Invalid physical SQLite source table: {original}: {table}: {check}')
+                    raise RuntimeError(f'Invalid physical SQLite source: {original}: {statement}: {check}')
         database.close()
 
 def fingerprint():
+    # Any write changes ctime/mtime/size, so the stat tuple detects concurrent
+    # writers without re-reading gigabytes of content.
     result = {}
     for path in paths:
-        bounded()
         try:
-            before = path.stat()
+            value = path.stat()
         except FileNotFoundError:
             result[str(path)] = None
             continue
         if not path.is_file():
             raise RuntimeError(f'Non-regular SQLite source: {path}')
-        digest = hashlib.sha256()
+        # The database header holds the file change counter and the WAL header
+        # its checkpoint salts, which catch rewrites coarse timestamps (NFS,
+        # SMB, some FUSE mounts) might hide.
         with path.open('rb') as handle:
-            while chunk := handle.read(1024 * 1024):
-                bounded()
-                digest.update(chunk)
-        after = path.stat()
-        state = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
-        if state(before) != state(after):
-            raise RuntimeError(f'SQLite source changed while hashing: {path}; stop Plex and writers before migration')
-        result[str(path)] = (state(after), digest.hexdigest())
+            header = handle.read(100 if path.suffix == '.db' else 32)
+        result[str(path)] = (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns, header)
     return result
 
+FICLONE = 0x40049409  # Linux reflink ioctl (btrfs, XFS, OpenZFS >= 2.2)
+
+def copy_file(path, target):
+    length = path.stat().st_size
+    with path.open('rb') as reader, target.open('wb') as writer:
+        if sys.platform.startswith('linux') and length:
+            try:
+                fcntl.ioctl(writer.fileno(), FICLONE, reader.fileno())
+                report(f'copied {path.name} ({size(length)}) as a reflink', True)
+                return
+            except OSError:
+                pass
+        copied = 0
+        while chunk := reader.read(8 * 1024 * 1024):
+            bounded()
+            writer.write(chunk)
+            copied += len(chunk)
+            report(f'copying {path.name}: {size(copied)} of {size(length)} ({100 * copied // max(length, 1)}%)')
+
+def backup_into(connection, target, name):
+    with sqlite3.connect(target, timeout=5) as backup:
+        def progress(status, remaining, pages):
+            bounded()
+            report(f'{name}: backup {pages - remaining} of {pages} pages')
+        # Live sources are read in one transaction so the copy is consistent
+        # while Plex keeps writing; private copies are walked in chunks.
+        connection.backup(backup, pages=-1 if live else 1024, progress=progress, sleep=0 if live else .01)
+        backup.execute('PRAGMA journal_mode=DELETE')
+        tables = backup.execute("SELECT name FROM sqlite_master WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name").fetchall()
+    backup.close()
+    return tables
+
 try:
+    report(f'snapshotting {size(total)} of SQLite data (timeout {int(seconds)}s, integrity check: {integrity})', True)
     before = fingerprint()
     if before[str(originals[0][0])] is None:
         raise RuntimeError('Missing SQLite library source')
-    with tempfile.TemporaryDirectory(prefix='.sqlite-source-copy-', dir=root) as temporary:
-        raw = pathlib.Path(temporary)
-        for original, name in originals:
-            if before[str(original)] is None:
-                if any(before[str(pathlib.Path(str(original) + suffix))] is not None for suffix in ('-wal', '-shm', '-journal')):
-                    raise RuntimeError(f'Orphan SQLite source sidecar: {original}')
-                continue
-            for suffix in ('', '-wal', '-shm', '-journal'):
-                path = pathlib.Path(str(original) + suffix)
-                if before[str(path)] is None:
-                    continue
-                with path.open('rb') as reader, (raw / (name + suffix)).open('wb') as writer:
-                    while chunk := reader.read(1024 * 1024):
-                        bounded()
-                        writer.write(chunk)
-            if fingerprint() != before:
-                raise RuntimeError('SQLite source pair changed while copying; stop Plex and writers before migration')
+    if live:
+        report('MIGRATION_LIVE_SOURCE=1: copying the library while it may be in use; '
+               'changes made after this snapshot will not be migrated', True)
         for original, name in originals:
             if before[str(original)] is None:
                 continue
             target = root / name
-            with sqlite3.connect(raw / name, timeout=5) as connection, sqlite3.connect(target, timeout=5) as backup:
-                connection.backup(backup, pages=1024, progress=lambda *_: bounded(), sleep=.01)
-                backup.execute('PRAGMA journal_mode=DELETE')
-                tables = backup.execute("SELECT name FROM sqlite_master WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name").fetchall()
-            connection.close()
-            backup.close()
+            connection = sqlite3.connect(original.resolve().as_uri() + '?mode=ro', uri=True, timeout=30)
+            try:
+                tables = backup_into(connection, target, name)
+            finally:
+                connection.close()
             validate_private_snapshot(target, tables, original)
-        # A stable pair encompasses both library/artwork and committed WAL data.
-        # Changes during recovery/backup invalidate the entire acquisition.
-        time.sleep(min(.05, max(0, deadline - time.monotonic())))
-        if fingerprint() != before:
-            raise RuntimeError('SQLite source pair changed during snapshot; stop Plex and writers before migration')
-except BaseException:
+    else:
+        with tempfile.TemporaryDirectory(prefix='.sqlite-source-copy-', dir=root) as temporary:
+            raw = pathlib.Path(temporary)
+            for original, name in originals:
+                if before[str(original)] is None:
+                    if any(before[str(pathlib.Path(str(original) + suffix))] is not None for suffix in ('-wal', '-shm', '-journal')):
+                        raise RuntimeError(f'Orphan SQLite source sidecar: {original}')
+                    continue
+                for suffix in ('', '-wal', '-shm', '-journal'):
+                    path = pathlib.Path(str(original) + suffix)
+                    if before[str(path)] is None:
+                        continue
+                    copy_file(path, raw / (name + suffix))
+                if fingerprint() != before:
+                    raise RuntimeError('SQLite source pair changed while copying; stop Plex and writers before migration '
+                                       '(or set MIGRATION_LIVE_SOURCE=1 to snapshot a running library)')
+            for original, name in originals:
+                if before[str(original)] is None:
+                    continue
+                target = root / name
+                connection = sqlite3.connect(raw / name, timeout=5)
+                try:
+                    tables = backup_into(connection, target, name)
+                finally:
+                    connection.close()
+                validate_private_snapshot(target, tables, original)
+            # A stable pair encompasses both library/artwork and committed WAL data.
+            # Changes during recovery/backup invalidate the entire acquisition.
+            if fingerprint() != before:
+                raise RuntimeError('SQLite source pair changed during snapshot; stop Plex and writers before migration '
+                                   '(or set MIGRATION_LIVE_SOURCE=1 to snapshot a running library)')
+    report(f'snapshot complete in {int(time.monotonic() - started)}s', True)
+except BaseException as error:
     for _, name in originals:
         for suffix in ('', '-wal', '-shm', '-journal'):
             (root / (name + suffix)).unlink(missing_ok=True)
+    if isinstance(error, (SnapshotTimeout, subprocess.TimeoutExpired)):
+        sys.exit(f'ERROR: SQLite snapshot timed out: not finished within {int(seconds)}s ({size(total)} source). '
+                 f'Set a larger MIGRATION_SNAPSHOT_TIMEOUT (seconds) in /etc/plex-postgresql.conf, or pass it '
+                 f'explicitly: sudo MIGRATION_SNAPSHOT_TIMEOUT=... <installer>. A plain `export` is dropped by sudo. '
+                 f'MIGRATION_INTEGRITY_CHECK=quick (skips index checks) or skip reduces the verification step.')
+    if isinstance(error, (RuntimeError, sqlite3.Error, OSError)):
+        sys.exit(f'ERROR: {error}')
     raise
 PY_SNAPSHOT
 }
@@ -736,12 +1030,28 @@ check_and_migrate() (
     fi
 
     validate_migration_schema || return 1
+    # Every check that does not need the snapshot runs first, so a missing tool,
+    # wrong credentials or a populated destination fail in seconds, not after
+    # copying and verifying a multi-gigabyte library.
+    migration_preflight || return 1
+    local destination_status
+    if destination_has_data; then
+        echo "ERROR: Remove the migration source mount to use an existing destination, or migrate into a separate empty database." >&2
+        return 1
+    else
+        destination_status=$?
+        [[ "$destination_status" == 1 ]] || return 1
+    fi
+
     local sqlite_count snapshot_dir original_source="$SQLITE_DB"
     snapshot_dir=$(mktemp -d "${TMPDIR:-/tmp}/plex-source-inspection.XXXXXX") || return 1
     trap 'rm -rf "$snapshot_dir"' EXIT
     snapshot_sqlite_sources "$SQLITE_DB" "$snapshot_dir" || return 1
     SQLITE_DB="$snapshot_dir/library.db"
-    sqlite_count=$(sqlite3 -readonly "$SQLITE_DB" "SELECT COUNT(*) FROM metadata_items;") || return 1
+    # migrate_sqlite_to_pg imports this validated private copy instead of
+    # snapshotting (and re-verifying) the whole library a second time.
+    MIGRATION_VALIDATED_SNAPSHOT="$SQLITE_DB"
+    sqlite_count=$(migration_sqlite3 -readonly "$SQLITE_DB" "SELECT COUNT(*) FROM metadata_items;") || return 1
     [[ "$sqlite_count" =~ ^[0-9]+$ ]] || return 1
 
     echo -e "${YELLOW}========================================${NC}"
@@ -754,7 +1064,7 @@ check_and_migrate() (
 
     # Show breakdown
     echo "Content breakdown:"
-    sqlite3 "$SQLITE_DB" "
+    migration_sqlite3 "$SQLITE_DB" "
         SELECT
             CASE metadata_type
                 WHEN 1 THEN '  Movies'
@@ -770,30 +1080,18 @@ check_and_migrate() (
     " || return 1
     echo ""
 
-    # Check PostgreSQL connection
-    export PGHOST="$PG_HOST"
-    export PGPORT="$PG_PORT"
-    export PGDATABASE="$PG_DATABASE"
-    export PGUSER="$PG_USER"
-    export PGPASSWORD="${PLEX_PG_PASSWORD:-plex}"
-
-    if ! psql -c "SELECT 1" >/dev/null 2>&1; then
-        echo -e "${RED}ERROR: Cannot connect to PostgreSQL at $PG_HOST:$PG_PORT${NC}"
-        return 1
-    fi
-
-    local destination_status
-    if destination_has_data; then
-        echo "ERROR: Remove the migration source mount to use an existing destination, or migrate into a separate empty database." >&2
-        return 1
-    else
-        destination_status=$?
-        [[ "$destination_status" == 1 ]] || return 1
-    fi
-    if [[ "$MIGRATION_INTERACTIVE" == "1" ]]; then
+    if [[ "${MIGRATION_INTERACTIVE:-1}" == "1" ]]; then
         local migrate_choice
-        read -r -p "Migrate into the empty PostgreSQL destination? [Y/n]: " migrate_choice || return 1
-        [[ ! "$migrate_choice" =~ ^[Nn] ]] || return 1
+        if ! read -r -p "Migrate into the empty PostgreSQL destination? [Y/n]: " migrate_choice; then
+            echo "" >&2
+            echo "ERROR: No answer to the migration prompt (stdin is not interactive)." >&2
+            echo "  Run the installer from a terminal, or set MIGRATION_INTERACTIVE=0 to migrate without asking." >&2
+            return 1
+        fi
+        if [[ "$migrate_choice" =~ ^[Nn] ]]; then
+            echo "Migration declined; nothing was changed." >&2
+            return 1
+        fi
     fi
 
     # Run migration
@@ -824,10 +1122,14 @@ migrate_sqlite_to_pg() (
     work_dir=$(mktemp -d "${TMPDIR:-/tmp}/plex-import.XXXXXX") || return 1
     trap 'status=$?; migration_psql -q -c "DROP SCHEMA IF EXISTS $staging CASCADE;" >&2 || status=1; rm -rf "$work_dir" || status=1; exit "$status"' EXIT
     local original_source="$SQLITE_DB"
-    snapshot_sqlite_sources "$original_source" "$work_dir" || return 1
-    SQLITE_DB="$work_dir/library.db"
+    if [[ -n "${MIGRATION_VALIDATED_SNAPSHOT:-}" && "$SQLITE_DB" == "$MIGRATION_VALIDATED_SNAPSHOT" ]]; then
+        echo "Importing the validated private snapshot taken above."
+    else
+        snapshot_sqlite_sources "$original_source" "$work_dir" || return 1
+        SQLITE_DB="$work_dir/library.db"
+    fi
     migration_psql -q -c "CREATE SCHEMA $staging;" || return 1
-    tables=$(sqlite3 -readonly "$SQLITE_DB" "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%fts%' AND name NOT LIKE '%spellfix%' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name;") || return 1
+    tables=$(migration_sqlite3 -readonly "$SQLITE_DB" "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%fts%' AND name NOT LIKE '%spellfix%' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name;") || return 1
     printf 'BEGIN;\n' > "$work_dir/activate.sql" || return 1
     destination_guard_sql >> "$work_dir/activate.sql" || return 1
 
@@ -839,14 +1141,14 @@ migrate_sqlite_to_pg() (
         [[ "$table" =~ ^[a-z_][a-z0-9_]*$ ]] || { echo "ERROR: Unsupported source table name: $table" >&2; return 1; }
         case "$table" in sqlite_column_types) continue ;; esac
         local count
-        count=$(sqlite3 -readonly "$SQLITE_DB" "SELECT COUNT(*) FROM \"$table\";") || return 1
+        count=$(migration_sqlite3 -readonly "$SQLITE_DB" "SELECT COUNT(*) FROM \"$table\";") || return 1
         [[ "$count" =~ ^[0-9]+$ ]] || return 1
         if [[ "$count" -ge 0 ]]; then
             printf "  %-35s %8s rows... " "$table" "$count"
 
             # Get SQLite columns
             local sqlite_cols_raw
-            sqlite_cols_raw=$(sqlite3 -readonly "$SQLITE_DB" "PRAGMA table_info(\"$table\");" | cut -d'|' -f2) || return 1
+            sqlite_cols_raw=$(migration_sqlite3 -readonly "$SQLITE_DB" "PRAGMA table_info(\"$table\");" | cut -d'|' -f2) || return 1
 
             if [[ -z "$sqlite_cols_raw" ]]; then
                 echo "ERROR: No source columns for $table" >&2
@@ -868,7 +1170,7 @@ migrate_sqlite_to_pg() (
             # Destination types decide which values need strict normalization.
             # Get column types from SQLite to detect BLOBs and Boolean affinity.
             local col_types
-            col_types=$(sqlite3 -readonly "$SQLITE_DB" "PRAGMA table_info(\"$table\");" | cut -d'|' -f2,3) || return 1
+            col_types=$(migration_sqlite3 -readonly "$SQLITE_DB" "PRAGMA table_info(\"$table\");" | cut -d'|' -f2,3) || return 1
 
             # Find common columns and build quoted lists
             # For BLOB columns, use hex() to convert binary to hex string
@@ -990,7 +1292,7 @@ migrate_sqlite_to_pg() (
 
     local blobs_db="${SQLITE_DB%.db}.blobs.db" blob_count pg_blob_count
     if [[ -f "$blobs_db" ]]; then
-        blob_count=$(sqlite3 -readonly "$blobs_db" "SELECT count(*) FROM blobs;") || return 1
+        blob_count=$(migration_sqlite3 -readonly "$blobs_db" "SELECT count(*) FROM blobs;") || return 1
         migration_psql -q -c "CREATE TABLE IF NOT EXISTS $staging.blobs (LIKE $schema.blobs INCLUDING CONSTRAINTS INCLUDING GENERATED INCLUDING IDENTITY INCLUDING INDEXES); DELETE FROM $staging.blobs;" || return 1
         local migrate_py="${SHIM_DIR}/migrate_table.py"
         [[ -f "$migrate_py" ]] || migrate_py="$(dirname "${BASH_SOURCE[0]}")/migrate_table.py"

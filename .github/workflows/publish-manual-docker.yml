@@ -1,0 +1,94 @@
+name: Publish requested release Docker images
+
+# Manual release path for a maintainer-requested release without the full
+# certification matrix. Promotes the AMD64 and ARM64 images that a green
+# `docker-publish` probe run built and tested for the release tag's exact
+# source; nothing is rebuilt here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag (for example: v1.3.24)"
+        required: true
+        type: string
+      probe_run_id:
+        description: "Successful docker-publish probe run for the tag's commit"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-release-docker
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'cgnl/plex-postgresql' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Match the probe run to the release tag
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ inputs.probe_run_id }}
+        run: |
+          set -eu
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          sha=$(git rev-parse "$TAG^{commit}")
+          test "$(git show "$sha:VERSION")" = "${TAG#v}"
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,status,conclusion > run.json
+          python3 -c 'import json; r=json.load(open("run.json")); assert r["workflowName"] == "Native Plex Acceptance Matrix", r; assert (r["status"], r["conclusion"]) == ("completed", "success"), r'
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'built-image-*' --dir images
+          for variant in linuxserver plexinc; do
+            for arch in amd64 arm64; do
+              dir="images/built-image-$variant-$arch"
+              test "$(cat "$dir/source-sha.txt")" = "$sha"
+              ref=$(cat "$dir/candidate-ref.txt")
+              [[ "$ref" =~ ^ghcr\.io/cgnl/plex-postgresql-$variant@sha256:[0-9a-f]{64}$ ]]
+              echo "${variant}_${arch}=$ref" >> "$GITHUB_OUTPUT"
+            done
+          done
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish version and latest tags
+        env:
+          TAG: ${{ inputs.tag }}
+          LINUXSERVER_AMD64: ${{ steps.source.outputs.linuxserver_amd64 }}
+          LINUXSERVER_ARM64: ${{ steps.source.outputs.linuxserver_arm64 }}
+          PLEXINC_AMD64: ${{ steps.source.outputs.plexinc_amd64 }}
+          PLEXINC_ARM64: ${{ steps.source.outputs.plexinc_arm64 }}
+        run: |
+          set -eu
+          publish() {
+            local repository=$1 amd64=$2 arm64=$3
+            if docker buildx imagetools inspect "$repository:$TAG" >/dev/null 2>&1; then
+              echo "$repository:$TAG already exists; immutable version tags are never replaced" >&2
+              exit 1
+            fi
+            docker buildx imagetools create --tag "$repository:$TAG" "$amd64" "$arm64"
+            digest=$(docker buildx imagetools inspect "$repository:$TAG" | awk '/^Digest:/ {print $2; exit}')
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            docker buildx imagetools create --tag "$repository:latest" "$repository@$digest"
+            echo "$repository:$TAG -> $digest" >> "$GITHUB_STEP_SUMMARY"
+          }
+          publish ghcr.io/cgnl/plex-postgresql-linuxserver "$LINUXSERVER_AMD64" "$LINUXSERVER_ARM64"
+          publish ghcr.io/cgnl/plex-postgresql-plexinc "$PLEXINC_AMD64" "$PLEXINC_ARM64"
+          echo 'Published at the maintainer request from a green probe run; the full certification matrix was not run.' >> "$GITHUB_STEP_SUMMARY"

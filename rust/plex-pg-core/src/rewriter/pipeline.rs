@@ -44,6 +44,7 @@ mod tests {
                 "functions",
                 "types",
                 "keywords",
+                "derived_aliases",
                 "upsert",
                 "quotes",
                 "groupby",

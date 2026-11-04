@@ -36,6 +36,7 @@ pub(super) unsafe fn streaming_fetch_result(
     s.streaming_conn = exec_conn;
     s.result_conn = exec_conn;
     ec.streaming_active.store(1, Ordering::SeqCst);
+    s.stream_generation = ec.stream_generation.fetch_add(1, Ordering::SeqCst) + 1;
     s.metadata_only_result = 0;
     conn_guard.unlock();
 
@@ -43,7 +44,7 @@ pub(super) unsafe fn streaming_fetch_result(
     if first_res.is_null() {
         clear_streaming_state(s);
         s.result_conn = std::ptr::null_mut();
-        s.read_done = -1;
+        s.read_done = first_fetch_failure_state(ec.conn);
         crate::db_interpose_exec::pg_path::set_pg_last_error(
             s.conn,
             "PostgreSQL stream returned no initial result",
@@ -64,6 +65,7 @@ pub(super) unsafe fn streaming_fetch_result(
         s.current_row = 0;
         s.num_rows = 1;
         s.num_cols = crate::libpq_helpers::rust_pq_nfields(first_res);
+        crate::db_interpose_column::refresh_descriptor_if_stale(s, first_res);
         s.ensure_column_capacity(s.num_cols as usize);
         resolve_column_tables(pg_stmt, exec_conn);
         trace_play_queue_result(pg_stmt, first_res, "STREAM FIRST");
@@ -108,10 +110,23 @@ pub(super) unsafe fn streaming_fetch_result(
     }
     clear_streaming_state(s);
     s.result_conn = std::ptr::null_mut();
-    s.read_done = -1;
+    s.read_done = first_fetch_failure_state(ec.conn);
     crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
     *exec_conn_io = exec_conn;
     *stmt_guard = None; // unlock
     set_pg_conn_error(pg_conn_error_out);
     STEP_RESULT_ERROR
+}
+
+/// `read_done` after the first fetch failed. No row has reached the caller, so
+/// when the session was lost the statement stays retryable: the step retry
+/// re-runs it on the recovered session (a read prepared from the description
+/// cache meets a dead session only here, not at prepare). Any other failure is
+/// final.
+unsafe fn first_fetch_failure_state(pq: *mut crate::libpq_helpers::PGconn) -> c_int {
+    if crate::libpq_helpers::rust_pq_status(pq) != 0 {
+        0
+    } else {
+        -1
+    }
 }

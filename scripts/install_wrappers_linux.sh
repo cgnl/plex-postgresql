@@ -18,6 +18,12 @@ else
 fi
 SQLITE_DB="$PLEX_SUPPORT_DIR/Plug-in Support/Databases/com.plexapp.plugins.library.db"
 
+# Shared migration library and config loader. sudo drops exported variables,
+# so settings come from /etc/plex-postgresql.conf (or PLEX_PG_* lines in
+# /etc/default/plexmediaserver) unless passed on the sudo command line.
+source "$SCRIPT_DIR/migrate_lib.sh"
+plex_pg_load_config
+
 # PostgreSQL defaults
 PG_HOST="${PLEX_PG_HOST:-localhost}"
 PG_PORT="${PLEX_PG_PORT:-5432}"
@@ -109,17 +115,33 @@ rm -rf "$LOADER_CHECK_DIR"
 trap - EXIT
 
 # Check if Plex is running
+PLEX_RUNNING=0
 if pgrep -f "Plex Media Server" >/dev/null 2>&1; then
-    echo -e "${YELLOW}WARNING: Plex is running. Stop it first:${NC}"
-    echo "  sudo systemctl stop plexmediaserver"
-    exit 1
+    PLEX_RUNNING=1
+    if [[ "${MIGRATION_LIVE_SOURCE:-0}" != 1 ]]; then
+        echo -e "${YELLOW}WARNING: Plex is running. Stop it first:${NC}"
+        echo "  sudo systemctl stop plexmediaserver"
+        echo "Or migrate a snapshot of the running library and restart afterwards (changes"
+        echo "made after the snapshot are lost): sudo MIGRATION_LIVE_SOURCE=1 $0"
+        exit 1
+    fi
 fi
 
-# Source shared migration library
-source "$SCRIPT_DIR/migrate_lib.sh"
+# Prepare the destination before migrating: native installs have no entrypoint
+# that loads the schema, so the import would otherwise find no tables.
+migration_preflight
+init_pg_schema "$(resolve_schema_dir)"
+if [[ ! -f "$SQLITE_DB" ]]; then
+    seed_fresh_pg_defaults
+fi
 
-# Run migration check before installing wrappers
-check_and_migrate
+# Run migration check before installing wrappers. A re-run finds the shim's
+# SQLite shadow instead of a native library; there is nothing to migrate then.
+if [[ -f "$SQLITE_DB" ]] && is_shadow_database "$SQLITE_DB"; then
+    echo "The Plex database is already a PostgreSQL shadow; skipping migration."
+else
+    check_and_migrate
+fi
 
 # Install the validated architecture's runtime after migration succeeds.
 install -d "$SHIM_INSTALL_DIR"
@@ -149,6 +171,11 @@ if [[ -f "$PLEX_DIR/Plex Media Server.original" ]]; then
         printf '#!/bin/bash\n'
         printf 'SHIM_PATH=%q\n' "$SHIM_PATH"
         printf 'SHIM_INSTALL_DIR=%q\n' "$SHIM_INSTALL_DIR"
+        # systemd never reads /etc/default/plexmediaserver for Plex, so the
+        # wrapper loads the connection settings itself (same parser as the
+        # installer; explicit Environment= entries still take precedence).
+        declare -f plex_pg_load_config
+        printf 'plex_pg_load_config\n'
     } > "$PLEX_DIR/Plex Media Server"
     cat >> "$PLEX_DIR/Plex Media Server" << 'WRAPPER'
 # Plex Media Server wrapper for PostgreSQL shim
@@ -194,6 +221,11 @@ if [[ -f "$PLEX_DIR/Plex Media Scanner.original" ]]; then
         printf '#!/bin/bash\n'
         printf 'SHIM_PATH=%q\n' "$SHIM_PATH"
         printf 'SHIM_INSTALL_DIR=%q\n' "$SHIM_INSTALL_DIR"
+        # systemd never reads /etc/default/plexmediaserver for Plex, so the
+        # wrapper loads the connection settings itself (same parser as the
+        # installer; explicit Environment= entries still take precedence).
+        declare -f plex_pg_load_config
+        printf 'plex_pg_load_config\n'
     } > "$PLEX_DIR/Plex Media Scanner"
     cat >> "$PLEX_DIR/Plex Media Scanner" << 'WRAPPER'
 # Plex Media Scanner wrapper for PostgreSQL shim
@@ -215,17 +247,24 @@ else
     exit 1
 fi
 
+# Persist the connection settings the migration used, so the wrappers reach
+# the same database. An existing file is never overwritten.
+PLEX_SERVICE_GROUP=$(stat -c %G "$PLEX_SUPPORT_DIR" 2>/dev/null || echo plex)
+write_plex_pg_config "$PLEX_SERVICE_GROUP"
+
 echo ""
 echo -e "${GREEN}=== Installation complete ===${NC}"
 echo ""
-echo "Configure PostgreSQL connection in /etc/default/plexmediaserver:"
-echo "  PLEX_PG_HOST=localhost"
-echo "  PLEX_PG_DATABASE=plex"
-echo "  PLEX_PG_USER=plex"
-echo "  PLEX_PG_PASSWORD=yourpassword"
+echo "PostgreSQL connection settings: ${PLEX_PG_CONFIG:-/etc/plex-postgresql.conf}"
+echo "  (PLEX_PG_HOST, PLEX_PG_PORT, PLEX_PG_DATABASE, PLEX_PG_USER, PLEX_PG_PASSWORD, PLEX_PG_SCHEMA)"
 echo ""
-echo "Then start Plex:"
-echo "  sudo systemctl start plexmediaserver"
+if [[ "$PLEX_RUNNING" == 1 ]]; then
+    echo -e "${YELLOW}Plex is still running the pre-migration binary. Restart it now:${NC}"
+    echo "  sudo systemctl restart plexmediaserver"
+else
+    echo "Then start Plex:"
+    echo "  sudo systemctl start plexmediaserver"
+fi
 echo ""
 echo "To uninstall:"
 echo "  sudo ./scripts/uninstall_wrappers_linux.sh"
