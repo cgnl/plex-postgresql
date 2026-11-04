@@ -660,7 +660,28 @@ def dispatch_followup(repository, plan, category, run_url):
     return workflow
 
 
+# Only these results need a maintainer decision on the default branch: a
+# passed probe stages a release, a regression proposes a fix. Every result is
+# already kept in the compatibility ledger, so the others (waiting for an
+# image, insufficient evidence, infrastructure failures) open no pull request;
+# opening one per weekly observation left a growing pile nobody merged.
+ACTIONABLE_REPORTS = {"probe-passed", "regression"}
+REPORT_BRANCH_PREFIX = "automation/plex-report-"
+
+
+def close_superseded_reports(repository, current):
+    """Close older open report pull requests; only the newest observation is current."""
+    for pr in github_api(f"repos/{repository}/pulls?state=open&per_page=100"):
+        if pr["number"] == current["number"] or not pr["head"]["ref"].startswith(REPORT_BRANCH_PREFIX):
+            continue
+        github_api(f"repos/{repository}/issues/{pr['number']}/comments", "POST",
+                   {"body": f"Superseded by #{current['number']}."})
+        github_api(f"repos/{repository}/pulls/{pr['number']}", "PATCH", {"state": "closed"})
+
+
 def report_pr(repository, plan, category, run_url):
+    if category not in ACTIONABLE_REPORTS:
+        return "recorded-in-ledger"
     if category == "probe-passed" and already_published(repository, plan):
         return "already-published"
     body = report(plan, category, run_url)
@@ -685,7 +706,7 @@ def report_pr(repository, plan, category, run_url):
                  f"Root cause remains under investigation. [Evidence]({run_url}).\n\n")
         entries.append({"path": "CHANGELOG.md", "mode": "100644", "type": "blob", "content": entry + original})
     tree = github_api(f"repos/{repository}/git/trees", "POST", {"base_tree": tree_sha, "tree": entries})
-    branch = "automation/plex-report-" + plan["fingerprint"]
+    branch = REPORT_BRANCH_PREFIX + plan["fingerprint"]
     try:
         existing = github_api(f"repos/{repository}/git/ref/heads/{branch}")
     except subprocess.CalledProcessError as error:
@@ -703,6 +724,7 @@ def report_pr(repository, plan, category, run_url):
     pr = github_api(f"repos/{repository}/pulls", "POST", {
         "title": f"Record Plex compatibility: {category}", "head": branch, "base": base,
         "body": body + f"\n<!-- {marker} -->\n", "draft": False})
+    close_superseded_reports(repository, pr)
     return pr["html_url"]
 
 
