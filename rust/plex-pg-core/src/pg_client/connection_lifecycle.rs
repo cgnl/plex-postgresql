@@ -202,6 +202,18 @@ pub(super) fn reset_conn(conn: *mut c_void) -> bool {
     true
 }
 
+/// Reset a session that was left unusable mid-command and restore what a
+/// fresh session needs (search_path, timeouts); its prepared statements are
+/// gone, so forget them too.
+pub(crate) fn reset_session(conn: *mut PgConnection) -> bool {
+    if conn.is_null() {
+        return false;
+    }
+    rust_stmt_cache_clear(conn as *mut c_void);
+    unsafe { (*conn).streaming_active.store(0, std::sync::atomic::Ordering::Release) };
+    reset_conn(conn as *mut c_void)
+}
+
 pub(super) fn reconnect_conn(raw_conn: *mut c_void) -> bool {
     let conn_ptr = raw_conn as *mut PgConnection;
     if conn_ptr.is_null() {

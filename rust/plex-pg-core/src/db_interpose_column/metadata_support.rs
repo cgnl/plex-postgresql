@@ -145,7 +145,7 @@ unsafe fn describe_pipelined(
         if !error_recorded {
             crate::db_interpose_exec::pg_path::record_pg_result_error(conn, exec_conn, ptr::null_mut());
         }
-        crate::libpq_helpers::rust_pq_reset(pq);
+        crate::pg_client::reset_session(exec_conn);
         reset = true;
     }
     if !round_ok && !desc.is_null() {
