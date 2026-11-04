@@ -21,6 +21,9 @@ jobs:
   build:
     name: Build ${{ matrix.arch }} artifact
     runs-on: ${{ matrix.runner }}
+    # A normal build takes about six minutes; fail a hang instead of waiting
+    # for the six-hour job limit.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -43,13 +46,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build builder rootfs for ${{ matrix.platform }}
+      # Export only the built payload (/libs). Exporting the whole builder
+      # rootfs (Rust toolchain, over a gigabyte) hung on the ARM64 runner
+      # during "copying files" for v1.3.25.
+      - name: Build shim payload for ${{ matrix.platform }}
         run: |
           set -eux
           mkdir -p out/${{ matrix.arch }} dist
           docker buildx build \
             --platform "${{ matrix.platform }}" \
-            --target builder \
+            --target export-payload \
             --output "type=local,dest=out/${{ matrix.arch }}" \
             .
 
@@ -76,6 +82,7 @@ jobs:
   package-linux-zip:
     name: Package Linux zip bundle
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: build
     outputs:
       tag: ${{ steps.tag.outputs.value }}
