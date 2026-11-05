@@ -339,7 +339,7 @@ Use this command to migrate an existing Plex library to PostgreSQL:
 | `PLEX_PG_PASSWORD` | (empty) | Database password |
 | `PLEX_PG_SCHEMA` | plex | Schema name |
 | `PLEX_PG_POOL_SIZE` | 50 | Initial connection pool size |
-| `PLEX_PG_POOL_MAX` | (inherits `PLEX_PG_POOL_SIZE`) | Runtime pool cap; auto-aligned to PostgreSQL `max_connections` at startup |
+| `PLEX_PG_POOL_MAX` | half of PostgreSQL `max_connections` | Runtime pool cap. Without it the pool may grow to half the server's slots, leaving the rest for scanner jobs; an explicit value is capped at `max_connections` |
 | `PLEX_PG_IDLE_TIMEOUT` | 300 | Seconds before idle connections are reaped |
 | `MIGRATION_SNAPSHOT_TIMEOUT` | 3600 | Seconds allowed for a private source snapshot; positive values up to 86400. Increase for large libraries on slow NAS storage. |
 | `PLEX_PG_OPENSSL_ARMCAP` | 0 (Docker ARM only) | Override `OPENSSL_armcap` for Plex process to avoid ARM `SIGILL` on unsupported crypto instructions |

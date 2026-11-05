@@ -44,7 +44,7 @@ PY
 NETWORK=$(docker network create --label plex-postgresql.test=native-bundle "plex-bundle-$(basename "$STAGE")")
 POSTGRES=$(docker run -d --network "$NETWORK" --network-alias postgres \
     --label plex-postgresql.test=native-bundle \
-    -e POSTGRES_USER=plex -e POSTGRES_PASSWORD=plex -e POSTGRES_DB=plex "$POSTGRES_IMAGE")
+    -e POSTGRES_USER=plex -e POSTGRES_PASSWORD=plex -e POSTGRES_DB=plex "$POSTGRES_IMAGE" -c max_connections=200)
 [[ $(docker image inspect --format '{{.Architecture}}' "$POSTGRES_IMAGE") == "$DOCKER_ARCH" ]] || {
     echo 'PostgreSQL fixture image architecture differs from native host' >&2; exit 1;
 }
