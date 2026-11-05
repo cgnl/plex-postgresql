@@ -182,6 +182,7 @@ pub extern "C" fn rust_pg_client_init() {
     CLIENT_INIT.call_once(|| {
         let mut pool_size =
             parse_positive_env_or_default("PLEX_PG_POOL_SIZE", POOL_SIZE_DEFAULT as i32);
+        let explicit_max = env_utils::env_string("PLEX_PG_POOL_MAX").is_some();
         let mut pool_max = parse_positive_env_or_default("PLEX_PG_POOL_MAX", pool_size);
 
         let cfg = conn_config();
@@ -207,14 +208,24 @@ pub extern "C" fn rust_pg_client_init() {
         };
 
         if db_max_connections > 0 {
-            if pool_max != db_max_connections {
+            // Every scanner, matcher and analysis job is a separate process
+            // with its own connections, and each SQLite handle keeps a session
+            // outside the pool. Without an explicit PLEX_PG_POOL_MAX the pool
+            // may grow to half the server's slots, leaving the rest for them;
+            // growing to all of them starved scanner jobs ("too many clients").
+            let aligned = if explicit_max {
+                pool_max.min(db_max_connections)
+            } else {
+                (db_max_connections / 2).max(1)
+            };
+            if pool_max != aligned {
                 log_info_lazy!(
-                    "Pool max ({}) does not match database max_connections ({}); adjusting to {}",
+                    "Pool max ({}) adjusted to {} for database max_connections {}",
                     pool_max,
-                    db_max_connections,
+                    aligned,
                     db_max_connections
                 );
-                pool_max = db_max_connections;
+                pool_max = aligned;
             }
         } else {
             log_info_lazy!(

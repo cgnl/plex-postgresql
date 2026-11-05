@@ -490,7 +490,7 @@ docker volume create --label "plex-pg-canary=$fixture" "$negative_config" >/dev/
 docker run -d --name "$postgres" --label "plex-pg-canary=$fixture" --network "$network" --network-alias postgres \
     --log-driver json-file --log-opt max-size=20m --log-opt max-file=3 \
     -e POSTGRES_USER=plex -e "POSTGRES_PASSWORD=$password" -e POSTGRES_DB=plex \
-    "$POSTGRES_IMAGE" -c "log_statement=$postgres_log_statement" -c log_min_error_statement=error >/dev/null
+    "$POSTGRES_IMAGE" -c max_connections=200 -c "log_statement=$postgres_log_statement" -c log_min_error_statement=error >/dev/null
 postgres_ready=false
 for ((attempt=1; attempt<=60; attempt++)); do
     if docker exec "$postgres" pg_isready -U plex -d plex >/dev/null 2>&1; then postgres_ready=true; break; fi

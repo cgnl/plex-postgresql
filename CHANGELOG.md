@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The connection pool of Plex Media Server no longer grows to all of PostgreSQL's `max_connections`. Without an explicit `PLEX_PG_POOL_MAX` it stops at half of them, leaving the rest for scanner, matcher and analysis jobs, which each open their own connections since 1.3.24. The long load test failed with "too many clients" on all eight configurations.
+- The native test harnesses run PostgreSQL with `max_connections=200`, the documented minimum.
+
 ## [1.3.25] - 2026-11-04
 
 ### Fixed
