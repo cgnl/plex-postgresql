@@ -8,15 +8,17 @@ A small shim library that catches Plex SQLite calls and sends them to PostgreSQL
 
 ## Current validation status
 
-**v1.3.25 is a regular release published without the certification matrix**, at the maintainer's request. It contains Linux AMD64/ARM64 and macOS ARM64 downloads, and LinuxServer and PlexInc Docker images for AMD64 and ARM64. The images are the ones built and smoke-tested by the native probe run (LinuxServer and PlexInc × AMD64 and ARM64 × PostgreSQL 15 and 18, one restart each).
+**v1.3.26 is a certified release.** Linux AMD64/ARM64 and macOS ARM64 downloads are available, along with LinuxServer and PlexInc Docker images.
 
-v1.3.25 was tested on Plex 1.43.5.11079 (official Debian package, ARM64) against PostgreSQL 15 on another host: a fresh start on an empty database, native installation and migration, library deletion, emptying the trash, filter lists, metadata matching and media analysis, and request latency at network round-trip times up to 17 ms. Unit tests, CI and the native ZIP installation check pass. The 100-restart and 5 hour 50 minute load matrix was not run for this release.
+All eight Linux configurations passed 100 restart cycles, 5 hours 50 minutes of movie and TV playback load with four simultaneous clients, and recovery after a live PostgreSQL restart. All four native ZIP installation and migration checks passed. The macOS ARM64 build was checked separately; the full playback matrix ran on Linux.
 
-The last fully certified release is [v1.3.23](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.23): **LinuxServer and PlexInc × native AMD64 and ARM64 × PostgreSQL 15 and 18** with Plex **1.43.4.10903-e5521bd8c**, 100 restart cycles, 5 hours 50 minutes of playback load and recovery after a live PostgreSQL restart. See the [completed test run](https://github.com/cgnl/plex-postgresql/actions/runs/38313571637).
+The tested matrix is **LinuxServer and PlexInc × native AMD64 and ARM64 × PostgreSQL 15 and 18**, using Plex **1.43.5.11079-b3b13e506**. The published Linux ZIP and Docker images are the exact tested files and images. See the [completed test run](https://github.com/cgnl/plex-postgresql/actions/runs/42045910733).
 
-## Latest published release: [v1.3.25](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.25)
+PostgreSQL needs `max_connections` of at least 200: scanner, matcher and analysis jobs open their own connections.
 
-Published on 4 November 2026. Lets Plex 1.43.5 start on a fresh PostgreSQL database. v1.3.24 (same day) fixed native Linux installation and configuration, cut PostgreSQL round trips, and fixed library deletion, emptying the trash, filter lists, and metadata matching and media analysis jobs. See [the changelog](CHANGELOG.md).
+## Latest published release: [v1.3.26](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.26)
+
+Published on 6 November 2026. Certified with Plex 1.43.5 and leaves PostgreSQL connections free for scanner jobs. v1.3.24 and v1.3.25 (4 November) fixed native Linux installation and configuration, cut PostgreSQL round trips, fixed library deletion, emptying the trash, filter lists, metadata matching and media analysis, and a fresh start of Plex 1.43.5. See [the changelog](CHANGELOG.md).
 
 ### Runtime architecture introduced in v1.2.0
 
@@ -28,7 +30,7 @@ Published on 4 November 2026. Lets Plex 1.43.5 start on a fresh PostgreSQL datab
 - 🔧 **Stack safety:** heap-allocated thread-local buffers for Plex's 544K worker thread stacks
 - ✅ **712 tests passing** across unit, integration, and compatibility suites
 
-[📥 Download v1.3.25](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.25) | [📋 Full Changelog](CHANGELOG.md)
+[📥 Download v1.3.26](https://github.com/cgnl/plex-postgresql/releases/tag/v1.3.26) | [📋 Full Changelog](CHANGELOG.md)
 
 New automatic releases require a certificate for the exact tested source and
 Linux ZIP/image bytes. Tag pushes no longer independently publish assets.

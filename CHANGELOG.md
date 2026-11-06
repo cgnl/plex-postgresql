@@ -6,15 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [1.3.26]
-
-- Stage native compatibility verification for Plex 1.43.5.11079-b3b13e506. Certification is pending.
-
 ## [Unreleased]
+
+## [1.3.26] - 2026-11-06
 
 ### Fixed
 - The connection pool of Plex Media Server no longer grows to all of PostgreSQL's `max_connections`. Without an explicit `PLEX_PG_POOL_MAX` it stops at half of them, leaving the rest for scanner, matcher and analysis jobs, which each open their own connections since 1.3.24. The long load test failed with "too many clients" on all eight configurations.
 - The native test harnesses run PostgreSQL with `max_connections=200`, the documented minimum.
+
+### Tested
+- Certified with Plex 1.43.5.11079-b3b13e506: LinuxServer and PlexInc, native AMD64 and ARM64, PostgreSQL 15 and 18. All eight configurations passed 100 restarts, 5 hours 50 minutes of playback load and live PostgreSQL recovery; four native ZIP installation checks passed. The published Linux ZIP and Docker images are the certified bytes. The macOS ARM64 ZIP was built from the same tag and checked separately.
 
 ## [1.3.25] - 2026-11-04
 
