@@ -20,8 +20,9 @@ on:
 permissions:
   contents: read
 
+# Same group as the certified publisher: both may move :latest.
 concurrency:
-  group: manual-release-docker
+  group: certified-release-publication
   cancel-in-progress: false
 
 jobs:
@@ -91,6 +92,8 @@ jobs:
             docker buildx imagetools create --tag "$repository:$TAG" "$amd64" "$arm64"
             digest=$(docker buildx imagetools inspect "$repository:$TAG" | awk '/^Digest:/ {print $2; exit}')
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            # Re-read right before promoting in case a release was published meanwhile.
+            latest_release=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
             if [[ "$latest_release" == "$TAG" ]]; then
               docker buildx imagetools create --tag "$repository:latest" "$repository@$digest"
               echo "$repository:$TAG and :latest -> $digest" >> "$GITHUB_STEP_SUMMARY"

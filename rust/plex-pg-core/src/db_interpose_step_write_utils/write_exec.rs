@@ -245,7 +245,7 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
         }
 
         crate::db_interpose_exec::pg_path::copy_pg_outcome(handle_conn, exec_conn);
-        crate::db_interpose_exec::pg_path::note_autocommit_end(ec.conn);
+        crate::db_interpose_exec::pg_path::note_write_done(exec_conn, cstr_bytes(stmt.sql), false);
         stmt.write_executed = 1;
         if !res.is_null() {
             // A statement Plex wrote with RETURNING produces rows, as in
