@@ -16,6 +16,19 @@ pub(super) unsafe fn set_pg_conn_error(pg_conn_error_out: *mut c_int) {
     }
 }
 
+/// `read_done` after the first fetch failed. No row has reached the caller, so
+/// when the session was lost the statement stays retryable: the step retry
+/// re-runs it on the recovered session (a read prepared from the description
+/// cache meets a dead session only here, not at prepare). Any other failure is
+/// final.
+pub(super) unsafe fn first_fetch_failure_state(pq: *mut crate::libpq_helpers::PGconn) -> c_int {
+    if crate::libpq_helpers::rust_pq_status(pq) != 0 {
+        0
+    } else {
+        -1
+    }
+}
+
 pub(super) fn first_execute_impl(
     pg_stmt: *mut PgStmt,
     exec_conn_io: *mut *mut PgConnection,
@@ -113,6 +126,7 @@ pub(super) fn first_execute_impl(
             exec_conn,
             &mut stmt_guard,
             &mut conn_guard,
+            pg_conn_error_out,
         )
     }
 }

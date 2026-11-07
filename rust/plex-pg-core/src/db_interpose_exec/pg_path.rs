@@ -261,6 +261,7 @@ pub(crate) fn exec_via_postgres(
 
                 let status = crate::libpq_helpers::rust_pq_result_status(res);
                 if status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK {
+                    note_autocommit_end(pg.conn);
                     clear_pg_last_error(pg_conn);
                     let cmd_tuples = crate::libpq_helpers::rust_pq_cmd_tuples(res);
                     let tuples_ptr = if cmd_tuples.is_null() {
@@ -363,5 +364,13 @@ pub(crate) fn exec_via_postgres(
         }
         clear_pg_last_error(pg_conn);
         SQLITE_OK
+    }
+}
+
+/// DDL outside a transaction is committed as soon as it ran; let the
+/// description cache resume (otherwise only a later transaction end would).
+pub(crate) fn note_autocommit_end(pq: *mut crate::libpq_helpers::PGconn) {
+    if crate::libpq_helpers::rust_pq_transaction_status(pq) == 0 {
+        crate::descriptor_cache::transaction_ended();
     }
 }

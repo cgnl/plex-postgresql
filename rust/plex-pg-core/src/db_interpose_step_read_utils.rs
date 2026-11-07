@@ -128,6 +128,22 @@ mod tests {
     }
 
     #[test]
+    fn cross_thread_reexecution_keeps_read_ahead_streams() {
+        let stmt_ptr = make_stmt();
+        let s = unsafe { &mut *stmt_ptr };
+        s.result_conn = 0x1234usize as *mut PgConnection;
+        s.streaming_mode = 1;
+        s.spill_state = 1;
+
+        // The remaining rows are local; a requery would replay from row 0.
+        assert!(!should_clear_cross_thread_result(stmt_ptr, 0x5678usize as *mut PgConnection));
+
+        let s = unsafe { &mut *stmt_ptr };
+        s.spill_state = 0;
+        rust_stmt_free(stmt_ptr);
+    }
+
+    #[test]
     fn cross_thread_reexecution_keeps_materialized_eager_results() {
         let stmt_ptr = make_stmt();
         let result = 0x1234usize as *mut PGresult;

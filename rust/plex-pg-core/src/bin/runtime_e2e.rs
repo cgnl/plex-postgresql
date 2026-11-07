@@ -399,7 +399,7 @@ fn run() -> Result<()> {
         &'static str,
         fn(&Api, &Db<'_>, &Db<'_>, &mut Client) -> Result<()>,
     );
-    let cases: [Case; 21] = [
+    let cases: [Case; 22] = [
         (
             "native_uuid_binding_ownership",
             |api, first, _, observer| {
@@ -1154,6 +1154,19 @@ fn run() -> Result<()> {
             },
         ),
         (
+            // `LIMIT 1` reads take the eager (non-streaming) path; a query that
+            // fails while executing must report an error, not an empty result.
+            "eager_query_errors",
+            |api, first, _, _| {
+                let stmt = first.prepare("SELECT CAST(1 AS INTEGER) / CAST(abs(random()) * 0 AS INTEGER) AS boom LIMIT 1")?;
+                let code = unsafe { (api.step)(stmt.handle) };
+                require(code != ROW && code != DONE, "failed eager query reported success")?;
+                require(!api.error(first.handle).is_empty(), "failed eager query lacks diagnostics")?;
+                require(unsafe { (api.step)(stmt.handle) } != ROW, "failed eager query produced rows")?;
+                Ok(())
+            },
+        ),
+        (
             // Plex 1.43.5 migration 202609141200 records a preference this way;
             // a failure aborted the migration on a fresh database.
             "preferences_upsert_returning",
@@ -1274,6 +1287,12 @@ fn run() -> Result<()> {
                     .is_err(),
                 "interrupted transaction silently resumed in autocommit",
             )?;
+            // The server discarded the transaction with the session; ROLLBACK
+            // must clear it so the handle can start new transactions.
+            first.exec("ROLLBACK")?;
+            first.exec("BEGIN")?;
+            first.exec("INSERT INTO runtime_items (unique_value) VALUES (603)")?;
+            first.exec("COMMIT")?;
             require(
                 observer.query_one("SELECT COUNT(*) FROM runtime_e2e.runtime_items WHERE unique_value IN (601,602)", &[]).map_err(|error| error.to_string())?.get::<_, i64>(0) == 0,
                 "interrupted transaction persisted partial writes",

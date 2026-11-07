@@ -32,6 +32,29 @@ fn state_for(conn: *mut PgConnection) -> Arc<Mutex<TransactionState>> {
         .clone()
 }
 
+/// A transaction is tracked but can no longer be on this session: the session
+/// is unusable, was replaced, or is idle.
+/// Caller holds the connection mutex.
+unsafe fn session_lost_locked(conn: *mut PgConnection) -> bool {
+    let state = state_for(conn);
+    let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.active
+        && ((*conn).conn.is_null()
+            || rust_pq_status((*conn).conn) != super::session::CONNECTION_OK
+            || state.session != (*conn).conn as usize
+            || rust_pq_transaction_status((*conn).conn) == 0)
+}
+
+fn forget_lost_transaction(conn: *mut PgConnection) {
+    let state = state_for(conn);
+    *state.lock().unwrap_or_else(|poison| poison.into_inner()) = TransactionState::default();
+    crate::descriptor_cache::transaction_ended();
+    unsafe {
+        (*conn).last_error_code = 0;
+        (*conn).last_error.fill(0);
+    }
+}
+
 pub(crate) fn forget_connection(conn: *mut PgConnection) {
     states()
         .lock()
@@ -232,6 +255,12 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, &'static str> {
     Ok(tokens)
 }
 
+/// A plain ROLLBACK (not ROLLBACK TO): allowed through the session check so
+/// it can clear a transaction whose session was lost.
+pub(crate) fn is_rollback_sql(sql: &str) -> bool {
+    is_transaction_sql(sql) && matches!(parse(sql), Ok(Control::Rollback))
+}
+
 pub(crate) fn is_transaction_sql(sql: &str) -> bool {
     let sql = crate::pg_config::strip_leading_ws_and_sql_comments(sql);
     let keyword = sql
@@ -379,6 +408,13 @@ pub(crate) fn execute_transaction(conn: *mut PgConnection, sql: &str) -> Option<
 unsafe fn execute(conn: *mut PgConnection, sql: &str) -> Result<c_int, c_int> {
     let _guard = PthreadMutexGuard::lock(&mut (*conn).mutex);
     let control = parse(sql).map_err(|message| set_error(conn, message))?;
+    if matches!(control, Control::Rollback) && session_lost_locked(conn) {
+        // The server discarded the transaction with the session, so the
+        // rollback has already happened; forget it instead of refusing
+        // forever (nothing else clears a transaction whose session is gone).
+        forget_lost_transaction(conn);
+        return Ok(0);
+    }
     if (*conn).conn.is_null() || rust_pq_status((*conn).conn) != super::session::CONNECTION_OK {
         return Err(set_error(
             conn,
@@ -492,7 +528,7 @@ unsafe fn execute(conn: *mut PgConnection, sql: &str) -> Result<c_int, c_int> {
             }
         }
     }
-    if ends_transaction {
+    if ends_transaction && rust_pq_transaction_status((*conn).conn) == 0 {
         crate::descriptor_cache::transaction_ended();
     }
     (*conn).last_error_code = 0;

@@ -6,6 +6,7 @@ pub(super) unsafe fn eager_fetch_result(
     exec_conn: *mut PgConnection,
     stmt_guard: &mut Option<StmtGuard>,
     conn_guard: &mut PthreadMutexGuard,
+    pg_conn_error_out: *mut c_int,
 ) -> c_int {
     let s = &mut *pg_stmt;
     let ec = &*exec_conn;
@@ -39,18 +40,34 @@ pub(super) unsafe fn eager_fetch_result(
             *stmt_guard = None; // unlock
             return STEP_RESULT_ROW;
         }
-    } else if !s.result.is_null() {
-        let err2 = crate::libpq_helpers::rust_pq_error_message(ec.conn);
-        let ctx = CString::new("EAGER FALLBACK").unwrap();
-        let fallback_err = if err2.is_null() {
-            CString::new("?").unwrap()
+    } else {
+        // A failed query is an error, as on the streaming path; it used to
+        // come back as an empty result with only a log line.
+        if s.result.is_null() {
+            crate::db_interpose_exec::pg_path::set_pg_last_error(
+                s.conn,
+                "PostgreSQL returned no result",
+            );
         } else {
-            CString::new(cstr_to_str(err2)).unwrap_or_else(|_| CString::new("?").unwrap())
-        };
-        log_sql_fallback(s.sql, s.pg_sql, fallback_err.as_ptr(), ctx.as_ptr());
-        crate::libpq_helpers::rust_pq_clear(s.result);
-        s.result = std::ptr::null_mut();
+            let err2 = crate::libpq_helpers::rust_pq_error_message(ec.conn);
+            let ctx = CString::new("EAGER FALLBACK").unwrap();
+            let fallback_err = if err2.is_null() {
+                CString::new("?").unwrap()
+            } else {
+                CString::new(cstr_to_str(err2)).unwrap_or_else(|_| CString::new("?").unwrap())
+            };
+            log_sql_fallback(s.sql, s.pg_sql, fallback_err.as_ptr(), ctx.as_ptr());
+            crate::db_interpose_exec::pg_path::record_pg_result_error(s.conn, exec_conn, s.result);
+            crate::libpq_helpers::rust_pq_clear(s.result);
+            s.result = std::ptr::null_mut();
+        }
+        s.result_conn = std::ptr::null_mut();
+        s.read_done = first_fetch_failure_state(ec.conn);
         crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+        *exec_conn_io = exec_conn;
+        *stmt_guard = None; // unlock
+        set_pg_conn_error(pg_conn_error_out);
+        return STEP_RESULT_ERROR;
     }
 
     s.read_done = 1;
