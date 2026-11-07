@@ -183,6 +183,7 @@ pub(super) unsafe fn ensure_connection_ready(
     log_error("=== END DIAGNOSTIC ===");
     log_error("STEP READ: Attempting PQreset...");
     crate::libpq_helpers::rust_pq_reset(ec.conn);
+    crate::descriptor_cache::connection_idle(exec_conn as usize);
 
     if crate::libpq_helpers::rust_pq_status(ec.conn) != CONNECTION_OK {
         log_error("STEP READ: PQreset failed, trying fresh PQconnectdb...");

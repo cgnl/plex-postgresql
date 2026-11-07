@@ -199,6 +199,7 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         let original_sql = call_sqlite3_sql(p_stmt);
         let sql = crate::db_interpose_helpers::cstr_to_str_or_empty(original_sql);
         if !crate::pg_config::is_sqlite_passthrough_str(sql)
+            && !statement_is_rollback(p_stmt, sql)
             && !crate::pg_client::transaction::session_ready(handle_conn)
         {
             return SQLITE_ERROR;
@@ -471,4 +472,17 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         libc::fflush(stderr_ptr());
     }
     rc
+}
+
+/// ROLLBACK may run on a lost session (it clears the tracked transaction).
+/// PostgreSQL statements wrap a placeholder SQLite statement, so the original
+/// SQL comes from the shim's statement when there is one.
+unsafe fn statement_is_rollback(p_stmt: *mut sqlite3_stmt, sqlite_sql: &str) -> bool {
+    let pg_stmt = crate::pg_statement::rust_stmt_find(p_stmt as usize) as *mut PgStmt;
+    let sql = if pg_stmt.is_null() || (*pg_stmt).sql.is_null() {
+        sqlite_sql
+    } else {
+        crate::db_interpose_helpers::cstr_to_str_or_empty((*pg_stmt).sql)
+    };
+    crate::pg_client::transaction::is_rollback_sql(sql)
 }

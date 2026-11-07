@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A read that fails while PostgreSQL executes it now reports the error. Reads that do not stream (for example `LIMIT 1` queries) returned an empty result instead, with only a log line.
+- `ROLLBACK` after the PostgreSQL session was lost mid-transaction clears the transaction; the handle could not start a new transaction until it was closed. It succeeds, unless the session broke during `COMMIT`: then it reports that the commit's outcome is unknown. Closed or destroyed connections no longer leave transaction state behind for a later connection at the same address.
+- A connection error noted during one step no longer makes the next failing statement on the same thread retry as if its connection had failed.
+- The result-description cache tracks uncommitted DDL per session: it resumes after DDL that ran outside a transaction, and another session's commit or autocommit write (or an inner `RELEASE SAVEPOINT`) no longer ends the window early.
+- A statement whose stream was read ahead is no longer re-run from the first row when it is stepped from another connection.
+- Manual image publication only moves `:latest` when it publishes the repository's latest release, checked right before promotion.
 - A shadow database without its sidecar file (an interrupted installation) is still refused, since it may have been used as a real library since, but the error now explains that and how to recover.
 - Release staging no longer closes older staging pull requests (and deletes their branches) while a certification is running or queued, which had discarded a finished 1.3.26 certification.
 

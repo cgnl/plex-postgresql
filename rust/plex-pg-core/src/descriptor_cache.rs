@@ -12,10 +12,10 @@
 //! - DDL seen anywhere in the shim (prepare, free, `sqlite3_exec`) clears the
 //!   cache and bumps a generation; a description taken before the bump is not
 //!   stored afterwards.
-//! - While DDL may be uncommitted, nothing is stored, and the end of the next
-//!   transaction clears the cache again (another session may have described
-//!   the old shape before the commit, or this session the new shape before a
-//!   rollback).
+//! - While any session has executed DDL that is not yet committed or rolled
+//!   back, nothing is stored; when that session is idle again the cache is
+//!   cleared (another session may have described the old shape before the
+//!   commit, or this session the new shape before a rollback).
 //! - Statements that name a temporary table are never cached (temporary
 //!   tables are per session; the cache is per process).
 //! - An execution whose columns differ from the description replaces it (see
@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::libpq_helpers::{self, PGresult, PG_COPYRES_ATTRS};
@@ -41,6 +41,9 @@ struct Cache {
     entries: HashMap<Vec<u8>, Vec<(c_int, usize)>>,
     len: usize,
     temporary_tables: Vec<Vec<u8>>,
+    /// Sessions (connection addresses) that executed DDL not yet committed
+    /// or rolled back. Nothing is stored while any exists.
+    ddl_sessions: Vec<usize>,
 }
 
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| {
@@ -48,10 +51,10 @@ static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| {
         entries: HashMap::new(),
         len: 0,
         temporary_tables: Vec::new(),
+        ddl_sessions: Vec::new(),
     })
 });
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-static DDL_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn with_cache<T>(f: impl FnOnce(&mut Cache) -> T) -> T {
     let mut cache = CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -90,12 +93,13 @@ pub(crate) fn lookup(sql: &CStr, param_count: c_int) -> *mut PGresult {
 /// may have changed since `described_at` (a `generation()` value).
 pub(crate) fn store(sql: &CStr, param_count: c_int, descriptor: *const PGresult, described_at: u64) {
     let bytes = sql.to_bytes();
-    if bytes.len() > MAX_SQL_BYTES || DDL_PENDING.load(Ordering::SeqCst) {
+    if bytes.len() > MAX_SQL_BYTES {
         return;
     }
     with_cache(|cache| {
         // Checked under the lock: `clear` bumps the generation under it too.
         if GENERATION.load(Ordering::SeqCst) != described_at
+            || !cache.ddl_sessions.is_empty()
             || cache.temporary_tables.iter().any(|name| contains_word(bytes, name))
         {
             return;
@@ -143,10 +147,8 @@ pub(crate) fn clear() {
     });
 }
 
-/// A CREATE/ALTER/DROP is about to run or has run. Stops caching until the
-/// end of the next transaction, which clears again.
+/// A CREATE/ALTER/DROP is about to run: drop what was cached so far.
 pub(crate) fn note_ddl(sql: &[u8]) {
-    DDL_PENDING.store(true, Ordering::SeqCst);
     let temporary = temporary_table_name(sql);
     with_cache(|cache| {
         GENERATION.fetch_add(1, Ordering::SeqCst);
@@ -159,11 +161,29 @@ pub(crate) fn note_ddl(sql: &[u8]) {
     });
 }
 
-/// A transaction ended (COMMIT, ROLLBACK, RELEASE, ROLLBACK TO).
-pub(crate) fn transaction_ended() {
-    if DDL_PENDING.swap(false, Ordering::SeqCst) {
-        clear();
-    }
+/// DDL ran on `session`. Until that session is idle again (its transaction
+/// committed or rolled back), other sessions may still see the old schema
+/// and this one the new, so nothing is cached.
+pub(crate) fn ddl_executed(session: usize) {
+    with_cache(|cache| {
+        GENERATION.fetch_add(1, Ordering::SeqCst);
+        clear_entries(cache);
+        if !cache.ddl_sessions.contains(&session) {
+            cache.ddl_sessions.push(session);
+        }
+    });
+}
+
+/// `session` has no open transaction (or is gone). Ends its DDL window, if
+/// any; the schema others see may just have changed, so drop the cache.
+pub(crate) fn connection_idle(session: usize) {
+    with_cache(|cache| {
+        if let Some(position) = cache.ddl_sessions.iter().position(|&s| s == session) {
+            cache.ddl_sessions.swap_remove(position);
+            GENERATION.fetch_add(1, Ordering::SeqCst);
+            clear_entries(cache);
+        }
+    });
 }
 
 fn skip_space_and_comments(sql: &[u8]) -> &[u8] {
@@ -254,6 +274,20 @@ mod tests {
         assert!(!starts_with_ddl(b"update t set c = 1"));
         assert!(!starts_with_ddl(b"-- drop\nselect 1"));
         assert!(!starts_with_ddl(b""));
+    }
+
+    fn ddl_window_open_for(session: usize) -> bool {
+        with_cache(|cache| cache.ddl_sessions.contains(&session))
+    }
+
+    #[test]
+    fn ddl_window_is_closed_only_by_its_own_session() {
+        let (ddl, other) = (0xD01usize, 0xD02usize);
+        ddl_executed(ddl);
+        connection_idle(other);
+        assert!(ddl_window_open_for(ddl), "another session closed the DDL window");
+        connection_idle(ddl);
+        assert!(!ddl_window_open_for(ddl));
     }
 
     #[test]

@@ -117,16 +117,3 @@ pub(super) unsafe fn streaming_fetch_result(
     set_pg_conn_error(pg_conn_error_out);
     STEP_RESULT_ERROR
 }
-
-/// `read_done` after the first fetch failed. No row has reached the caller, so
-/// when the session was lost the statement stays retryable: the step retry
-/// re-runs it on the recovered session (a read prepared from the description
-/// cache meets a dead session only here, not at prepare). Any other failure is
-/// final.
-unsafe fn first_fetch_failure_state(pq: *mut crate::libpq_helpers::PGconn) -> c_int {
-    if crate::libpq_helpers::rust_pq_status(pq) != 0 {
-        0
-    } else {
-        -1
-    }
-}
