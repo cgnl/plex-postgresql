@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The result-description cache tracks uncommitted DDL per session: it resumes after DDL that ran outside a transaction, and another session's commit or autocommit write (or an inner `RELEASE SAVEPOINT`) no longer ends the window early.
 - A statement whose stream was read ahead is no longer re-run from the first row when it is stepped from another connection.
 - Manual image publication only moves `:latest` when it publishes the repository's latest release, checked right before promotion.
+- A shadow database without its sidecar file (an interrupted installation) is still refused, since it may have been used as a real library since, but the error now explains that and how to recover.
+- Release staging no longer closes older staging pull requests (and deletes their branches) while a certification is running or queued, which had discarded a finished 1.3.26 certification.
 
 ## [1.3.26] - 2026-11-06
 

@@ -439,12 +439,36 @@ sys.exit(0 if identity == [(expected,)] and expected else 1)
 PY
 }
 
+# A database with a shadow marker but no sidecar is most likely left by an
+# interrupted shadow installation (the database is moved before its sidecar).
+# It is still refused: it may since have been used as a real library.
+shadow_recovery_hint() {
+    [[ -f "$1" && ! -e "${1}.plex-pg-shadow" ]] || return 0
+    python3 - "$1" <<'PY' || return 0
+import pathlib
+import sqlite3
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    connection = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
+    rows = connection.execute('SELECT identity FROM plex_pg_shadow_marker').fetchall()
+    connection.close()
+except (OSError, sqlite3.Error):
+    sys.exit(1)
+sys.exit(0 if len(rows) == 1 else 1)
+PY
+    echo "  It carries a plex-postgresql shadow marker but no ${1}.plex-pg-shadow file, which usually means a" >&2
+    echo "  shadow installation was interrupted. If it was not used with plain Plex since, move it aside and start again." >&2
+}
+
 protect_shadow_destinations() {
     local shadow_dir="$1" db_file
     protect_sqlite_sources "$shadow_dir" || return 1
     for db_file in "$shadow_dir/com.plexapp.plugins.library.db" "$shadow_dir/com.plexapp.plugins.library.blobs.db"; do
         if [[ -e "$db_file" ]] && ! is_shadow_database "$db_file"; then
             echo "ERROR: Unmarked SQLite destination $db_file; preserve it as a separate source/backup before startup." >&2
+            shadow_recovery_hint "$db_file"
             return 1
         fi
     done
@@ -720,6 +744,7 @@ build_shadow_database() (
     protect_sqlite_sources "$(dirname "$db_file")" || return 1
     if [[ -e "$db_file" ]] && ! is_shadow_database "$db_file"; then
         echo "ERROR: Unmarked SQLite destination $db_file; preserve it as a separate backup before rebuilding." >&2
+        shadow_recovery_hint "$db_file"
         return 1
     fi
     temporary=$(mktemp "${db_file}.new.XXXXXX") || return 1
