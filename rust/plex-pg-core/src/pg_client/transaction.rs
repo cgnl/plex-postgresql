@@ -11,6 +11,9 @@ use crate::libpq_helpers::*;
 struct TransactionState {
     active: bool,
     implicit: bool,
+    /// The session failed while COMMIT was in flight: the server may or may
+    /// not have committed.
+    commit_outcome_unknown: bool,
     session: usize,
     next_savepoint: u64,
     savepoints: Vec<(String, String)>,
@@ -32,7 +35,35 @@ fn state_for(conn: *mut PgConnection) -> Arc<Mutex<TransactionState>> {
         .clone()
 }
 
+/// A transaction is tracked but can no longer be on this session: the session
+/// is unusable, was replaced, or is idle.
+/// Caller holds the connection mutex.
+unsafe fn session_lost_locked(conn: *mut PgConnection) -> bool {
+    let state = state_for(conn);
+    let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.active
+        && ((*conn).conn.is_null()
+            || rust_pq_status((*conn).conn) != super::session::CONNECTION_OK
+            || state.session != (*conn).conn as usize
+            || rust_pq_transaction_status((*conn).conn) == 0)
+}
+
+/// Returns whether a COMMIT was in flight when the session was lost.
+fn forget_lost_transaction(conn: *mut PgConnection) -> bool {
+    let state = state_for(conn);
+    let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    let unknown = state.commit_outcome_unknown;
+    *state = TransactionState::default();
+    crate::descriptor_cache::connection_idle(conn as usize);
+    unsafe {
+        (*conn).last_error_code = 0;
+        (*conn).last_error.fill(0);
+    }
+    unknown
+}
+
 pub(crate) fn forget_connection(conn: *mut PgConnection) {
+    crate::descriptor_cache::connection_idle(conn as usize);
     states()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -114,6 +145,7 @@ pub(crate) fn ensure_handle_session(conn: *mut PgConnection) {
         if !(*conn).conn.is_null() {
             if rust_pq_status((*conn).conn) != super::session::CONNECTION_OK {
                 rust_pq_reset((*conn).conn);
+                crate::descriptor_cache::connection_idle(conn as usize);
                 if rust_pq_status((*conn).conn) == super::session::CONNECTION_OK {
                     super::session::pg_set_socket_timeout((*conn).conn);
                     super::session::apply_session_settings((*conn).conn, &config.schema, false);
@@ -232,6 +264,12 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, &'static str> {
     Ok(tokens)
 }
 
+/// A plain ROLLBACK (not ROLLBACK TO): allowed through the session check so
+/// it can clear a transaction whose session was lost.
+pub(crate) fn is_rollback_sql(sql: &str) -> bool {
+    is_transaction_sql(sql) && matches!(parse(sql), Ok(Control::Rollback))
+}
+
 pub(crate) fn is_transaction_sql(sql: &str) -> bool {
     let sql = crate::pg_config::strip_leading_ws_and_sql_comments(sql);
     let keyword = sql
@@ -347,6 +385,24 @@ pub(crate) unsafe fn set_error(conn: *mut PgConnection, message: &str) -> c_int 
     1
 }
 
+/// Run COMMIT/ROLLBACK; a COMMIT that fails because the session broke has
+/// an unknown outcome, which a later ROLLBACK must report.
+unsafe fn commit_or_mark_unknown(
+    conn: *mut PgConnection,
+    state: &mut TransactionState,
+    committing: bool,
+    sql: &str,
+) -> Result<(), c_int> {
+    let outcome = command(conn, sql);
+    if outcome.is_err()
+        && committing
+        && ((*conn).conn.is_null() || rust_pq_status((*conn).conn) != super::session::CONNECTION_OK)
+    {
+        state.commit_outcome_unknown = true;
+    }
+    outcome
+}
+
 unsafe fn command(conn: *mut PgConnection, sql: &str) -> Result<(), c_int> {
     let sql = CString::new(sql).map_err(|_| set_error(conn, "Invalid transaction SQL"))?;
     let result = rust_pq_exec((*conn).conn, sql.as_ptr());
@@ -379,6 +435,20 @@ pub(crate) fn execute_transaction(conn: *mut PgConnection, sql: &str) -> Option<
 unsafe fn execute(conn: *mut PgConnection, sql: &str) -> Result<c_int, c_int> {
     let _guard = PthreadMutexGuard::lock(&mut (*conn).mutex);
     let control = parse(sql).map_err(|message| set_error(conn, message))?;
+    if matches!(control, Control::Rollback) && session_lost_locked(conn) {
+        // The server discarded the transaction with the session, so the
+        // rollback has already happened; forget it instead of refusing
+        // forever (nothing else clears a transaction whose session is gone).
+        // Unless a COMMIT was in flight: then it may have committed.
+        let unknown = forget_lost_transaction(conn);
+        if unknown {
+            return Err(set_error(
+                conn,
+                "PostgreSQL session was lost during COMMIT; whether it committed is unknown",
+            ));
+        }
+        return Ok(0);
+    }
     if (*conn).conn.is_null() || rust_pq_status((*conn).conn) != super::session::CONNECTION_OK {
         return Err(set_error(
             conn,
@@ -435,14 +505,8 @@ unsafe fn execute(conn: *mut PgConnection, sql: &str) -> Result<c_int, c_int> {
                     "Cannot commit an aborted PostgreSQL transaction; rollback required",
                 ));
             }
-            command(
-                conn,
-                if matches!(control, Control::Commit) {
-                    "COMMIT"
-                } else {
-                    "ROLLBACK"
-                },
-            )?;
+            let committing = matches!(control, Control::Commit);
+            commit_or_mark_unknown(conn, &mut state, committing, if committing { "COMMIT" } else { "ROLLBACK" })?;
             *state = TransactionState::default();
         }
         Control::Savepoint(name) => {
@@ -474,7 +538,7 @@ unsafe fn execute(conn: *mut PgConnection, sql: &str) -> Result<c_int, c_int> {
                             "Cannot release an aborted transaction; rollback required",
                         ));
                     }
-                    command(conn, "COMMIT")?;
+                    commit_or_mark_unknown(conn, &mut state, true, "COMMIT")?;
                     *state = TransactionState::default();
                 } else {
                     command(
@@ -492,8 +556,8 @@ unsafe fn execute(conn: *mut PgConnection, sql: &str) -> Result<c_int, c_int> {
             }
         }
     }
-    if ends_transaction {
-        crate::descriptor_cache::transaction_ended();
+    if ends_transaction && rust_pq_transaction_status((*conn).conn) == 0 {
+        crate::descriptor_cache::connection_idle(conn as usize);
     }
     (*conn).last_error_code = 0;
     (*conn).last_error.fill(0);

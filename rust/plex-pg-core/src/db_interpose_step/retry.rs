@@ -79,5 +79,8 @@ pub(super) fn maybe_retry_step(p_stmt: *mut sqlite3_stmt, rc: c_int) -> Option<c
         STEP_RETRY_COUNT.with(|c| c.set(0));
     }
 
+    // The flag belongs to this step; a stale value would let the next failing
+    // statement on this thread be retried as a connection error.
+    STEP_PG_CONN_ERROR.with(|c| c.set(0));
     None
 }

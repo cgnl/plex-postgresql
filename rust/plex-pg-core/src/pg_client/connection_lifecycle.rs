@@ -164,6 +164,7 @@ pub(super) fn destroy_pool_connection(conn: *mut c_void) {
     }
     pool().forget_live_pool_connection(conn_ptr as *const c_void);
     rust_stmt_cache_drop(conn_ptr as *mut c_void);
+    super::transaction::forget_connection(conn_ptr);
     // SAFETY: conn_ptr is non-null after the check above.
     let conn = unsafe { &mut *conn_ptr };
     if !conn.conn.is_null() {
@@ -193,6 +194,8 @@ pub(super) fn reset_conn(conn: *mut c_void) -> bool {
         return false;
     }
     rust_pq_reset(conn.conn);
+    // Whatever transaction the old session had is gone with it.
+    crate::descriptor_cache::connection_idle(conn_ptr as usize);
     if rust_pq_status(conn.conn) != CONNECTION_OK {
         return false;
     }
@@ -273,6 +276,9 @@ pub(super) fn close_handle_connection(conn_ptr: *mut PgConnection) {
     }
     rust_stmt_cache_clear(conn_ptr as *mut c_void);
     rust_stmt_cache_drop(conn_ptr as *mut c_void);
+    // A later connection may be allocated at this address; it must not
+    // inherit this one's transaction state.
+    super::transaction::forget_connection(conn_ptr);
     // SAFETY: conn_ptr is non-null after the check above.
     let conn = unsafe { &mut *conn_ptr };
     let _conn_guard = unsafe { PthreadMutexGuard::lock(&mut conn.mutex as *mut _) };

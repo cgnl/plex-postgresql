@@ -12,7 +12,9 @@ pub(crate) fn should_clear_cross_thread_result(
     if stmt.result_conn == exec_conn {
         return false;
     }
-    stmt.streaming_mode != 0
+    // A stream that was read ahead no longer needs its connection: its
+    // remaining rows are local. Requerying it would deliver from row 0 again.
+    stmt.streaming_mode != 0 && stmt.spill_state == 0
 }
 
 pub(crate) fn should_use_streaming(stmt: *const PgStmt, disable_streaming_env: bool) -> bool {
