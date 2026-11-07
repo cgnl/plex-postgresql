@@ -1,4 +1,4 @@
-"""A shadow database is recognised by its marker, with or without its sidecar."""
+"""Shadow databases need their sidecar; a marker alone only earns a recovery hint."""
 from contextlib import closing
 import pathlib
 import sqlite3
@@ -10,11 +10,11 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
-def is_shadow(path):
+def run(function, path):
     return subprocess.run(
-        ['bash', '-c', 'source "$1"; is_shadow_database "$2"', 'shadow-test',
+        ['bash', '-c', 'source "$1"; ' + function + ' "$2"', 'shadow-test',
          str(ROOT / 'scripts/migrate_lib.sh'), str(path)],
-        capture_output=True, text=True, timeout=30).returncode == 0
+        capture_output=True, text=True, timeout=30)
 
 
 class ShadowMarkerTests(unittest.TestCase):
@@ -27,30 +27,34 @@ class ShadowMarkerTests(unittest.TestCase):
                 connection.execute('INSERT INTO plex_pg_shadow_marker VALUES (?)', (marker,))
         return path
 
-    def test_marker_and_sidecar(self):
+    def test_shadow_requires_matching_sidecar(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             matching = self.database(root, 'matching.db', 'identity-1')
             pathlib.Path(str(matching) + '.plex-pg-shadow').write_text('identity-1\n')
-            self.assertTrue(is_shadow(matching))
+            self.assertEqual(run('is_shadow_database', matching).returncode, 0)
 
             mismatched = self.database(root, 'mismatched.db', 'identity-1')
             pathlib.Path(str(mismatched) + '.plex-pg-shadow').write_text('identity-2\n')
-            self.assertFalse(is_shadow(mismatched))
+            self.assertNotEqual(run('is_shadow_database', mismatched).returncode, 0)
 
-    def test_marker_without_sidecar_after_interrupted_install(self):
+            # A marker without sidecar may since be a real library: refused.
+            unmarked = self.database(root, 'unmarked.db', 'identity-1')
+            self.assertNotEqual(run('is_shadow_database', unmarked).returncode, 0)
+
+    def test_recovery_hint_only_for_marker_without_sidecar(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            self.assertTrue(is_shadow(self.database(root, 'shadow.db', 'identity-1')))
+            interrupted = self.database(root, 'interrupted.db', 'identity-1')
+            self.assertIn('shadow installation was interrupted',
+                          run('shadow_recovery_hint', interrupted).stderr)
 
-    def test_real_library_is_never_a_shadow(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
             library = self.database(root, 'library.db')
-            self.assertFalse(is_shadow(library))
-            pathlib.Path(str(library) + '.plex-pg-shadow').write_text('identity-1\n')
-            self.assertFalse(is_shadow(library))
-            self.assertFalse(is_shadow(root / 'missing.db'))
+            self.assertEqual(run('shadow_recovery_hint', library).stderr, '')
+
+            marked = self.database(root, 'marked.db', 'identity-1')
+            pathlib.Path(str(marked) + '.plex-pg-shadow').write_text('identity-1\n')
+            self.assertEqual(run('shadow_recovery_hint', marked).stderr, '')
 
 
 if __name__ == '__main__':

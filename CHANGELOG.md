@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- A shadow database whose sidecar file is missing (installation interrupted between moving the database and its marker file) is recognised by its marker table instead of being refused as an unknown library.
-- Release staging waits for a running certification instead of closing that candidate's pull request and deleting its branch mid-certification.
+- A shadow database without its sidecar file (an interrupted installation) is still refused, since it may have been used as a real library since, but the error now explains that and how to recover.
+- Release staging no longer closes older staging pull requests (and deletes their branches) while a certification is running or queued, which had discarded a finished 1.3.26 certification.
 
 ## [1.3.26] - 2026-11-06
 

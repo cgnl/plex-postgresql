@@ -19,11 +19,8 @@ on:
         type: string
 permissions:
   contents: read
-# Shares the certification group: staging closes older staging PRs and
-# deletes their branches, which must never happen while one of them is being
-# certified. It now waits for a running certification to finish.
 concurrency:
-  group: compatibility-release-certification
+  group: compatibility-release-staging
   cancel-in-progress: false
 jobs:
   stage:
@@ -66,13 +63,22 @@ jobs:
           fi
           test "$(gh api "repos/$GITHUB_REPOSITORY/commits/${{ github.event.repository.default_branch }}" --jq .sha)" = "$SOURCE_SHA"
           git -c 'credential.helper=!gh auth git-credential' push origin "$branch"
-          # Only the newest staged leaf can be certified; close older ones.
-          gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName \
-            --jq '.[] | select(.headRefName | startswith("automation/release-stage-")) | .number' |
-          while read -r number; do
-            gh pr close "$number" --repo "$GITHUB_REPOSITORY" --delete-branch \
-              --comment "Superseded by staging run $GITHUB_RUN_ID."
-          done
+          # Only the newest staged leaf can be certified; close older ones,
+          # but never while a certification runs or waits: it may be
+          # certifying one of them (1.3.26 lost a finished certification
+          # that way). A later staging run closes them.
+          active_certifications=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release-certification.yml \
+            --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length')
+          if [[ "$active_certifications" == 0 ]]; then
+            gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName \
+              --jq '.[] | select(.headRefName | startswith("automation/release-stage-")) | .number' |
+            while read -r number; do
+              gh pr close "$number" --repo "$GITHUB_REPOSITORY" --delete-branch \
+                --comment "Superseded by staging run $GITHUB_RUN_ID."
+            done
+          else
+            echo "A certification is running; older staging PRs stay open." >> "$GITHUB_STEP_SUMMARY"
+          fi
           gh pr create --repo "$GITHUB_REPOSITORY" --base '${{ github.event.repository.default_branch }}' --head "$branch" --title "Stage compatibility release $(cat VERSION)" --body 'Version and factual changelog frozen before full native certification. Preserve this leaf with a merge; squash/rebase or concurrent main changes require fresh staging and certification.'
           echo "Frozen candidate: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
           gh workflow run release-certification.yml --ref '${{ github.event.repository.default_branch }}' -f "source_sha=$(git rev-parse HEAD)" -f "upstream_profile_json=$PROFILE_JSON" -f "profile_id=$PROFILE_ID" -f mode=full
