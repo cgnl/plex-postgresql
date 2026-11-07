@@ -194,6 +194,8 @@ pub(super) fn reset_conn(conn: *mut c_void) -> bool {
         return false;
     }
     rust_pq_reset(conn.conn);
+    // Whatever transaction the old session had is gone with it.
+    crate::descriptor_cache::connection_idle(conn_ptr as usize);
     if rust_pq_status(conn.conn) != CONNECTION_OK {
         return false;
     }

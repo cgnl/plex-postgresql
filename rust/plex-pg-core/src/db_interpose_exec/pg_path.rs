@@ -260,8 +260,10 @@ pub(crate) fn exec_via_postgres(
                 }
 
                 let status = crate::libpq_helpers::rust_pq_result_status(res);
+                // Also on failure: a batch can commit DDL before a later
+                // statement fails.
+                note_write_done(pg_conn, CStr::from_ptr(sql).to_bytes(), true);
                 if status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK {
-                    note_write_done(pg_conn, CStr::from_ptr(sql).to_bytes(), true);
                     clear_pg_last_error(pg_conn);
                     let cmd_tuples = crate::libpq_helpers::rust_pq_cmd_tuples(res);
                     let tuples_ptr = if cmd_tuples.is_null() {
@@ -367,8 +369,8 @@ pub(crate) fn exec_via_postgres(
     }
 }
 
-/// A write succeeded on `conn`. DDL opens a description-cache window that
-/// ends once the session is idle; outside a transaction that is right away.
+/// A write ran on `conn`. DDL opens a description-cache window that ends once
+/// the session is idle; outside a transaction that is right away.
 pub(crate) fn note_write_done(conn: *mut crate::ffi_types::PgConnection, sql: &[u8], batch: bool) {
     if conn.is_null() {
         return;

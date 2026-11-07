@@ -20,9 +20,11 @@ on:
 permissions:
   contents: read
 
-# Same group as the certified publisher: both may move :latest.
+# Not the certified publisher's group: a queued manual run would replace a
+# pending certified publication. The latest-release check right before
+# moving :latest keeps the two from overwriting each other's image.
 concurrency:
-  group: certified-release-publication
+  group: manual-release-docker
   cancel-in-progress: false
 
 jobs:
@@ -82,7 +84,7 @@ jobs:
           # :latest follows the repository's latest GitHub release, so a
           # manual publication of an older or newer-but-unreleased tag never
           # replaces the image of the current (possibly certified) release.
-          latest_release=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          latest_release=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
           publish() {
             local repository=$1 amd64=$2 arm64=$3
             if docker buildx imagetools inspect "$repository:$TAG" >/dev/null 2>&1; then
@@ -93,7 +95,7 @@ jobs:
             digest=$(docker buildx imagetools inspect "$repository:$TAG" | awk '/^Digest:/ {print $2; exit}')
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
             # Re-read right before promoting in case a release was published meanwhile.
-            latest_release=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+            latest_release=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
             if [[ "$latest_release" == "$TAG" ]]; then
               docker buildx imagetools create --tag "$repository:latest" "$repository@$digest"
               echo "$repository:$TAG and :latest -> $digest" >> "$GITHUB_STEP_SUMMARY"

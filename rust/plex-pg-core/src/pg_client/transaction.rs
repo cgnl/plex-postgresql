@@ -145,6 +145,7 @@ pub(crate) fn ensure_handle_session(conn: *mut PgConnection) {
         if !(*conn).conn.is_null() {
             if rust_pq_status((*conn).conn) != super::session::CONNECTION_OK {
                 rust_pq_reset((*conn).conn);
+                crate::descriptor_cache::connection_idle(conn as usize);
                 if rust_pq_status((*conn).conn) == super::session::CONNECTION_OK {
                     super::session::pg_set_socket_timeout((*conn).conn);
                     super::session::apply_session_settings((*conn).conn, &config.schema, false);
