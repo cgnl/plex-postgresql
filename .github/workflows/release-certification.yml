@@ -102,11 +102,37 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          # Docker build records are gzip data, not ZIP evidence archives.
-          pattern: '!*.dockerbuild'
-          path: certification-evidence
+      # actions/download-artifact@v4 reported success for v1.3.27 while four
+      # of the largest soak archives were never written (32 started, 28
+      # finished), so the certificate could not be issued. Download each
+      # artifact explicitly (the newest per name, skipping Docker build
+      # records, which are not ZIP evidence) and fail if any is missing.
+      - name: Download every evidence artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p certification-evidence
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not) | select(.name | endswith(".dockerbuild") | not) | "\(.created_at) \(.id) \(.name)"' |
+            sort -r | awk '!seen[$3]++ { print $2, $3 }' > artifacts.txt
+          test -s artifacts.txt
+          while read -r id name; do
+            [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]
+            for attempt in 1 2 3; do
+              rm -rf "certification-evidence/$name" artifact.zip
+              if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > artifact.zip \
+                && unzip -q artifact.zip -d "certification-evidence/$name"; then
+                break
+              fi
+              [[ "$attempt" == 3 ]] && { echo "Could not download artifact $name" >&2; exit 1; }
+              sleep 10
+            done
+            test -n "$(ls -A "certification-evidence/$name")"
+          done < artifacts.txt
+          rm -f artifact.zip
+          echo "Downloaded $(wc -l < artifacts.txt) evidence artifacts" >> "$GITHUB_STEP_SUMMARY"
       - name: Validate every cell and bind final artifact bytes
         env:
           GH_TOKEN: ${{ github.token }}
