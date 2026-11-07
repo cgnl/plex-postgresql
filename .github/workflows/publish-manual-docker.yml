@@ -84,7 +84,17 @@ jobs:
           # :latest follows the repository's latest GitHub release, so a
           # manual publication of an older or newer-but-unreleased tag never
           # replaces the image of the current (possibly certified) release.
-          latest_release=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          # Decided before any tag is written (an API error fails the run
+          # while it can still be rerun), and only while no certified
+          # publication is running, which would set :latest itself.
+          latest_release=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+            --limit 20 --json tagName,isLatest --jq '[.[] | select(.isLatest)][0].tagName // ""')
+          certified_publications=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow publish-certified-release.yml \
+            --limit 10 --json status --jq '[.[] | select(.status != "completed")] | length')
+          move_latest=false
+          if [[ "$latest_release" == "$TAG" && "$certified_publications" == 0 ]]; then
+            move_latest=true
+          fi
           publish() {
             local repository=$1 amd64=$2 arm64=$3
             if docker buildx imagetools inspect "$repository:$TAG" >/dev/null 2>&1; then
@@ -94,13 +104,11 @@ jobs:
             docker buildx imagetools create --tag "$repository:$TAG" "$amd64" "$arm64"
             digest=$(docker buildx imagetools inspect "$repository:$TAG" | awk '/^Digest:/ {print $2; exit}')
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-            # Re-read right before promoting in case a release was published meanwhile.
-            latest_release=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
-            if [[ "$latest_release" == "$TAG" ]]; then
+            if [[ "$move_latest" == true ]]; then
               docker buildx imagetools create --tag "$repository:latest" "$repository@$digest"
               echo "$repository:$TAG and :latest -> $digest" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "$repository:$TAG -> $digest (:latest left on $latest_release)" >> "$GITHUB_STEP_SUMMARY"
+              echo "$repository:$TAG -> $digest (:latest unchanged; latest release ${latest_release:-none})" >> "$GITHUB_STEP_SUMMARY"
             fi
           }
           publish ghcr.io/cgnl/plex-postgresql-linuxserver "$LINUXSERVER_AMD64" "$LINUXSERVER_ARM64"
