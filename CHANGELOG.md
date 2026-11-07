@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A statement whose stream was read ahead is no longer re-run from the first row when it is stepped from another connection.
 - Manual image publication only moves `:latest` when it publishes the repository's latest release, checked right before promotion.
 - A shadow database without its sidecar file (an interrupted installation) is still refused, since it may have been used as a real library since, but the error now explains that and how to recover.
+- The certificate job downloads every evidence artifact itself and fails if one is missing. `actions/download-artifact` reported success for 1.3.27 while four of the largest soak archives were never written, so a fully passed certification could not issue its certificate.
 - Release staging no longer closes older staging pull requests (and deletes their branches) while a certification is running or queued, which had discarded a finished 1.3.26 certification.
 
 ## [1.3.26] - 2026-11-06
