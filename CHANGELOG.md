@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A shadow database whose sidecar file is missing (installation interrupted between moving the database and its marker file) is recognised by its marker table instead of being refused as an unknown library.
+- Release staging waits for a running certification instead of closing that candidate's pull request and deleting its branch mid-certification.
+
 ## [1.3.26] - 2026-11-06
 
 ### Fixed

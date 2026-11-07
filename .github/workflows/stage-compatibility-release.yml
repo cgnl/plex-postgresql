@@ -19,8 +19,11 @@ on:
         type: string
 permissions:
   contents: read
+# Shares the certification group: staging closes older staging PRs and
+# deletes their branches, which must never happen while one of them is being
+# certified. It now waits for a running certification to finish.
 concurrency:
-  group: compatibility-release-staging
+  group: compatibility-release-certification
   cancel-in-progress: false
 jobs:
   stage:
