@@ -6,11 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [1.3.27]
-
-- Stage native compatibility verification for Plex 1.43.5.11079-b3b13e506. Certification is pending.
-
 ## [Unreleased]
+
+## [1.3.27] - 2026-11-08
 
 ### Fixed
 - A read that fails while PostgreSQL executes it now reports the error. Reads that do not stream (for example `LIMIT 1` queries) returned an empty result instead, with only a log line.
@@ -18,10 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A connection error noted during one step no longer makes the next failing statement on the same thread retry as if its connection had failed.
 - The result-description cache tracks uncommitted DDL per session: it resumes after DDL that ran outside a transaction, and another session's commit or autocommit write (or an inner `RELEASE SAVEPOINT`) no longer ends the window early.
 - A statement whose stream was read ahead is no longer re-run from the first row when it is stepped from another connection.
-- Manual image publication only moves `:latest` when it publishes the repository's latest release, checked right before promotion.
+- Manual image publication only moves `:latest` when it publishes the repository's latest release and no certified publication is running; the decision is made before any tag is written.
 - A shadow database without its sidecar file (an interrupted installation) is still refused, since it may have been used as a real library since, but the error now explains that and how to recover.
 - The certificate job downloads every evidence artifact itself and fails if one is missing. `actions/download-artifact` reported success for 1.3.27 while four of the largest soak archives were never written, so a fully passed certification could not issue its certificate.
 - Release staging no longer closes older staging pull requests (and deletes their branches) while a certification is running or queued, which had discarded a finished 1.3.26 certification.
+
+### Tested
+- Certified with Plex 1.43.5.11079-b3b13e506: LinuxServer and PlexInc, native AMD64 and ARM64, PostgreSQL 15 and 18. All eight configurations passed 100 restarts, 5 hours 50 minutes of playback load and live PostgreSQL recovery; four native ZIP installation checks passed. The published Linux ZIP and Docker images are the certified bytes. The macOS ARM64 ZIP was built from the same tag and checked separately.
 
 ## [1.3.26] - 2026-11-06
 
