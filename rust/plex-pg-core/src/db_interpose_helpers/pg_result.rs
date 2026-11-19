@@ -6,8 +6,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 
 use super::{
-    cstr_to_str, format_epoch_to_datetime_utc_impl, is_aggregate_alias, pg_sql_has_timestamp_hint,
-    rewrite_server_library_uri_bytes, rust_decode_hex_bytes, write_i32_to_buf, write_i64_to_buf,
+    cstr_to_str, is_aggregate_alias, rewrite_server_library_uri_bytes, rust_decode_hex_bytes, write_i32_to_buf, write_i64_to_buf,
     PGresult, SQLITE_NULL_CONST,
 };
 
@@ -25,7 +24,7 @@ extern "C" {
 pub fn rust_column_text_reformat_aggregate(
     col_name: *const c_char,
     oid: c_uint,
-    pg_sql: *const c_char,
+    _pg_sql: *const c_char,
     source_value: *const c_char,
     out: *mut c_char,
     out_len: usize,
@@ -48,21 +47,21 @@ pub fn rust_column_text_reformat_aggregate(
     }
 
     if oid == 20 {
+        // Plex's SOCI layer reads integer columns through column_text() and
+        // parses the result. SQLite returns max()/min() of an integer column
+        // as plain decimal text, so do the same. (This used to render
+        // max(viewed_at) as a datetime whenever the SQL mentioned "_at"
+        // anywhere, which Plex parsed as the year 2026 and dropped every show
+        // from Continue Watching.)
         let val = pg_text_to_int64_impl(source_value);
-        let pg_sql = cstr_to_str(pg_sql).unwrap_or("");
-        if (col.eq_ignore_ascii_case("max") || col.eq_ignore_ascii_case("min"))
-            && !pg_sql.is_empty()
-            && pg_sql_has_timestamp_hint(pg_sql)
-            && format_epoch_to_datetime_utc_impl(val, out, out_len) != 0
-        {
-            return 1;
-        }
         return c_int::from(write_i64_to_buf(out, out_len, val));
     }
 
     let val = pg_text_to_int_impl(source_value);
     c_int::from(write_i32_to_buf(out, out_len, val))
 }
+
+const PG_BOOL_OID: c_uint = 16;
 
 pub fn rust_column_text_transform(
     col_name: *const c_char,
@@ -83,6 +82,23 @@ pub fn rust_column_text_transform(
             *out = 0;
         }
         return -1;
+    }
+
+    // PostgreSQL booleans arrive as "t"/"f"; SQLite has no boolean type and
+    // yields 1/0 (e.g. SELECT EXISTS(...)). Plex parses the text, so match it.
+    if oid == PG_BOOL_OID && out_len >= 2 {
+        let digit = match bytes {
+            b"t" => Some(b'1'),
+            b"f" => Some(b'0'),
+            _ => None,
+        };
+        if let Some(d) = digit {
+            unsafe {
+                *out.cast::<u8>() = d;
+                *out.cast::<u8>().add(1) = 0;
+            }
+            return 1;
+        }
     }
 
     if rust_column_text_reformat_aggregate(col_name, oid, pg_sql, source_value, out, out_len) != 0 {

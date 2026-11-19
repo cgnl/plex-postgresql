@@ -69,13 +69,6 @@ pub(super) fn is_aggregate_alias(col: &str) -> bool {
             .any(|prefix| lower.starts_with(prefix))
 }
 
-pub(super) fn pg_sql_has_timestamp_hint(pg_sql: &str) -> bool {
-    pg_sql.contains("_at")
-        || pg_sql.contains("changed_at")
-        || pg_sql.contains("updated_at")
-        || pg_sql.contains("created_at")
-}
-
 pub(super) fn normalize_sql_literals_impl(sql: &str) -> Option<(String, Vec<String>)> {
     const MAX_NORMALIZED_PARAMS: usize = 32;
 

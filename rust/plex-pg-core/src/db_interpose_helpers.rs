@@ -45,8 +45,8 @@ use pure_helpers::{
     bytes_to_pg_hex_impl, contains_binary_bytes_impl, find_insert_column_index_impl,
     format_epoch_to_datetime_utc_impl, is_aggregate_alias, is_blobs_db_path_impl,
     is_junk_metadata_insert_impl, is_library_db_path_impl, is_library_or_blobs_db_path_impl,
-    is_related_items_query_impl, normalize_sql_literals_impl, pg_sql_has_timestamp_hint,
-    rewrite_server_library_uri_bytes, should_mask_collection_metadata_type_impl,
+    is_related_items_query_impl, normalize_sql_literals_impl, rewrite_server_library_uri_bytes,
+    should_mask_collection_metadata_type_impl,
 };
 pub(crate) use string_utils::cstr_to_str_or_empty;
 use string_utils::{
