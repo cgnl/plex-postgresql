@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.3.28]
+
+- Stage native compatibility verification for Plex 1.43.5.11079-b3b13e506. Certification is pending.
+
 ## [Unreleased]
 
 ## [1.3.27] - 2026-11-08
